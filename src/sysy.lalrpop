@@ -1,13 +1,11 @@
 // lalrpop 里的约定
 grammar;
-use compile_sysy::ast::astnode::*;
+use compile_sysy::ast::*;
 
-// 约束 lexer 的行为
 match {
-  // 跳过空白符和注释
   r"\s*" => {},
   r"//[^\n\r]*[\n\r]*" => {},
-  // 剩下的情况采用默认方式处理
+  r"/\*([^*]|\*[^/])*\*/" => {},
   _
 }
 
@@ -42,6 +40,82 @@ StmtList: Vec<Stmt> = {
 };
 
 Stmt: Stmt =
-  "return" <num: Number> ";" => Stmt::Return(<>);
+  "return" <exp: Exp> ";" => Stmt::Return(<>);
 
-Number: i32 = <num: IntConst> => <>;
+Exp: Exp = {
+  <exp: LOrExp> => exp,
+}
+
+PrimaryExp: Exp = {
+  "(" <exp: Exp> ")" => exp,
+  <int_const: IntConst> => Exp::Number(int_const),
+}
+
+UnaryExp: Exp = {
+  <primary_exp: PrimaryExp> => primary_exp,
+  <op: UnaryOp> <exp: UnaryExp> => Exp::UnaryExp(op, Box::new(exp)),
+}
+
+MulExp: Exp = {
+  <unary_exp: UnaryExp> => unary_exp,
+  <mul_exp: MulExp> <op: MulOp> <unary_exp: UnaryExp> => Exp::BinaryExp(op, Box::new(mul_exp), Box::new(unary_exp)),
+}
+
+AddExp: Exp = {
+  <mul_exp: MulExp> => mul_exp,
+  <add_exp: AddExp> <op: AddOp> <mul_exp: MulExp> => Exp::BinaryExp(op, Box::new(add_exp), Box::new(mul_exp)),
+}
+
+UnaryOp: UnaryOp = {
+  "+" => UnaryOp::Pos,
+  "-" => UnaryOp::Neg,
+  "!" => UnaryOp::Not,
+}
+
+MulOp: BinaryOp = {
+  "*" => BinaryOp::Mul,
+  "/" => BinaryOp::Div,
+  "%" => BinaryOp::Mod,
+}
+
+AddOp: BinaryOp = {
+  "+" => BinaryOp::Add,
+  "-" => BinaryOp::Sub,
+}
+
+// RelExp      ::= AddExp | RelExp RelOp AddExp;
+// EqExp       ::= RelExp | EqExp EqOp RelExp;
+// LAndExp     ::= EqExp | LAndExp "&&" EqExp;
+// LOrExp      ::= LAndExp | LOrExp "||" LAndExp;
+
+RelExp: Exp = {
+  <add_exp: AddExp> => add_exp,
+  <rel_exp: RelExp> <op: RelOp> <add_exp: AddExp> => Exp::BinaryExp(op, Box::new(rel_exp), Box::new(add_exp)),
+}
+
+RelOp: BinaryOp = {
+  "<" => BinaryOp::Lt,
+  ">" => BinaryOp::Gt,
+  "<=" => BinaryOp::Le,
+  ">=" => BinaryOp::Ge,
+}
+
+EqExp: Exp = {
+  <rel_exp: RelExp> => rel_exp,
+  <eq_exp: EqExp> <op: EqOp> <rel_exp: RelExp> => Exp::BinaryExp(op, Box::new(eq_exp), Box::new(rel_exp)),
+}
+
+EqOp: BinaryOp = {
+  "==" => BinaryOp::Eq,
+  "!=" => BinaryOp::Ne,
+}
+
+LAndExp: Exp = {
+  <eq_exp: EqExp> => eq_exp,
+  <land_exp: LAndExp> "&&" <eq_exp: EqExp> => Exp::BinaryExp(BinaryOp::And, Box::new(land_exp), Box::new(eq_exp)),
+}
+
+LOrExp: Exp = {
+  <land_exp: LAndExp> => land_exp,
+  <lor_exp: LOrExp> "||" <land_exp: LAndExp> => Exp::BinaryExp(BinaryOp::Or, Box::new(lor_exp), Box::new(land_exp)),
+}

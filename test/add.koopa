@@ -1,0 +1,10 @@
+	.text
+	.globl main
+main:
+	li s10, 0
+	xor s10, s10, 6
+	seqz s10, s10
+	sub s8, 0, s10
+	sub s4, 0, s8
+	add s7, 0, s4
+	mv a0, s7
