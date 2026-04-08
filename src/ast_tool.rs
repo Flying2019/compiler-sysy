@@ -1,4 +1,4 @@
-use crate::ast::{Background, BinaryOp, ReturnValue, UnaryOp};
+use crate::{ast::{Background, ReturnValue}, lalr::{BinaryOp, UnaryOp}};
 
 
 pub fn gen_unary_koopa_ir(op: &UnaryOp, src: String, background: &mut Background) -> ReturnValue {

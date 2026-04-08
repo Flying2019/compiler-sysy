@@ -1,6 +1,6 @@
 // lalrpop 里的约定
 grammar;
-use compile_sysy::ast::*;
+use compile_sysy::lalr::*;
 
 match {
   r"\s*" => {},
@@ -20,9 +20,7 @@ IntConst: i32 = {
 pub CompUnit: CompUnit = <func_def: FuncDef> => CompUnit { func_def };
 
 FuncDef: FuncDef = {
-  <func_type: FuncType> <ident: Ident> "(" ")" <block: Block> => {
-    FuncDef { func_type, ident, block }
-  }
+  <func_type: FuncType> <ident: Ident> "(" ")" <block: Block> => FuncDef { func_type, ident, block }
 }
 
 FuncType:
@@ -40,6 +38,7 @@ StmtList: Vec<Stmt> = {
 };
 
 Stmt: Stmt = {
+  <block: Block> => Stmt::Block(block),
   <ident: Ident> "=" <exp: Exp> ";" => Stmt::Assign(ident, exp),
   <typ: Type> <decls: MultipleDecl> ";" => Stmt::Decl(typ, decls),
   "return" <exp: Exp> ";" => Stmt::Return(<>),

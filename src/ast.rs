@@ -1,6 +1,8 @@
 use std::{collections::HashMap, fmt::Debug};
 use crate::ast_tool::{eval_binary_const, eval_unary_const, gen_binary_koopa_ir, gen_unary_koopa_ir};
+use crate::lalr::*;
 
+#[derive(Clone)]
 pub struct Background {
     temp_counter: usize,
     variable_map: HashMap<String, String>,
@@ -30,6 +32,14 @@ impl Background {
 
     pub fn set_variable(&mut self, name: String, value: String) {
         self.variable_map.insert(name, value);
+    }
+
+    pub fn try_get_constant(&self, name: &String) -> Option<i32> {
+        self.constant_map.get(name).cloned()
+    }
+
+    pub fn set_constant(&mut self, name: String, value: i32) {
+        self.constant_map.insert(name, value);
     }
 }
 
@@ -63,22 +73,10 @@ pub trait AstNode: Debug {
     }
 }
 
-#[derive(Debug)]
-pub struct CompUnit {
-    pub func_def: FuncDef,
-}
-
 impl AstNode for CompUnit {
     fn to_koopa_ir(&self, bg: &mut Background) -> String {
         self.func_def.to_koopa_ir(bg)
     }
-}
-
-#[derive(Debug)]
-pub struct FuncDef {
-    pub func_type: FuncType,
-    pub ident: String,
-    pub block: Block,
 }
 
 impl AstNode for FuncDef {
@@ -93,12 +91,6 @@ impl AstNode for FuncDef {
     }
 }
 
-#[derive(Debug)]
-pub enum FuncType {
-    Void,
-    Int,
-}
-
 impl AstNode for FuncType {
     fn to_koopa_ir(&self, _bg: &mut Background) -> String {
         match self {
@@ -106,11 +98,6 @@ impl AstNode for FuncType {
             FuncType::Int => "i32".to_string(),
         }
     }
-}
-
-#[derive(Debug)]
-pub struct Block {
-    pub stmts: Vec<Stmt>,
 }
 
 impl AstNode for Block {
@@ -123,16 +110,10 @@ impl AstNode for Block {
     }
 }
 
-#[derive(Debug)]
-pub enum Stmt {
-    Assign(String, Exp),
-    Decl(Type, Vec<SingleDecl>),
-    Return(Exp),
-}
-
 impl AstNode for Stmt {
     fn to_koopa_ir(&self, bg: &mut Background) -> String {
         match self {
+            Stmt::Block(block) => block.to_koopa_ir(bg),
             Stmt::Assign(ident, exp) => {
                 let exp_ret = exp.to_koopa(bg);
                 bg.set_variable(ident.clone(), exp_ret.value.unwrap());
@@ -158,7 +139,7 @@ impl AstNode for Stmt {
                         for decl in decls {
                             if let Some(init) = &decl.init {
                                 let value = init.try_eval_const(bg).expect("Const variable must be initialized with a constant expression");
-                                bg.constant_map.insert(decl.ident.clone(), value);
+                                bg.set_constant(decl.ident.clone(), value);
                             } else {
                                 panic!("Const variable {} must be initialized", decl.ident);
                             }
@@ -174,31 +155,6 @@ impl AstNode for Stmt {
             }
         }
     }
-}
-
-#[derive(Debug)]
-pub struct SingleDecl {
-    pub ident: String,
-    pub init: Option<Exp>,
-}
-
-#[derive(Debug)]
-pub enum BType {
-    Int,
-}
-
-#[derive(Debug)]
-pub enum Type {
-    Var(BType),
-    Const(BType),
-}
-
-#[derive(Debug)]
-pub enum Exp {
-    Number(i32),
-    UnaryExp(UnaryOp, Box<Exp>),
-    BinaryExp(BinaryOp, Box<Exp>, Box<Exp>),
-    Ident(String),
 }
 
 impl AstNode for Exp {
@@ -222,7 +178,7 @@ impl AstNode for Exp {
                 )
             }
             Exp::Ident(name) => {
-                if let Some(const_value) = bg.constant_map.get(name) {
+                if let Some(const_value) = bg.try_get_constant(name) {
                     ReturnValue::new(Some(const_value.to_string()), String::new())
                 } else {
                     let var_name = bg.get_variable(name.clone());
@@ -247,32 +203,8 @@ impl Exp {
                 Some(eval_binary_const(op, lhs, rhs))
             }
             Exp::Ident(name) => {
-                bg.constant_map.get(name).cloned()
+                bg.try_get_constant(name)
             }
         }
     }
-}
-
-#[derive(Debug)]
-pub enum UnaryOp {
-    Pos,
-    Neg,
-    Not,
-}
-
-#[derive(Debug)]
-pub enum BinaryOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Lt,
-    Gt,
-    Le,
-    Ge,
-    Eq,
-    Ne,
-    And,
-    Or,
 }
