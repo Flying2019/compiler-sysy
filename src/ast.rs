@@ -2,44 +2,128 @@ use std::{collections::HashMap, fmt::Debug};
 use crate::ast_tool::{eval_binary_const, eval_unary_const, gen_binary_koopa_ir, gen_unary_koopa_ir};
 use crate::lalr::*;
 
-#[derive(Clone)]
+pub struct RenameManager {
+    timestamp: usize,
+    rename_count: HashMap<String, usize>,
+    rename_record: HashMap<String, Vec<(usize, usize)>>, // (timestamp, count)
+}
+
+fn variable_rename(name: String, count: usize) -> String {
+    if count == 1 {
+        format!("@{}", name)
+    } else {
+        format!("@{}_{}", name, count)
+    }
+}
+
+impl RenameManager {
+    pub fn new() -> Self {
+        Self {
+            timestamp: 0,
+            rename_count: HashMap::new(),
+            rename_record: HashMap::new(),
+        }
+    }
+    
+    pub fn new_variable(&mut self, name: String) -> Option<usize> {
+        let count = self.rename_count.entry(name.clone()).or_insert(0);
+        *count += 1;
+        let times = self.rename_record.entry(name).or_insert(Vec::new());
+        if let Some(last) = times.last() {
+            if last.0 == self.timestamp {
+                return None;
+            }
+        }
+        times.push((self.timestamp, *count));
+        Some(*count)
+    }
+
+    pub fn get_current_name(&self, name: &String) -> Option<usize> {
+        let &(ts, count) = self.rename_record.get(name)?.last()?;
+        if ts <= self.timestamp {
+            Some(count)
+        } else {
+            // The variable is not visible
+            None
+        }
+    }
+
+    pub fn rollback(&mut self, timestamp: usize) {
+        for (_, times) in self.rename_record.iter_mut() {
+            while let Some(&(ts, _)) = times.last() {
+                if ts > timestamp {
+                    times.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn increment(&mut self) {
+        self.timestamp += 1;
+    }
+
+    pub fn record(&self) -> usize {
+        self.timestamp
+    }
+}
+
 pub struct Background {
     temp_counter: usize,
-    variable_map: HashMap<String, String>,
     constant_map: HashMap<String, i32>,
+    rename_manager: RenameManager,
 }
 
 impl Background {
     pub fn new() -> Self {
         Self {
             temp_counter: 0,
-            variable_map: HashMap::new(),
             constant_map: HashMap::new(),
+            rename_manager: RenameManager::new(),
         }
     }
 
     pub fn next_temp(&mut self) -> String {
         let temp_name = format!("%{}", self.temp_counter);
+        self.rename_manager.new_variable(temp_name.clone()).expect("Temp variable name conflict");
         self.temp_counter += 1;
         temp_name
     }
 
-    pub fn get_variable(&mut self, name: String) -> String {
-        self.variable_map.get(&name).cloned().unwrap_or_else(|| {
-            panic!("Variable {} not found in background", name);
-        })
+    pub fn get_variable(&self, name: String) -> String {
+        // println!("Getting variable: {}", name);
+        let count = self.rename_manager.get_current_name(&name).expect("Variable not found in the current scope");
+        variable_rename(name, count)
     }
 
-    pub fn set_variable(&mut self, name: String, value: String) {
-        self.variable_map.insert(name, value);
+    pub fn new_variable(&mut self, name: String) -> String {
+        // println!("Creating variable: {}", name);
+        let count = self.rename_manager.new_variable(name.clone()).expect("Variable name conflict in the same scope");
+        let new_name = variable_rename(name.clone(), count);
+        new_name
     }
 
-    pub fn try_get_constant(&self, name: &String) -> Option<i32> {
-        self.constant_map.get(name).cloned()
+    pub fn try_get_constant(&self, name: String) -> Option<i32> {
+        let name = self.get_variable(name);
+        self.constant_map.get(&name).cloned()
     }
 
     pub fn set_constant(&mut self, name: String, value: i32) {
+        let name = self.new_variable(name);
         self.constant_map.insert(name, value);
+    }
+
+    pub fn increment(&mut self) {
+        self.rename_manager.increment();
+    }
+
+    pub fn record(&self) -> usize {
+        self.rename_manager.record()
+    }
+
+    pub fn rollback(&mut self, timestamp: usize) {
+        self.rename_manager.rollback(timestamp);
     }
 }
 
@@ -105,6 +189,7 @@ impl AstNode for Block {
         let mut ir = String::new();
         for stmt in &self.stmts {
             ir.push_str(&stmt.to_koopa_ir(bg));
+            ir.push_str("\n");
         }
         ir
     }
@@ -113,24 +198,30 @@ impl AstNode for Block {
 impl AstNode for Stmt {
     fn to_koopa_ir(&self, bg: &mut Background) -> String {
         match self {
-            Stmt::Block(block) => block.to_koopa_ir(bg),
+            Stmt::Block(block) => {
+                let ts = bg.record();
+                bg.increment();
+                let block_ir = block.to_koopa_ir(bg);
+                bg.rollback(ts);
+                block_ir
+            }
             Stmt::Assign(ident, exp) => {
                 let exp_ret = exp.to_koopa(bg);
-                bg.set_variable(ident.clone(), exp_ret.value.unwrap());
-                exp_ret.content
+                let ptr = bg.get_variable(ident.clone());
+                let store_ir = format!("  store {}, {}\n", exp_ret.value.unwrap(), ptr);
+                format!("{}{}", exp_ret.content, store_ir)
             }
             Stmt::Decl(typ, decls) => {
                 let mut content = String::new();
                 match typ {
                     Type::Var(_t) => {
                         for decl in decls {
+                            let ptr_name = bg.new_variable(decl.ident.clone());
+                            content.push_str(&format!("  {} = alloc i32\n", ptr_name));
                             if let Some(init) = &decl.init {
                                 let init_ret = init.to_koopa(bg);
                                 content.push_str(&init_ret.content);
-                                bg.set_variable(decl.ident.clone(), init_ret.value.unwrap());
-                            } else {
-                                let var_name = bg.next_temp();
-                                bg.set_variable(decl.ident.clone(), var_name);
+                                content.push_str(&format!("  store {}, {}\n", init_ret.value.unwrap(), ptr_name));
                             }
                         }
                         content
@@ -153,6 +244,11 @@ impl AstNode for Stmt {
                 let additional_ir = format!("  ret {}\n", ret.value.unwrap());
                 format!("{}{}", ret.content, additional_ir)
             }
+            Stmt::Exp(exp) => {
+                let exp_ret = exp.to_koopa(bg);
+                exp_ret.content
+            }
+            Stmt::Empty => String::new(),
         }
     }
 }
@@ -178,11 +274,13 @@ impl AstNode for Exp {
                 )
             }
             Exp::Ident(name) => {
-                if let Some(const_value) = bg.try_get_constant(name) {
+                if let Some(const_value) = bg.try_get_constant(name.clone()) {
                     ReturnValue::new(Some(const_value.to_string()), String::new())
                 } else {
-                    let var_name = bg.get_variable(name.clone());
-                    ReturnValue::new(Some(var_name), String::new())
+                    let ptr_name = bg.get_variable(name.clone());
+                    let loaded_name = bg.next_temp();
+                    let load_ir = format!("  {} = load {}\n", loaded_name, ptr_name);
+                    ReturnValue::new(Some(loaded_name), load_ir)
                 }
             }
         }
@@ -203,7 +301,7 @@ impl Exp {
                 Some(eval_binary_const(op, lhs, rhs))
             }
             Exp::Ident(name) => {
-                bg.try_get_constant(name)
+                bg.try_get_constant(name.clone())
             }
         }
     }

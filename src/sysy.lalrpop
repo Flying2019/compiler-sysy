@@ -42,6 +42,8 @@ Stmt: Stmt = {
   <ident: Ident> "=" <exp: Exp> ";" => Stmt::Assign(ident, exp),
   <typ: Type> <decls: MultipleDecl> ";" => Stmt::Decl(typ, decls),
   "return" <exp: Exp> ";" => Stmt::Return(<>),
+  <exp: Exp> ";" => Stmt::Exp(exp),
+  ";" => Stmt::Empty,
 }
 
 MultipleDecl: Vec<SingleDecl> = {

@@ -27,6 +27,8 @@ pub enum Stmt {
     Assign(String, Exp),
     Decl(Type, Vec<SingleDecl>),
     Return(Exp),
+    Exp(Exp),
+    Empty,
 }
 
 #[derive(Debug)]
