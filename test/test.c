@@ -1,3 +1,4 @@
 int main() {
-    return (2+3*5)%(-1);
+    const int a = 1 + 2 * 3;
+    return a;
 }

@@ -1,12 +1,22 @@
-use std::fmt::Debug;
+use std::{collections::HashMap, fmt::Debug};
+
+use koopa::ir::values::Integer;
+
+use crate::ast_tool::{eval_binary_const, eval_unary_const, gen_binary_koopa_ir, gen_unary_koopa_ir};
 
 pub struct Background {
     temp_counter: usize,
+    variable_map: HashMap<String, String>,
+    constant_map: HashMap<String, i32>,
 }
 
 impl Background {
     pub fn new() -> Self {
-        Self { temp_counter: 0 }
+        Self {
+            temp_counter: 0,
+            variable_map: HashMap::new(),
+            constant_map: HashMap::new(),
+        }
     }
 
     pub fn next_temp(&mut self) -> String {
@@ -15,11 +25,16 @@ impl Background {
         temp_name
     }
 
-    pub fn last_temp(&self) -> String {
-        if self.temp_counter == 0 {
-            panic!("No temporary variables have been generated yet.");
+    pub fn get_variable(&mut self, name: String) -> String {
+        if let Some(index) = self.variable_map.get(&name) {
+            format!("%{}_{}", name, index)
+        } else {
+            panic!("Variable {} not found in background", name);
         }
-        format!("%{}", self.temp_counter - 1)
+    }
+
+    pub fn set_variable(&mut self, name: String, value: String) {
+        self.variable_map.insert(name, value);
     }
 }
 
@@ -115,12 +130,48 @@ impl AstNode for Block {
 
 #[derive(Debug)]
 pub enum Stmt {
+    Assign(String, Exp),
+    Decl(Type, Vec<SingleDecl>),
     Return(Exp),
 }
 
 impl AstNode for Stmt {
     fn to_koopa_ir(&self, background: &mut Background) -> String {
         match self {
+            Stmt::Assign(ident, exp) => {
+                let exp_ret = exp.to_koopa(background);
+                background.set_variable(ident.clone(), exp_ret.value.unwrap());
+                exp_ret.content
+            }
+            Stmt::Decl(typ, decls) => {
+                let mut content = String::new();
+                match typ {
+                    Type::Var(_t) => {
+                        for decl in decls {
+                            if let Some(init) = &decl.init {
+                                let init_ret = init.to_koopa(background);
+                                content.push_str(&init_ret.content);
+                                background.set_variable(decl.ident.clone(), init_ret.value.unwrap());
+                            } else {
+                                let var_name = background.next_temp();
+                                background.set_variable(decl.ident.clone(), var_name);
+                            }
+                        }
+                        content
+                    }
+                    Type::Const(_t) => {
+                        for decl in decls {
+                            if let Some(init) = &decl.init {
+                                let value = init.try_eval_const().expect("Const variable must be initialized with a constant expression");
+                                background.constant_map.insert(decl.ident.clone(), value);
+                            } else {
+                                panic!("Const variable {} must be initialized", decl.ident);
+                            }
+                        }
+                        content
+                    }
+                }
+            }
             Stmt::Return(num) => {
                 let ret = num.to_koopa(background);
                 let additional_ir = format!("  ret {}\n", ret.value.unwrap());
@@ -131,10 +182,28 @@ impl AstNode for Stmt {
 }
 
 #[derive(Debug)]
+pub struct SingleDecl {
+    pub ident: String,
+    pub init: Option<Exp>,
+}
+
+#[derive(Debug)]
+pub enum BType {
+    Int,
+}
+
+#[derive(Debug)]
+pub enum Type {
+    Var(BType),
+    Const(BType),
+}
+
+#[derive(Debug)]
 pub enum Exp {
     Number(i32),
     UnaryExp(UnaryOp, Box<Exp>),
     BinaryExp(BinaryOp, Box<Exp>, Box<Exp>),
+    Ident(String),
 }
 
 impl AstNode for Exp {
@@ -157,6 +226,32 @@ impl AstNode for Exp {
                     gen_binary_koopa_ir(op, src_1, src_2, background)
                 )
             }
+            Exp::Ident(name) => {
+                if let Some(const_value) = background.constant_map.get(name) {
+                    ReturnValue::new(Some(const_value.to_string()), String::new())
+                } else {
+                    let var_name = background.get_variable(name.clone());
+                    ReturnValue::new(Some(var_name), String::new())
+                }
+            }
+        }
+    }
+}
+
+impl Exp {
+    fn try_eval_const(&self) -> Option<i32> {
+        match self {
+            Exp::Number(num) => Some(*num),
+            Exp::UnaryExp(op, exp) => {
+                let value = exp.try_eval_const()?;
+                Some(eval_unary_const(op, value))
+            }
+            Exp::BinaryExp(op, left, right) => {
+                let lhs = left.try_eval_const()?;
+                let rhs = right.try_eval_const()?;
+                Some(eval_binary_const(op, lhs, rhs))
+            }
+            Exp::Ident(_) => None,
         }
     }
 }
@@ -166,17 +261,6 @@ pub enum UnaryOp {
     Pos,
     Neg,
     Not,
-}
-
-fn gen_unary_koopa_ir(op: &UnaryOp, src: String, background: &mut Background) -> ReturnValue {
-    let dst = background.next_temp();
-    let ir =
-    match op {
-        UnaryOp::Pos => format!("  {} = add 0, {}\n", dst, src),
-        UnaryOp::Neg => format!("  {} = sub 0, {}\n", dst, src),
-        UnaryOp::Not => format!("  {} = eq {}, 0\n", dst, src),
-    };
-    ReturnValue { value: Some(dst), content: ir }
 }
 
 #[derive(Debug)]
@@ -194,44 +278,4 @@ pub enum BinaryOp {
     Ne,
     And,
     Or,
-}
-
-fn gen_binary_koopa_ir(op: &BinaryOp, lhs: String, rhs: String, background: &mut Background) -> ReturnValue {
-    match op {
-        BinaryOp::And => {
-            let dst_1 = background.next_temp();
-            let dst_2 = background.next_temp();
-            let dst = background.next_temp();
-            let ir = format!(
-                "  {} = ne {}, 0\n  {} = ne {}, 0\n  {} = and {}, {}\n",
-                dst_1, lhs, dst_2, rhs, dst, dst_1, dst_2);
-            return ReturnValue { value: Some(dst), content: ir }
-        }
-        BinaryOp::Or => {
-            let dst_1 = background.next_temp();
-            let dst = background.next_temp();
-            let ir = format!(
-                "  {} = or {}, {}\n  {} = ne {}, 0\n",
-                dst_1, lhs, rhs, dst, dst_1);
-            return ReturnValue { value: Some(dst), content: ir }
-        }
-        _ => {}
-    };
-    let dst = background.next_temp();
-    let ir =
-    match op {
-        BinaryOp::Add => format!("  {} = add {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Sub => format!("  {} = sub {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Mul => format!("  {} = mul {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Div => format!("  {} = div {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Mod => format!("  {} = mod {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Lt => format!("  {} = lt {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Gt => format!("  {} = gt {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Le => format!("  {} = le {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Ge => format!("  {} = ge {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Eq => format!("  {} = eq {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Ne => format!("  {} = ne {}, {}\n", dst, lhs, rhs),
-        _ => unimplemented!("Unsupported binary operation: {:?}", op),
-    };
-    ReturnValue { value: Some(dst), content: ir }
 }

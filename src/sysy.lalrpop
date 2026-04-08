@@ -39,8 +39,32 @@ StmtList: Vec<Stmt> = {
   }
 };
 
-Stmt: Stmt =
-  "return" <exp: Exp> ";" => Stmt::Return(<>);
+Stmt: Stmt = {
+  <ident: Ident> "=" <exp: Exp> ";" => Stmt::Assign(ident, exp),
+  <typ: Type> <decls: MultipleDecl> ";" => Stmt::Decl(typ, decls),
+  "return" <exp: Exp> ";" => Stmt::Return(<>),
+}
+
+MultipleDecl: Vec<SingleDecl> = {
+  <single_decl: SingleDecl> => vec![single_decl],
+  <single_decl: SingleDecl> "," <rest: MultipleDecl> => {
+    let mut decls = vec![single_decl];
+    decls.extend(rest);
+    decls
+  }
+}
+
+SingleDecl: SingleDecl = {
+  <ident: Ident> => SingleDecl { ident: ident, init: None },
+  <ident: Ident> "=" <exp: Exp> => SingleDecl { ident: ident, init: Some(exp) },
+}
+
+BType: BType = "int" => BType::Int;
+
+Type: Type = {
+  "const" <btype: BType> => Type::Const(btype),
+  <btype: BType> => Type::Var(btype),
+}
 
 Exp: Exp = {
   <exp: LOrExp> => exp,
@@ -49,6 +73,7 @@ Exp: Exp = {
 PrimaryExp: Exp = {
   "(" <exp: Exp> ")" => exp,
   <int_const: IntConst> => Exp::Number(int_const),
+  <ident: Ident> => Exp::Ident(ident),
 }
 
 UnaryExp: Exp = {
@@ -82,11 +107,6 @@ AddOp: BinaryOp = {
   "+" => BinaryOp::Add,
   "-" => BinaryOp::Sub,
 }
-
-// RelExp      ::= AddExp | RelExp RelOp AddExp;
-// EqExp       ::= RelExp | EqExp EqOp RelExp;
-// LAndExp     ::= EqExp | LAndExp "&&" EqExp;
-// LOrExp      ::= LAndExp | LOrExp "||" LAndExp;
 
 RelExp: Exp = {
   <add_exp: AddExp> => add_exp,
