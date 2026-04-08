@@ -1,40 +1,42 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use koopa::ir::Value;
 
 #[derive(Eq, Hash, PartialEq, Clone)]
-pub enum AsmValue {
+pub enum RegName {
     Ret,
     Param(usize),
-    Temp(String),
+    TempT(usize),
+    TempS(usize),
+    Stack
+}
+
+impl RegName {
+    pub fn to_string(&self) -> String {
+        match self {
+            RegName::Ret => "a0".to_string(),
+            RegName::Param(i) => format!("a{}", i + 1),
+            RegName::TempT(i) => format!("t{}", i),
+            RegName::TempS(i) => format!("s{}", i),
+            RegName::Stack => "sp".to_string(),
+        }
+    }
+}
+
+pub enum AsmValue {
+    Reg(RegName),
+    Offset(i32, RegName),
     Const(i32),
-    Zero,
 }
 
 impl AsmValue {
     pub fn to_string(&self) -> String {
         match self {
-            AsmValue::Ret => "a0".to_string(),
-            AsmValue::Param(i) => format!("a{}", i + 1),
-            AsmValue::Temp(name) => name.clone(),
-            AsmValue::Const(imm) => imm.to_string(),
-            AsmValue::Zero => "zero".to_string(),
-        }
-    }
-}
-
-pub enum Address {
-    Reg(AsmValue),
-    Offset(i32, AsmValue),
-    Stack(i32),
-}
-
-impl Address {
-    pub fn to_string(&self) -> String {
-        match self {
-            Address::Reg(reg) => reg.to_string(),
-            Address::Offset(offset, reg) => format!("{}({})", offset, reg.to_string()),
-            Address::Stack(offset) => format!("{}(sp)", offset),
+            AsmValue::Reg(reg) => reg.to_string(),
+            AsmValue::Offset(offset, reg) => format!("{}({})", offset, reg.to_string()),
+            AsmValue::Const(c) => c.to_string(),
         }
     }
 }
@@ -46,31 +48,31 @@ pub enum AsmLine {
     Ret,
     Call(String),
 // Data movement
-    Mv(AsmValue, AsmValue),
-    Load(AsmValue, Address),
-    Store(Address, AsmValue),
-    Li(AsmValue, i32),
-    La(AsmValue, String),
+    Mv(RegName, RegName),
+    Load(RegName, AsmValue),
+    Store(AsmValue, RegName),
+    Li(RegName, i32),
+    La(RegName, String),
 // Arithmetic
-    Add(AsmValue, AsmValue, AsmValue),
-    Addi(AsmValue, AsmValue, i32),
-    Sub(AsmValue, AsmValue, AsmValue),
-    Slt(AsmValue, AsmValue, AsmValue),
-    Sgt(AsmValue, AsmValue, AsmValue),
-    Seqz(AsmValue, AsmValue),
-    Snez(AsmValue, AsmValue),
-    Xor(AsmValue, AsmValue, AsmValue),
-    Xori(AsmValue, AsmValue, i32),
-    Or(AsmValue, AsmValue, AsmValue),
-    Ori(AsmValue, AsmValue, i32),
-    And(AsmValue, AsmValue, AsmValue),
-    Andi(AsmValue, AsmValue, i32),
-    Sll(AsmValue, AsmValue, AsmValue),
-    Srl(AsmValue, AsmValue, AsmValue),
-    Sra(AsmValue, AsmValue, AsmValue),
-    Mul(AsmValue, AsmValue, AsmValue),
-    Div(AsmValue, AsmValue, AsmValue),
-    Rem(AsmValue, AsmValue, AsmValue),
+    Add(RegName, RegName, RegName),
+    Addi(RegName, RegName, i32),
+    Sub(RegName, RegName, RegName),
+    Slt(RegName, RegName, RegName),
+    Sgt(RegName, RegName, RegName),
+    Seqz(RegName, RegName),
+    Snez(RegName, RegName),
+    Xor(RegName, RegName, RegName),
+    Xori(RegName, RegName, i32),
+    Or(RegName, RegName, RegName),
+    Ori(RegName, RegName, i32),
+    And(RegName, RegName, RegName),
+    Andi(RegName, RegName, i32),
+    Sll(RegName, RegName, RegName),
+    Srl(RegName, RegName, RegName),
+    Sra(RegName, RegName, RegName),
+    Mul(RegName, RegName, RegName),
+    Div(RegName, RegName, RegName),
+    Rem(RegName, RegName, RegName),
 }
 
 impl AsmLine {
@@ -139,78 +141,166 @@ impl AsmLine {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum RegLocation {
+    Reg(RegName),
+    Stack(usize),
+}
+
+impl Into<AsmValue> for RegLocation {
+    fn into(self) -> AsmValue {
+        match self {
+            RegLocation::Reg(reg) => AsmValue::Reg(reg),
+            RegLocation::Stack(offset) => AsmValue::Offset((offset * 4) as i32, RegName::Stack),
+        }
+    }
+}
+
+struct RegisterAllocatorState {
+    regs: HashMap<RegName, bool>,
+    stack: Vec<bool>,
+    mapping: HashMap<Value, RegLocation>,
+}
+
+impl RegisterAllocatorState {
+    fn new() -> Self {
+        let mut regs = HashMap::new();
+        for i in 1..6 {
+            regs.insert(RegName::TempT(i), false);
+        }
+        for i in 2..12 {
+            regs.insert(RegName::TempS(i), false);
+        }
+        Self {
+            regs,
+            stack: Vec::new(),
+            mapping: HashMap::new(),
+        }
+    }
+
+    fn free_location(&mut self, value: Value, location: RegLocation) {
+        if self.mapping.get(&value) != Some(&location) {
+            return;
+        }
+        self.mapping.remove(&value);
+        match location {
+            RegLocation::Reg(reg) => {
+                self.regs.insert(reg, false);
+            }
+            RegLocation::Stack(index) => {
+                if let Some(used) = self.stack.get_mut(index) {
+                    *used = false;
+                }
+            }
+        }
+    }
+
+    fn alloc_stack_slot(&mut self) -> usize {
+        for (index, used) in self.stack.iter_mut().enumerate() {
+            if !*used {
+                *used = true;
+                return index;
+            }
+        }
+        self.stack.push(true);
+        self.stack.len() - 1
+    }
+
+    fn max_stack_size(&self) -> usize {
+        self.stack.len()
+    }
+}
+
+#[must_use]
+pub struct RegAddress {
+    state: Rc<RefCell<RegisterAllocatorState>>,
+    value: Value,
+    pub location: RegLocation,
+    owned: bool,
+}
+
+impl RegAddress {
+    fn new(
+        state: Rc<RefCell<RegisterAllocatorState>>,
+        value: Value,
+        location: RegLocation,
+        owned: bool,
+    ) -> Self {
+        Self {
+            state,
+            value,
+            location,
+            owned,
+        }
+    }
+}
+
+impl Drop for RegAddress {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        state.free_location(self.value, self.location.clone());
+    }
+}
+
+impl Into<RegLocation> for RegAddress {
+    fn into(self) -> RegLocation {
+        self.location.clone()
+    }
+}
+
 pub struct RegisterAllocator {
-    regs: HashMap<AsmValue, bool>,
-    stack: Vec<Option<bool>>,
-    mapping: HashMap<Value, Result<AsmValue, usize>>,
+    state: Rc<RefCell<RegisterAllocatorState>>,
 }
 
 impl RegisterAllocator {
     pub fn new() -> Self {
-        let mut regs = HashMap::new();
-        for i in 0..6 {
-            regs.insert(AsmValue::Temp(format!("t{}", i)), false);
+        Self {
+            state: Rc::new(RefCell::new(RegisterAllocatorState::new())),
         }
-        for i in 2..12 {
-            regs.insert(AsmValue::Temp(format!("s{}", i)), false);
-        }
-        Self { regs, stack: Vec::new(), mapping: HashMap::new()}
     }
 
-    pub fn find(&self, value: &Value) -> Option<Result<AsmValue, usize>> {
-        self.mapping.get(value).cloned()
+    pub fn find(&self, value: &Value) -> Option<RegAddress> {
+        let state = self.state.borrow();
+        let location = state.mapping.get(value)?.clone();
+        Some(RegAddress::new(
+            Rc::clone(&self.state),
+            value.clone(),
+            location,
+            false,
+        ))
     }
 
-    pub fn register(&mut self, value: Value) -> Result<AsmValue, usize> {
-        if let Some(reg) = self.mapping.get(&value) {
-            return reg.clone();
+    pub fn register(&self, value: Value) -> RegAddress {
+        let mut state = self.state.borrow_mut();
+        if let Some(location) = state.mapping.get(&value).cloned() {
+            return RegAddress::new(Rc::clone(&self.state), value, location, false);
         }
-        for (reg, used) in self.regs.iter_mut() {
+
+        let mut picked_reg: Option<RegName> = None;
+        for (reg, used) in state.regs.iter_mut() {
             if !*used {
                 *used = true;
-                self.mapping.insert(value, Ok(reg.clone()));
-                return Ok(reg.clone());
+                picked_reg = Some(reg.clone());
+                break;
             }
         }
-        for (i, used) in self.stack.iter_mut().enumerate() {
-            if used.is_none() {
-                *used = Some(true);
-                self.mapping.insert(value, Err(i));
-                return Err(i);
-            }
-        }
-        self.stack.push(Some(true));
-        let index = self.stack.len() - 1;
-        self.mapping.insert(value, Err(index));
-        Err(index)
-    }
 
-    pub fn free(&mut self, value: Value) {
-        if let Some(reg) = self.mapping.get(&value) {
-            match reg {
-                Ok(r) => {
-                    self.regs.insert(r.clone(), false);
-                }
-                Err(i) => {
-                    if *i < self.stack.len() {
-                        self.stack[*i] = None;
-                    }
-                }
-            }
+        if let Some(reg) = picked_reg {
+            let location = RegLocation::Reg(reg);
+            state.mapping.insert(value, location.clone());
+            return RegAddress::new(Rc::clone(&self.state), value, location, true);
         }
-    }
 
-    pub fn free_all(&mut self) {
-        for used in self.regs.values_mut() {
-            *used = false;
-        }
-        for used in self.stack.iter_mut() {
-            *used = None;
-        }
-        self.mapping.clear();
+        let stack_index = state.alloc_stack_slot();
+        let location = RegLocation::Stack(stack_index);
+        state.mapping.insert(value, location.clone());
+        RegAddress::new(Rc::clone(&self.state), value, location, true)
     }
 
     pub fn max_stack_size(&self) -> usize {
-        self.stack.len()
+        self.state.borrow().max_stack_size()
     }
 }

@@ -23,6 +23,7 @@ impl Background {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ReturnValue {
     pub value: Option<String>,
     pub content: String,
@@ -34,6 +35,11 @@ impl ReturnValue {
     }
     pub fn with_content(content: String) -> Self {
         Self { value: None, content }
+    }
+    pub fn extend(&self, additional: ReturnValue) -> Self {
+        let new_value = additional.value;
+        let new_content = format!("{}{}", self.content, additional.content);
+        Self { value: new_value, content: new_content }
     }
 }
 
@@ -137,16 +143,19 @@ impl AstNode for Exp {
             Exp::Number(num) => ReturnValue::new(Some(num.to_string()), String::new()),
             Exp::UnaryExp(op, exp) => {
                 let exp_ret = exp.to_koopa(background);
-                let temp = background.next_temp();
-                let additional_ir = format!("  {} = {} 0, {}\n", temp, op.to_koopa_ir(background), exp_ret.value.unwrap());
-                ReturnValue::new(Some(temp), format!("{}{}", exp_ret.content, additional_ir))
+                let src = exp_ret.value.clone().unwrap();
+                exp_ret.extend(
+                    gen_unary_koopa_ir(op, src, background)
+                )
             }
             Exp::BinaryExp(op, left, right) => {
                 let left_ret = left.to_koopa(background);
                 let right_ret = right.to_koopa(background);
-                let temp = background.next_temp();
-                let additional_ir = format!("  {} = {} {}, {}\n", temp, op.to_koopa_ir(background), left_ret.value.unwrap(), right_ret.value.unwrap());
-                ReturnValue::new(Some(temp), format!("{}{}{}", left_ret.content, right_ret.content, additional_ir))
+                let src_1 = left_ret.value.clone().unwrap();
+                let src_2 = right_ret.value.clone().unwrap();
+                left_ret.extend(right_ret).extend(
+                    gen_binary_koopa_ir(op, src_1, src_2, background)
+                )
             }
         }
     }
@@ -159,14 +168,15 @@ pub enum UnaryOp {
     Not,
 }
 
-impl AstNode for UnaryOp {
-    fn to_koopa_ir(&self, _background: &mut Background) -> String {
-        match self {
-            UnaryOp::Pos => "add".to_string(),
-            UnaryOp::Neg => "sub".to_string(),
-            UnaryOp::Not => "eq".to_string(),
-        }
-    }
+fn gen_unary_koopa_ir(op: &UnaryOp, src: String, background: &mut Background) -> ReturnValue {
+    let dst = background.next_temp();
+    let ir =
+    match op {
+        UnaryOp::Pos => format!("  {} = add 0, {}\n", dst, src),
+        UnaryOp::Neg => format!("  {} = sub 0, {}\n", dst, src),
+        UnaryOp::Not => format!("  {} = eq {}, 0\n", dst, src),
+    };
+    ReturnValue { value: Some(dst), content: ir }
 }
 
 #[derive(Debug)]
@@ -186,22 +196,42 @@ pub enum BinaryOp {
     Or,
 }
 
-impl AstNode for BinaryOp {
-    fn to_koopa_ir(&self, _background: &mut Background) -> String {
-        match self {
-            BinaryOp::Add => "add".to_string(),
-            BinaryOp::Sub => "sub".to_string(),
-            BinaryOp::Mul => "mul".to_string(),
-            BinaryOp::Div => "div".to_string(),
-            BinaryOp::Mod => "mod".to_string(),
-            BinaryOp::Lt => "lt".to_string(),
-            BinaryOp::Gt => "gt".to_string(),
-            BinaryOp::Le => "le".to_string(),
-            BinaryOp::Ge => "ge".to_string(),
-            BinaryOp::Eq => "eq".to_string(),
-            BinaryOp::Ne => "ne".to_string(),
-            BinaryOp::And => "and".to_string(),
-            BinaryOp::Or => "or".to_string(),
+fn gen_binary_koopa_ir(op: &BinaryOp, lhs: String, rhs: String, background: &mut Background) -> ReturnValue {
+    match op {
+        BinaryOp::And => {
+            let dst_1 = background.next_temp();
+            let dst_2 = background.next_temp();
+            let dst = background.next_temp();
+            let ir = format!(
+                "  {} = ne {}, 0\n  {} = ne {}, 0\n  {} = and {}, {}\n",
+                dst_1, lhs, dst_2, rhs, dst, dst_1, dst_2);
+            return ReturnValue { value: Some(dst), content: ir }
         }
-    }
+        BinaryOp::Or => {
+            let dst_1 = background.next_temp();
+            let dst = background.next_temp();
+            let ir = format!(
+                "  {} = or {}, {}\n  {} = ne {}, 0\n",
+                dst_1, lhs, rhs, dst, dst_1);
+            return ReturnValue { value: Some(dst), content: ir }
+        }
+        _ => {}
+    };
+    let dst = background.next_temp();
+    let ir =
+    match op {
+        BinaryOp::Add => format!("  {} = add {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Sub => format!("  {} = sub {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Mul => format!("  {} = mul {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Div => format!("  {} = div {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Mod => format!("  {} = mod {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Lt => format!("  {} = lt {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Gt => format!("  {} = gt {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Le => format!("  {} = le {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Ge => format!("  {} = ge {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Eq => format!("  {} = eq {}, {}\n", dst, lhs, rhs),
+        BinaryOp::Ne => format!("  {} = ne {}, {}\n", dst, lhs, rhs),
+        _ => unimplemented!("Unsupported binary operation: {:?}", op),
+    };
+    ReturnValue { value: Some(dst), content: ir }
 }

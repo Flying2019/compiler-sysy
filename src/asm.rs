@@ -1,8 +1,12 @@
+use std::collections::{HashMap, HashSet};
+
 use koopa::ir::dfg::DataFlowGraph;
+use koopa::ir::entities::ValueData;
 use koopa::ir::values::{Binary, BinaryOp};
 use koopa::ir::{Value, ValueKind};
 use koopa::ir::{FunctionData, Program};
-use crate::riscv::{AsmLine, AsmValue, RegisterAllocator};
+use crate::riscv::{AsmLine, RegAddress, RegName, RegisterAllocator};
+use crate::asm_tool::regaddress_to_regname;
 
 fn name_to_symbol(name: &str) -> String {
     if name.starts_with("@") {
@@ -63,6 +67,10 @@ impl<'a> Background<'a> {
     {
         Background { dfg: Some(dfg), ..self.clone() }
     }
+
+    pub fn get_value(&self, value: Value) -> &ValueData {
+        self.dfg.unwrap().value(value)
+    }
 }
 
 impl<'a> Clone for Background<'a> {
@@ -88,21 +96,58 @@ impl GenerateAsm for Program {
     }
 }
 
+struct TempRecord {
+    loc: RegAddress,
+    used_by: HashSet<Value>,
+}
+
+impl TempRecord {
+    pub fn from_value(value: Value, bg: &Background, loc: RegAddress) -> TempRecord {
+        TempRecord {
+            loc: loc,
+            used_by: bg.get_value(value).used_by().clone(),
+        }
+    }
+}
+
+fn consume_temp_reg(
+    operand: Value,
+    user: Value,
+    temp_value: &mut HashMap<Value, TempRecord>,
+    asm: &mut Asm,
+) -> Option<RegName> {
+    let mut should_release = false;
+    let mut reg = None;
+    if let Some(record) = temp_value.get_mut(&operand) {
+        record.used_by.remove(&user);
+        should_release = record.used_by.is_empty();
+        reg = Some(regaddress_to_regname(&record.loc, asm));
+    }
+    if should_release {
+        temp_value.remove(&operand);
+    }
+    reg
+}
+
 impl GenerateAsm for &FunctionData {
     fn to_asm(&self, bg: &Background) -> Asm {
+        let bg = &bg.with_dfg(&self.dfg());
         let mut result = Asm::new();
         let mut context = Asm::new();
+        let mut temp_value = HashMap::new();
         let name = name_to_symbol(self.name());
         result.add_text("\t.text".to_string());
         result.add_text(format!("\t.globl {}", name));
         result.add_text(format!("{}:", name));
-        let mut ra =  RegisterAllocator::new();
+        let ra =  RegisterAllocator::new();
         for (&_bb, node) in self.layout().bbs() {
             let insts = node.insts().keys();
             for &inst in insts {
-                context.add_asm(gen_inst_asm(inst, &bg.with_dfg(self.dfg()), &mut ra).asm);
+                let ret = inst_to_asm(inst, &bg, &ra, &mut context, &mut temp_value);
+                if let Some(ret) = ret {
+                    temp_value.insert(inst, TempRecord::from_value(inst, &bg, ret));
+                }
             }
-            ra.free_all();
         }
         if ra.max_stack_size() > 0 {
             let max_stack_size = ra.max_stack_size();
@@ -113,89 +158,102 @@ impl GenerateAsm for &FunctionData {
         else {
             result.add_asm(context);
         }
+        result.add_line(AsmLine::Ret);
         result
     }
 }
 
-#[allow(unused)]
-pub struct InstAsm {
-    asm: Asm,
-    ret: Option<AsmValue>,
-}
-
-fn gen_inst_asm(value: Value, bg: &Background, ra: &mut RegisterAllocator) -> InstAsm {
-    let inst = bg.dfg.unwrap().value(value);
+fn inst_to_asm(
+    value: Value,
+    bg: &Background,
+    ra: &RegisterAllocator,
+    asm: &mut Asm,
+    temp_value: &mut HashMap<Value, TempRecord>,
+) -> Option<RegAddress> {
+    let inst = bg.get_value(value);
     match inst.kind() {
         ValueKind::Return(r) => {
-            let mut asm = Asm::new();
             if let Some(value) = r.value() {
-                let ret_val = single_value_to_asm(value, bg, ra);
-                asm.add_line(mov_to_asm(AsmValue::Ret, ret_val, bg, ra));
+                match bg.get_value(value).kind() {
+                    ValueKind::Integer(c) => {
+                        asm.add_line(AsmLine::Li(RegName::Ret, c.value()));
+                    }
+                    _ => {
+                        let reg_name = consume_temp_reg(value, value, temp_value, asm).unwrap();
+                        asm.add_line(AsmLine::Mv(RegName::Ret, reg_name));
+                    }
+                }
             }
-            InstAsm { asm, ret: None }
+            None
         }
         ValueKind::Integer(_) => {
             panic!("Integer value should not be directly used as an instruction");
         }
         ValueKind::Binary(binary) => {
-            let asm = binary_to_asm(value, binary, bg, ra);
-            InstAsm { asm, ret: Some(ra.register(value).unwrap()) }
+            let ret = binary_to_asm(value, binary, bg, ra, asm, temp_value);
+            Some(ret)
         }
         _ => unimplemented!()
     }
 }
 
-fn single_value_to_asm(value: Value, bg: &Background, ra: &mut RegisterAllocator) -> AsmValue {
-    let inst = bg.dfg.unwrap().value(value);
-    match inst.kind() {
-        ValueKind::Integer(i) => {
-            AsmValue::Const(i.value())
+fn operand_to_reg(
+    operand: Value,
+    user: Value,
+    bg: &Background,
+    temp_value: &mut HashMap<Value, TempRecord>,
+    asm: &mut Asm,
+    scratch: RegName,
+) -> RegName {
+    match bg.get_value(operand).kind() {
+        ValueKind::Integer(c) => {
+            asm.add_line(AsmLine::Li(scratch.clone(), c.value()));
+            scratch
         }
-        _ => {
-            let result = ra.find(&value).unwrap();
-            match result {
-                Ok(reg) => reg,
-                Err(_) => unimplemented!("Value {:?} is not allocated in a register", value),
-            }
-        }
+        _ => consume_temp_reg(operand, user, temp_value, asm).unwrap(),
     }
 }
 
-fn mov_to_asm(reg: AsmValue, value: AsmValue, bg: &Background, ra: &mut RegisterAllocator) -> AsmLine {
-    match value {
-        AsmValue::Const(c) => AsmLine::Li(reg, c),
-        AsmValue::Temp(_) => AsmLine::Mv(reg, value),
-        _ => unimplemented!(),
-    }
-}
+fn binary_to_asm(
+    value: Value,
+    binary: &Binary,
+    bg: &Background,
+    ra: &RegisterAllocator,
+    asm: &mut Asm,
+    temp_value: &mut HashMap<Value, TempRecord>,
+) -> RegAddress {
+    let dest = ra.register(value);
+    let dest_reg = regaddress_to_regname(&dest, asm);
+    let lhs = operand_to_reg(binary.lhs(), value, bg, temp_value, asm, RegName::TempT(0));
+    let rhs = operand_to_reg(binary.rhs(), value, bg, temp_value, asm, RegName::TempT(1));
 
-fn binary_to_asm(value: Value, binary: &Binary, bg: &Background, ra: &mut RegisterAllocator) -> Asm {
-    let mut asm = Asm::new();
-    let lhs = single_value_to_asm(binary.lhs(), bg, ra);
-    let rhs = single_value_to_asm(binary.rhs(), bg, ra);
-    let dest = ra.register(value).unwrap();
     match binary.op() {
-        BinaryOp::Add => {
-            asm.add_line(AsmLine::Add(dest, lhs, rhs));
-        }
-        BinaryOp::Sub => {
-            asm.add_line(AsmLine::Sub(dest, lhs, rhs));
-        }
-        BinaryOp::Mul => {
-            asm.add_line(AsmLine::Mul(dest, lhs, rhs));
-        }
-        BinaryOp::Div => {
-            asm.add_line(AsmLine::Div(dest, lhs, rhs));
-        }
-        BinaryOp::Mod => {
-            asm.add_line(AsmLine::Rem(dest, lhs, rhs));
-        }
+        BinaryOp::Add => asm.add_line(AsmLine::Add(dest_reg, lhs, rhs)),
+        BinaryOp::Sub => asm.add_line(AsmLine::Sub(dest_reg, lhs, rhs)),
+        BinaryOp::Mul => asm.add_line(AsmLine::Mul(dest_reg, lhs, rhs)),
+        BinaryOp::Div => asm.add_line(AsmLine::Div(dest_reg, lhs, rhs)),
+        BinaryOp::Mod => asm.add_line(AsmLine::Rem(dest_reg, lhs, rhs)),
         BinaryOp::Eq => {
-            asm.add_line(mov_to_asm(dest.clone(), lhs, bg, ra));
-            asm.add_line(AsmLine::Xor(dest.clone(), dest.clone(), rhs));
-            asm.add_line(AsmLine::Seqz(dest.clone(), dest));
+            asm.add_line(AsmLine::Xor(dest_reg.clone(), lhs, rhs));
+            asm.add_line(AsmLine::Seqz(dest_reg.clone(), dest_reg));
         }
+        BinaryOp::NotEq => {
+            asm.add_line(AsmLine::Xor(dest_reg.clone(), lhs, rhs));
+            asm.add_line(AsmLine::Snez(dest_reg.clone(), dest_reg));
+        }
+        BinaryOp::Le => {
+            asm.add_line(AsmLine::Slt(dest_reg.clone(), rhs, lhs));
+            asm.add_line(AsmLine::Xori(dest_reg.clone(), dest_reg, 1));
+        }
+        BinaryOp::Lt => asm.add_line(AsmLine::Slt(dest_reg, lhs, rhs)),
+        BinaryOp::Ge => {
+            asm.add_line(AsmLine::Slt(dest_reg.clone(), lhs, rhs));
+            asm.add_line(AsmLine::Xori(dest_reg.clone(), dest_reg, 1));
+        }
+        BinaryOp::Gt => asm.add_line(AsmLine::Slt(dest_reg, rhs, lhs)),
+        BinaryOp::And => asm.add_line(AsmLine::And(dest_reg, lhs, rhs)),
+        BinaryOp::Or => asm.add_line(AsmLine::Or(dest_reg, lhs, rhs)),
         _ => unimplemented!("{}", format!("Unsupported binary operation: {:?}", binary.op())),
     }
-    asm
+    dest
 }
