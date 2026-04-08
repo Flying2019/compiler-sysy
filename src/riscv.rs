@@ -1,16 +1,25 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use koopa::ir::Value;
 
-#[derive(Eq, Hash, PartialEq, Clone)]
+#[derive(Eq, PartialOrd, PartialEq, Clone, Debug)]
 pub enum RegName {
     Ret,
     Param(usize),
     TempT(usize),
     TempS(usize),
     Stack
+}
+
+impl Ord for RegName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match RegName::partial_cmp(self, other) {
+            Some(ordering) => ordering,
+            None => self.to_string().cmp(&other.to_string()),
+        }
+    }
 }
 
 impl RegName {
@@ -141,7 +150,7 @@ impl AsmLine {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RegLocation {
     Reg(RegName),
     Stack(usize),
@@ -157,14 +166,14 @@ impl Into<AsmValue> for RegLocation {
 }
 
 struct RegisterAllocatorState {
-    regs: HashMap<RegName, bool>,
+    regs: BTreeMap<RegName, bool>,
     stack: Vec<bool>,
     mapping: HashMap<Value, RegLocation>,
 }
 
 impl RegisterAllocatorState {
     fn new() -> Self {
-        let mut regs = HashMap::new();
+        let mut regs = BTreeMap::new();
         for i in 1..6 {
             regs.insert(RegName::TempT(i), false);
         }
@@ -211,7 +220,6 @@ impl RegisterAllocatorState {
     }
 }
 
-#[must_use]
 pub struct RegAddress {
     state: Rc<RefCell<RegisterAllocatorState>>,
     value: Value,

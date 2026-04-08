@@ -1,7 +1,4 @@
 use std::{collections::HashMap, fmt::Debug};
-
-use koopa::ir::values::Integer;
-
 use crate::ast_tool::{eval_binary_const, eval_unary_const, gen_binary_koopa_ir, gen_unary_koopa_ir};
 
 pub struct Background {
@@ -26,11 +23,9 @@ impl Background {
     }
 
     pub fn get_variable(&mut self, name: String) -> String {
-        if let Some(index) = self.variable_map.get(&name) {
-            format!("%{}_{}", name, index)
-        } else {
+        self.variable_map.get(&name).cloned().unwrap_or_else(|| {
             panic!("Variable {} not found in background", name);
-        }
+        })
     }
 
     pub fn set_variable(&mut self, name: String, value: String) {
@@ -60,11 +55,11 @@ impl ReturnValue {
 
 #[allow(unused)]
 pub trait AstNode: Debug {
-    fn to_koopa(&self, background: &mut Background) -> ReturnValue {
+    fn to_koopa(&self, bg: &mut Background) -> ReturnValue {
         ReturnValue::with_content(String::new())
     }
-    fn to_koopa_ir(&self, background: &mut Background) -> String {
-        self.to_koopa(background).content
+    fn to_koopa_ir(&self, bg: &mut Background) -> String {
+        self.to_koopa(bg).content
     }
 }
 
@@ -74,8 +69,8 @@ pub struct CompUnit {
 }
 
 impl AstNode for CompUnit {
-    fn to_koopa_ir(&self, background: &mut Background) -> String {
-        self.func_def.to_koopa_ir(background)
+    fn to_koopa_ir(&self, bg: &mut Background) -> String {
+        self.func_def.to_koopa_ir(bg)
     }
 }
 
@@ -87,10 +82,10 @@ pub struct FuncDef {
 }
 
 impl AstNode for FuncDef {
-    fn to_koopa_ir(&self, background: &mut Background) -> String {
+    fn to_koopa_ir(&self, bg: &mut Background) -> String {
         let mut ir = String::new();
-        let func_type_ir = self.func_type.to_koopa_ir(background);
-        let block_ir = self.block.to_koopa_ir(background);
+        let func_type_ir = self.func_type.to_koopa_ir(bg);
+        let block_ir = self.block.to_koopa_ir(bg);
         ir.push_str(&format!("fun @{}(): {} {{\n%entry:\n", self.ident, func_type_ir));
         ir.push_str(&block_ir);
         ir.push_str("}\n");
@@ -105,7 +100,7 @@ pub enum FuncType {
 }
 
 impl AstNode for FuncType {
-    fn to_koopa_ir(&self, _background: &mut Background) -> String {
+    fn to_koopa_ir(&self, _bg: &mut Background) -> String {
         match self {
             FuncType::Void => "void".to_string(),
             FuncType::Int => "i32".to_string(),
@@ -119,10 +114,10 @@ pub struct Block {
 }
 
 impl AstNode for Block {
-    fn to_koopa_ir(&self, background: &mut Background) -> String {
+    fn to_koopa_ir(&self, bg: &mut Background) -> String {
         let mut ir = String::new();
         for stmt in &self.stmts {
-            ir.push_str(&stmt.to_koopa_ir(background));
+            ir.push_str(&stmt.to_koopa_ir(bg));
         }
         ir
     }
@@ -136,11 +131,11 @@ pub enum Stmt {
 }
 
 impl AstNode for Stmt {
-    fn to_koopa_ir(&self, background: &mut Background) -> String {
+    fn to_koopa_ir(&self, bg: &mut Background) -> String {
         match self {
             Stmt::Assign(ident, exp) => {
-                let exp_ret = exp.to_koopa(background);
-                background.set_variable(ident.clone(), exp_ret.value.unwrap());
+                let exp_ret = exp.to_koopa(bg);
+                bg.set_variable(ident.clone(), exp_ret.value.unwrap());
                 exp_ret.content
             }
             Stmt::Decl(typ, decls) => {
@@ -149,12 +144,12 @@ impl AstNode for Stmt {
                     Type::Var(_t) => {
                         for decl in decls {
                             if let Some(init) = &decl.init {
-                                let init_ret = init.to_koopa(background);
+                                let init_ret = init.to_koopa(bg);
                                 content.push_str(&init_ret.content);
-                                background.set_variable(decl.ident.clone(), init_ret.value.unwrap());
+                                bg.set_variable(decl.ident.clone(), init_ret.value.unwrap());
                             } else {
-                                let var_name = background.next_temp();
-                                background.set_variable(decl.ident.clone(), var_name);
+                                let var_name = bg.next_temp();
+                                bg.set_variable(decl.ident.clone(), var_name);
                             }
                         }
                         content
@@ -162,8 +157,8 @@ impl AstNode for Stmt {
                     Type::Const(_t) => {
                         for decl in decls {
                             if let Some(init) = &decl.init {
-                                let value = init.try_eval_const().expect("Const variable must be initialized with a constant expression");
-                                background.constant_map.insert(decl.ident.clone(), value);
+                                let value = init.try_eval_const(bg).expect("Const variable must be initialized with a constant expression");
+                                bg.constant_map.insert(decl.ident.clone(), value);
                             } else {
                                 panic!("Const variable {} must be initialized", decl.ident);
                             }
@@ -173,7 +168,7 @@ impl AstNode for Stmt {
                 }
             }
             Stmt::Return(num) => {
-                let ret = num.to_koopa(background);
+                let ret = num.to_koopa(bg);
                 let additional_ir = format!("  ret {}\n", ret.value.unwrap());
                 format!("{}{}", ret.content, additional_ir)
             }
@@ -207,30 +202,30 @@ pub enum Exp {
 }
 
 impl AstNode for Exp {
-    fn to_koopa(&self, background: &mut Background) -> ReturnValue {
+    fn to_koopa(&self, bg: &mut Background) -> ReturnValue {
         match self {
             Exp::Number(num) => ReturnValue::new(Some(num.to_string()), String::new()),
             Exp::UnaryExp(op, exp) => {
-                let exp_ret = exp.to_koopa(background);
+                let exp_ret = exp.to_koopa(bg);
                 let src = exp_ret.value.clone().unwrap();
                 exp_ret.extend(
-                    gen_unary_koopa_ir(op, src, background)
+                    gen_unary_koopa_ir(op, src, bg)
                 )
             }
             Exp::BinaryExp(op, left, right) => {
-                let left_ret = left.to_koopa(background);
-                let right_ret = right.to_koopa(background);
+                let left_ret = left.to_koopa(bg);
+                let right_ret = right.to_koopa(bg);
                 let src_1 = left_ret.value.clone().unwrap();
                 let src_2 = right_ret.value.clone().unwrap();
                 left_ret.extend(right_ret).extend(
-                    gen_binary_koopa_ir(op, src_1, src_2, background)
+                    gen_binary_koopa_ir(op, src_1, src_2, bg)
                 )
             }
             Exp::Ident(name) => {
-                if let Some(const_value) = background.constant_map.get(name) {
+                if let Some(const_value) = bg.constant_map.get(name) {
                     ReturnValue::new(Some(const_value.to_string()), String::new())
                 } else {
-                    let var_name = background.get_variable(name.clone());
+                    let var_name = bg.get_variable(name.clone());
                     ReturnValue::new(Some(var_name), String::new())
                 }
             }
@@ -239,19 +234,21 @@ impl AstNode for Exp {
 }
 
 impl Exp {
-    fn try_eval_const(&self) -> Option<i32> {
+    fn try_eval_const(&self, bg: &Background) -> Option<i32> {
         match self {
             Exp::Number(num) => Some(*num),
             Exp::UnaryExp(op, exp) => {
-                let value = exp.try_eval_const()?;
+                let value = exp.try_eval_const(bg)?;
                 Some(eval_unary_const(op, value))
             }
             Exp::BinaryExp(op, left, right) => {
-                let lhs = left.try_eval_const()?;
-                let rhs = right.try_eval_const()?;
+                let lhs = left.try_eval_const(bg)?;
+                let rhs = right.try_eval_const(bg)?;
                 Some(eval_binary_const(op, lhs, rhs))
             }
-            Exp::Ident(_) => None,
+            Exp::Ident(name) => {
+                bg.constant_map.get(name).cloned()
+            }
         }
     }
 }

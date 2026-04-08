@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
-
 use koopa::ir::dfg::DataFlowGraph;
 use koopa::ir::entities::ValueData;
 use koopa::ir::values::{Binary, BinaryOp};
 use koopa::ir::{Value, ValueKind};
 use koopa::ir::{FunctionData, Program};
-use crate::riscv::{AsmLine, RegAddress, RegName, RegisterAllocator};
+use crate::riscv::{AsmLine, RegAddress, RegLocation, RegName, RegisterAllocator};
 use crate::asm_tool::regaddress_to_regname;
 
 fn name_to_symbol(name: &str) -> String {
@@ -103,9 +102,34 @@ struct TempRecord {
 
 impl TempRecord {
     pub fn from_value(value: Value, bg: &Background, loc: RegAddress) -> TempRecord {
+        println!("Creating TempRecord for value {:?}, used by: {:?}", value, bg.get_value(value).used_by());
         TempRecord {
             loc: loc,
             used_by: bg.get_value(value).used_by().clone(),
+        }
+    }
+}
+
+struct ConsumedTemp {
+    reg: RegName,
+    _hold: Option<RegAddress>,
+}
+
+impl ConsumedTemp {
+    fn new(reg: RegName, hold: Option<RegAddress>) -> Self {
+        Self { reg, _hold: hold }
+    }
+
+    fn reg(&self) -> RegName {
+        self.reg.clone()
+    }
+}
+
+impl Into<ConsumedTemp> for RegName {
+    fn into(self) -> ConsumedTemp {
+        ConsumedTemp {
+            reg: self,
+            _hold: None,
         }
     }
 }
@@ -115,18 +139,16 @@ fn consume_temp_reg(
     user: Value,
     temp_value: &mut HashMap<Value, TempRecord>,
     asm: &mut Asm,
-) -> Option<RegName> {
-    let mut should_release = false;
-    let mut reg = None;
-    if let Some(record) = temp_value.get_mut(&operand) {
-        record.used_by.remove(&user);
-        should_release = record.used_by.is_empty();
-        reg = Some(regaddress_to_regname(&record.loc, asm));
-    }
-    if should_release {
-        temp_value.remove(&operand);
-    }
-    reg
+) -> Option<ConsumedTemp> {
+    let record = temp_value.get_mut(&operand)?;
+    record.used_by.remove(&user);
+    let reg = regaddress_to_regname(&record.loc, asm);
+    let hold = if record.used_by.is_empty() {
+        Some(temp_value.remove(&operand)?.loc)
+    } else {
+        None
+    };
+    Some(ConsumedTemp::new(reg, hold))
 }
 
 impl GenerateAsm for &FunctionData {
@@ -179,8 +201,8 @@ fn inst_to_asm(
                         asm.add_line(AsmLine::Li(RegName::Ret, c.value()));
                     }
                     _ => {
-                        let reg_name = consume_temp_reg(value, value, temp_value, asm).unwrap();
-                        asm.add_line(AsmLine::Mv(RegName::Ret, reg_name));
+                        let ret_value = consume_temp_reg(value, value, temp_value, asm).unwrap();
+                        asm.add_line(AsmLine::Mv(RegName::Ret, ret_value.reg()));
                     }
                 }
             }
@@ -200,15 +222,24 @@ fn inst_to_asm(
 fn operand_to_reg(
     operand: Value,
     user: Value,
+    ra: &RegisterAllocator,
     bg: &Background,
     temp_value: &mut HashMap<Value, TempRecord>,
     asm: &mut Asm,
-    scratch: RegName,
-) -> RegName {
+) -> ConsumedTemp {
     match bg.get_value(operand).kind() {
         ValueKind::Integer(c) => {
-            asm.add_line(AsmLine::Li(scratch.clone(), c.value()));
-            scratch
+            let dest = ra.register(operand);
+            println!("Loading immediate value {:?} into register {:?}", c.value(), dest.location);
+            match &dest.location {
+                RegLocation::Reg(reg) => {
+                    asm.add_line(AsmLine::Li(reg.clone(), c.value()));
+                    ConsumedTemp::new(reg.clone(), Some(dest))
+                }
+                RegLocation::Stack(_) => {
+                    unimplemented!()
+                }
+            }
         }
         _ => consume_temp_reg(operand, user, temp_value, asm).unwrap(),
     }
@@ -224,35 +255,35 @@ fn binary_to_asm(
 ) -> RegAddress {
     let dest = ra.register(value);
     let dest_reg = regaddress_to_regname(&dest, asm);
-    let lhs = operand_to_reg(binary.lhs(), value, bg, temp_value, asm, RegName::TempT(0));
-    let rhs = operand_to_reg(binary.rhs(), value, bg, temp_value, asm, RegName::TempT(1));
+    let lhs = operand_to_reg(binary.lhs(), value, ra, bg, temp_value, asm);
+    let rhs = operand_to_reg(binary.rhs(), value, ra, bg, temp_value, asm);
 
     match binary.op() {
-        BinaryOp::Add => asm.add_line(AsmLine::Add(dest_reg, lhs, rhs)),
-        BinaryOp::Sub => asm.add_line(AsmLine::Sub(dest_reg, lhs, rhs)),
-        BinaryOp::Mul => asm.add_line(AsmLine::Mul(dest_reg, lhs, rhs)),
-        BinaryOp::Div => asm.add_line(AsmLine::Div(dest_reg, lhs, rhs)),
-        BinaryOp::Mod => asm.add_line(AsmLine::Rem(dest_reg, lhs, rhs)),
+        BinaryOp::Add => asm.add_line(AsmLine::Add(dest_reg, lhs.reg(), rhs.reg())),
+        BinaryOp::Sub => asm.add_line(AsmLine::Sub(dest_reg, lhs.reg(), rhs.reg())),
+        BinaryOp::Mul => asm.add_line(AsmLine::Mul(dest_reg, lhs.reg(), rhs.reg())),
+        BinaryOp::Div => asm.add_line(AsmLine::Div(dest_reg, lhs.reg(), rhs.reg())),
+        BinaryOp::Mod => asm.add_line(AsmLine::Rem(dest_reg, lhs.reg(), rhs.reg())),
         BinaryOp::Eq => {
-            asm.add_line(AsmLine::Xor(dest_reg.clone(), lhs, rhs));
+            asm.add_line(AsmLine::Xor(dest_reg.clone(), lhs.reg(), rhs.reg()));
             asm.add_line(AsmLine::Seqz(dest_reg.clone(), dest_reg));
         }
         BinaryOp::NotEq => {
-            asm.add_line(AsmLine::Xor(dest_reg.clone(), lhs, rhs));
+            asm.add_line(AsmLine::Xor(dest_reg.clone(), lhs.reg(), rhs.reg()));
             asm.add_line(AsmLine::Snez(dest_reg.clone(), dest_reg));
         }
         BinaryOp::Le => {
-            asm.add_line(AsmLine::Slt(dest_reg.clone(), rhs, lhs));
+            asm.add_line(AsmLine::Slt(dest_reg.clone(), rhs.reg(), lhs.reg()));
             asm.add_line(AsmLine::Xori(dest_reg.clone(), dest_reg, 1));
         }
-        BinaryOp::Lt => asm.add_line(AsmLine::Slt(dest_reg, lhs, rhs)),
+        BinaryOp::Lt => asm.add_line(AsmLine::Slt(dest_reg, lhs.reg(), rhs.reg())),
         BinaryOp::Ge => {
-            asm.add_line(AsmLine::Slt(dest_reg.clone(), lhs, rhs));
+            asm.add_line(AsmLine::Slt(dest_reg.clone(), lhs.reg(), rhs.reg()));
             asm.add_line(AsmLine::Xori(dest_reg.clone(), dest_reg, 1));
         }
-        BinaryOp::Gt => asm.add_line(AsmLine::Slt(dest_reg, rhs, lhs)),
-        BinaryOp::And => asm.add_line(AsmLine::And(dest_reg, lhs, rhs)),
-        BinaryOp::Or => asm.add_line(AsmLine::Or(dest_reg, lhs, rhs)),
+        BinaryOp::Gt => asm.add_line(AsmLine::Slt(dest_reg, rhs.reg(), lhs.reg())),
+        BinaryOp::And => asm.add_line(AsmLine::And(dest_reg, lhs.reg(), rhs.reg())),
+        BinaryOp::Or => asm.add_line(AsmLine::Or(dest_reg, lhs.reg(), rhs.reg())),
         _ => unimplemented!("{}", format!("Unsupported binary operation: {:?}", binary.op())),
     }
     dest

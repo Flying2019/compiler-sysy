@@ -1,4 +1,6 @@
 int main() {
-    const int a = 1 + 2 * 3;
-    return a;
+  int x = 10;
+  int y = x + 1;
+  int z = x * y + 1;
+  return z % 66;
 }
