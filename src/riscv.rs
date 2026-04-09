@@ -34,6 +34,7 @@ impl RegName {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub enum AsmValue {
     Reg(RegName),
     Offset(i32, RegName),
@@ -50,14 +51,21 @@ impl AsmValue {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub enum AsmLine {
+// PlaceHold
+    PlaceHold(String),
+// Symbol
+    Text,
+    Global(String),
+    Func(String),
 // Control flow
-    Label(i32),
-    Jump(i32),
+    Label(usize),
+    Jump(usize),
     Ret,
     Call(String),
-    Beqz(RegName, i32),
-    Bnez(RegName, i32),
+    Beqz(RegName, usize),
+    Bnez(RegName, usize),
 // Data movement
     Mv(RegName, RegName),
     Load(RegName, AsmValue),
@@ -89,6 +97,16 @@ pub enum AsmLine {
 impl AsmLine {
     pub fn to_string(&self) -> String {
         match self {
+        // PlaceHold
+            AsmLine::PlaceHold(s)
+                => panic!("PlaceHold should not be converted to string: {}", s),
+        // Symbol
+            AsmLine::Text
+                => "\t.text".to_string(),
+            AsmLine::Global(name)
+                => format!("\t.global {}", name),
+            AsmLine::Func(name)
+                => format!("{}:", name),
         // Control flow
             AsmLine::Label(id)
                 => format!("L{}:", id),

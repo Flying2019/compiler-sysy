@@ -74,6 +74,7 @@ pub struct Background {
     branch_counter: usize,
     constant_map: HashMap<String, i32>,
     rename_manager: RenameManager,
+    next_bb: Option<String>,
 }
 
 impl Background {
@@ -83,6 +84,7 @@ impl Background {
             branch_counter: 0,
             constant_map: HashMap::new(),
             rename_manager: RenameManager::new(),
+            next_bb: None,
         }
     }
 
@@ -133,6 +135,10 @@ impl Background {
         self.branch_counter += 1;
         branch_name
     }
+
+    pub fn set_next_br(&mut self, branch: String) {
+        self.next_bb = Some(branch);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -175,7 +181,7 @@ impl AstNode for FuncDef {
     fn to_koopa_ir(&self, bg: &mut Background) -> String {
         let mut ir = String::new();
         let func_type_ir = self.func_type.to_koopa_ir(bg);
-        let block_ir = self.block.to_koopa_ir(bg);
+        let block_ir = self.block.iter().map(|stmt| stmt.to_koopa_ir(bg)).collect::<String>();
         ir.push_str(&format!("fun @{}(): {} {{\n%entry:\n", self.ident, func_type_ir));
         ir.push_str(&block_ir);
         ir.push_str("}\n");
@@ -192,31 +198,30 @@ impl AstNode for FuncType {
     }
 }
 
-impl AstNode for Block {
-    fn to_koopa_ir(&self, bg: &mut Background) -> String {
-        let mut ir = String::new();
-        for stmt in &self.stmts {
-            ir.push_str(&stmt.to_koopa_ir(bg));
-            ir.push_str("\n");
-        }
-        ir
-    }
-}
-
 impl AstNode for Stmt {
     fn to_koopa_ir(&self, bg: &mut Background) -> String {
+        let next_bb: Option<String> = bg.next_bb.clone();
         match self {
             Stmt::Block(block) => {
                 let ts = bg.record();
                 bg.increment_time();
-                let block_ir = block.to_koopa_ir(bg);
+                let mut block_ir = String::new();
+                // Only the last statement in the block set bb to next_bb. Others set to None.
+                for (id, stmt) in block.iter().enumerate() {
+                    if id == block.len() - 1 && next_bb.is_some() {
+                        bg.next_bb = next_bb.clone();
+                    } else {
+                        bg.next_bb = None;
+                    }
+                    block_ir.push_str(&stmt.to_koopa_ir(bg));
+                }
                 bg.rollback(ts);
                 block_ir
             }
             Stmt::Assign(ident, exp) => {
                 let exp_ret = exp.to_koopa(bg);
                 let ptr = bg.get_variable(ident.clone());
-                let store_ir = format!("  store {}, {}\n", exp_ret.value.unwrap(), ptr);
+                let store_ir = format!("\tstore {}, {}\n", exp_ret.value.unwrap(), ptr);
                 format!("{}{}", exp_ret.content, store_ir)
             }
             Stmt::Decl(typ, decls) => {
@@ -225,11 +230,11 @@ impl AstNode for Stmt {
                     Type::Var(_t) => {
                         for decl in decls {
                             let ptr_name = bg.new_variable(decl.ident.clone());
-                            content.push_str(&format!("  {} = alloc i32\n", ptr_name));
+                            content.push_str(&format!("\t{} = alloc i32\n", ptr_name));
                             if let Some(init) = &decl.init {
                                 let init_ret = init.to_koopa(bg);
                                 content.push_str(&init_ret.content);
-                                content.push_str(&format!("  store {}, {}\n", init_ret.value.unwrap(), ptr_name));
+                                content.push_str(&format!("\tstore {}, {}\n", init_ret.value.unwrap(), ptr_name));
                             }
                         }
                         content
@@ -251,39 +256,48 @@ impl AstNode for Stmt {
                 let exp_ret = exp.to_koopa(bg);
                 let cond = exp_ret.value.unwrap();
                 let br_name = bg.new_branch();
-                let then_branch = format!("{}_then", br_name);
-                let merge_branch = format!("{}_end", br_name);
+                let then_branch = format!("%{}_then", br_name);
+                let merge_branch = next_bb.clone().unwrap_or_else(|| format!("%{}_end", br_name));
                 let mut ir = String::new();
                 ir.push_str(&exp_ret.content);
-                ir.push_str(&format!("  br {}, {}, {}\n", cond, then_branch, merge_branch));
+                ir.push_str(&format!("\tbr {}, {}, {}\n", cond, then_branch, merge_branch));
                 ir.push_str(&format!("{}:\n", then_branch));
+                bg.set_next_br(merge_branch.clone());
                 ir.push_str(&stmt.to_koopa_ir(bg));
-                ir.push_str(&format!("  jump {}\n", merge_branch));
-                ir.push_str(&format!("{}:\n", merge_branch));
+                if next_bb.is_none() {
+                    ir.push_str(&format!("{}:\n", merge_branch));
+                }
+                else {
+                    ir.push_str(&format!("\tjump {}\n", merge_branch));
+                }
                 ir
-            } 
+            }
             Stmt::IfElse(exp, then_stmt, else_stmt) => {
                 let exp_ret = exp.to_koopa(bg);
                 let cond = exp_ret.value.unwrap();
                 let br_name = bg.new_branch();
                 let then_branch = format!("%{}_then", br_name);
                 let else_branch = format!("%{}_else", br_name);
-                let merge_branch = format!("%{}_end", br_name);
+                let merge_branch = next_bb.clone().unwrap_or_else(|| format!("%{}_end", br_name));
                 let mut ir = String::new();
                 ir.push_str(&exp_ret.content);
-                ir.push_str(&format!("  br {}, {}, {}\n\n", cond, then_branch, else_branch));
+                ir.push_str(&format!("\tbr {}, {}, {}\n\n", cond, then_branch, else_branch));
                 ir.push_str(&format!("{}:\n", then_branch));
                 ir.push_str(&then_stmt.to_koopa_ir(bg));
-                ir.push_str(&format!("  jump {}\n\n", merge_branch));
+                ir.push_str(&format!("\tjump {}\n", merge_branch));
                 ir.push_str(&format!("{}:\n", else_branch));
                 ir.push_str(&else_stmt.to_koopa_ir(bg));
-                ir.push_str(&format!("  jump {}\n\n", merge_branch));
-                ir.push_str(&format!("{}:\n", merge_branch));
+                if next_bb.is_none() {
+                    ir.push_str(&format!("{}:\n", merge_branch));
+                }
+                else {
+                    ir.push_str(&format!("\tjump {}\n", merge_branch));
+                }
                 ir
             }
             Stmt::Return(num) => {
                 let ret = num.to_koopa(bg);
-                let additional_ir = format!("  ret {}\n", ret.value.unwrap());
+                let additional_ir = format!("\tret {}\n", ret.value.unwrap());
                 format!("{}{}", ret.content, additional_ir)
             }
             Stmt::Exp(exp) => {
@@ -291,6 +305,18 @@ impl AstNode for Stmt {
                 exp_ret.content
             }
             Stmt::Empty => String::new(),
+        }
+    }
+}
+
+impl Stmt {
+    fn may_goto_next(&self) -> bool {
+        match self {
+            Stmt::Return(_) => false,
+            Stmt::If(_, then_stmt) => then_stmt.may_goto_next(),
+            Stmt::IfElse(_, then_stmt, else_stmt) => then_stmt.may_goto_next() || else_stmt.may_goto_next(),
+            Stmt::Block(stmts) => stmts.iter().any(|stmt| stmt.may_goto_next()),
+            Stmt::Assign(_, _) | Stmt::Decl(_, _) | Stmt::Exp(_) | Stmt::Empty => true,
         }
     }
 }
@@ -321,7 +347,7 @@ impl AstNode for Exp {
                 } else {
                     let ptr_name = bg.get_variable(name.clone());
                     let loaded_name = bg.next_temp();
-                    let load_ir = format!("  {} = load {}\n", loaded_name, ptr_name);
+                    let load_ir = format!("\t{} = load {}\n", loaded_name, ptr_name);
                     ReturnValue::new(Some(loaded_name), load_ir)
                 }
             }

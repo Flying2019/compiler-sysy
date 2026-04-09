@@ -7,7 +7,7 @@ pub struct CompUnit {
 pub struct FuncDef {
     pub func_type: FuncType,
     pub ident: String,
-    pub block: Block,
+    pub block: Vec<Stmt>,
 }
 
 #[derive(Debug)]
@@ -17,13 +17,8 @@ pub enum FuncType {
 }
 
 #[derive(Debug)]
-pub struct Block {
-    pub stmts: Vec<Stmt>,
-}
-
-#[derive(Debug)]
 pub enum Stmt {
-    Block(Block),
+    Block(Vec<Stmt>),
     Assign(String, Exp),
     Decl(Type, Vec<SingleDecl>),
     Return(Exp),

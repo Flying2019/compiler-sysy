@@ -26,7 +26,7 @@ FuncDef: FuncDef = {
 FuncType: FuncType =
   "int" => FuncType::Int;
 
-Block: Block = "{" <stmts: StmtList> "}" => Block { stmts };
+Block: Vec<Stmt> = "{" <stmts: StmtList> "}" => stmts;
 
 StmtList: Vec<Stmt> = {
   => Vec::new(),
@@ -38,13 +38,22 @@ StmtList: Vec<Stmt> = {
 };
 
 Stmt: Stmt = {
-  <Type> <MultipleDecl> ";" => Stmt::Decl(<>),
-  "if" "(" <exp: Exp> ")" <stmt: SingleStmt> => Stmt::If(exp, Box::new(stmt)),
-  "if" "(" <exp: Exp> ")" <then_stmt: SingleStmt> "else" <else_stmt: Stmt> => Stmt::IfElse(exp, Box::new(then_stmt), Box::new(else_stmt)),
-  SingleStmt => <>,
+  OpenStmt => <>,
+  ClosedStmt => <>,
 }
 
-SingleStmt: Stmt = {
+OpenStmt: Stmt = {
+  "if" "(" <exp: Exp> ")" <stmt: Stmt> => Stmt::If(exp, Box::new(stmt)),
+  "if" "(" <exp: Exp> ")" <then_stmt: ClosedStmt> "else" <else_stmt: OpenStmt> => Stmt::IfElse(exp, Box::new(then_stmt), Box::new(else_stmt)),
+}
+
+ClosedStmt: Stmt = {
+  NonIfStmt => <>,
+  "if" "(" <exp: Exp> ")" <then_stmt: ClosedStmt> "else" <else_stmt: ClosedStmt> => Stmt::IfElse(exp, Box::new(then_stmt), Box::new(else_stmt)),
+}
+
+NonIfStmt: Stmt = {
+  <Type> <MultipleDecl> ";" => Stmt::Decl(<>),
   <Block> => Stmt::Block(<>),
   <Ident> "=" <Exp> ";" => Stmt::Assign(<>),
   "return" <Exp> ";" => Stmt::Return(<>),
