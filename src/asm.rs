@@ -438,6 +438,10 @@ fn inst_to_asm(
             panic!("Integer value should not be directly used as an instruction");
         }
         ValueKind::Binary(binary) => Some(binary_to_asm(value, binary, bg, ra, frame, asm, temp_value)),
-        _ => unimplemented!(),
+        ValueKind::Branch(br) => {
+            let cond = consume_or_load_operand(br.cond(), value, bg, ra, frame, temp_value, asm);
+            unimplemented!();
+        }
+        _ => panic!("Unsupported instruction: {:?}", inst.kind()),
     }
 }

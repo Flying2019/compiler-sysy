@@ -28,6 +28,8 @@ pub enum Stmt {
     Decl(Type, Vec<SingleDecl>),
     Return(Exp),
     Exp(Exp),
+    If(Exp, Box<Stmt>),
+    IfElse(Exp, Box<Stmt>, Box<Stmt>),
     Empty,
 }
 

@@ -71,6 +71,7 @@ impl RenameManager {
 
 pub struct Background {
     temp_counter: usize,
+    branch_counter: usize,
     constant_map: HashMap<String, i32>,
     rename_manager: RenameManager,
 }
@@ -79,6 +80,7 @@ impl Background {
     pub fn new() -> Self {
         Self {
             temp_counter: 0,
+            branch_counter: 0,
             constant_map: HashMap::new(),
             rename_manager: RenameManager::new(),
         }
@@ -114,7 +116,7 @@ impl Background {
         self.constant_map.insert(name, value);
     }
 
-    pub fn increment(&mut self) {
+    pub fn increment_time(&mut self) {
         self.rename_manager.increment();
     }
 
@@ -124,6 +126,12 @@ impl Background {
 
     pub fn rollback(&mut self, timestamp: usize) {
         self.rename_manager.rollback(timestamp);
+    }
+
+    pub fn new_branch(&mut self) -> String {
+        let branch_name = format!("br{}", self.branch_counter);
+        self.branch_counter += 1;
+        branch_name
     }
 }
 
@@ -200,7 +208,7 @@ impl AstNode for Stmt {
         match self {
             Stmt::Block(block) => {
                 let ts = bg.record();
-                bg.increment();
+                bg.increment_time();
                 let block_ir = block.to_koopa_ir(bg);
                 bg.rollback(ts);
                 block_ir
@@ -238,6 +246,40 @@ impl AstNode for Stmt {
                         content
                     }
                 }
+            }
+            Stmt::If(exp, stmt) => {
+                let exp_ret = exp.to_koopa(bg);
+                let cond = exp_ret.value.unwrap();
+                let br_name = bg.new_branch();
+                let then_branch = format!("{}_then", br_name);
+                let merge_branch = format!("{}_end", br_name);
+                let mut ir = String::new();
+                ir.push_str(&exp_ret.content);
+                ir.push_str(&format!("  br {}, {}, {}\n", cond, then_branch, merge_branch));
+                ir.push_str(&format!("{}:\n", then_branch));
+                ir.push_str(&stmt.to_koopa_ir(bg));
+                ir.push_str(&format!("  jump {}\n", merge_branch));
+                ir.push_str(&format!("{}:\n", merge_branch));
+                ir
+            } 
+            Stmt::IfElse(exp, then_stmt, else_stmt) => {
+                let exp_ret = exp.to_koopa(bg);
+                let cond = exp_ret.value.unwrap();
+                let br_name = bg.new_branch();
+                let then_branch = format!("%{}_then", br_name);
+                let else_branch = format!("%{}_else", br_name);
+                let merge_branch = format!("%{}_end", br_name);
+                let mut ir = String::new();
+                ir.push_str(&exp_ret.content);
+                ir.push_str(&format!("  br {}, {}, {}\n\n", cond, then_branch, else_branch));
+                ir.push_str(&format!("{}:\n", then_branch));
+                ir.push_str(&then_stmt.to_koopa_ir(bg));
+                ir.push_str(&format!("  jump {}\n\n", merge_branch));
+                ir.push_str(&format!("{}:\n", else_branch));
+                ir.push_str(&else_stmt.to_koopa_ir(bg));
+                ir.push_str(&format!("  jump {}\n\n", merge_branch));
+                ir.push_str(&format!("{}:\n", merge_branch));
+                ir
             }
             Stmt::Return(num) => {
                 let ret = num.to_koopa(bg);

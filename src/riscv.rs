@@ -56,6 +56,8 @@ pub enum AsmLine {
     Jump(i32),
     Ret,
     Call(String),
+    Beqz(RegName, i32),
+    Bnez(RegName, i32),
 // Data movement
     Mv(RegName, RegName),
     Load(RegName, AsmValue),
@@ -96,6 +98,10 @@ impl AsmLine {
                 => "\tret".to_string(),
             AsmLine::Call(func)
                 => format!("\tcall {}", func),
+            AsmLine::Beqz(reg, id)
+                => format!("\tbeqz {}, L{}", reg.to_string(), id),
+            AsmLine::Bnez(reg, id)
+                => format!("\tbnez {}, L{}", reg.to_string(), id),
         // Data movement
             AsmLine::Mv(dest, src)
                 => format!("\tmv {}, {}", dest.to_string(), src.to_string()),

@@ -17,14 +17,14 @@ IntConst: i32 = {
   r"0[xX][0-9a-fA-F]+" => i32::from_str_radix(&<>[2..], 16).unwrap(),
 }
 
-pub CompUnit: CompUnit = <func_def: FuncDef> => CompUnit { func_def };
+pub CompUnit: CompUnit = <func_def: FuncDef> => CompUnit { <> };
 
 FuncDef: FuncDef = {
-  <func_type: FuncType> <ident: Ident> "(" ")" <block: Block> => FuncDef { func_type, ident, block }
+  <func_type: FuncType> <ident: Ident> "(" ")" <block: Block> => FuncDef { <> }
 }
 
-FuncType:
-  FuncType = "int" => FuncType::Int;
+FuncType: FuncType =
+  "int" => FuncType::Int;
 
 Block: Block = "{" <stmts: StmtList> "}" => Block { stmts };
 
@@ -38,16 +38,22 @@ StmtList: Vec<Stmt> = {
 };
 
 Stmt: Stmt = {
-  <block: Block> => Stmt::Block(block),
-  <ident: Ident> "=" <exp: Exp> ";" => Stmt::Assign(ident, exp),
-  <typ: Type> <decls: MultipleDecl> ";" => Stmt::Decl(typ, decls),
-  "return" <exp: Exp> ";" => Stmt::Return(<>),
-  <exp: Exp> ";" => Stmt::Exp(exp),
+  <Type> <MultipleDecl> ";" => Stmt::Decl(<>),
+  "if" "(" <exp: Exp> ")" <stmt: SingleStmt> => Stmt::If(exp, Box::new(stmt)),
+  "if" "(" <exp: Exp> ")" <then_stmt: SingleStmt> "else" <else_stmt: Stmt> => Stmt::IfElse(exp, Box::new(then_stmt), Box::new(else_stmt)),
+  SingleStmt => <>,
+}
+
+SingleStmt: Stmt = {
+  <Block> => Stmt::Block(<>),
+  <Ident> "=" <Exp> ";" => Stmt::Assign(<>),
+  "return" <Exp> ";" => Stmt::Return(<>),
+  <Exp> ";" => Stmt::Exp(<>),
   ";" => Stmt::Empty,
 }
 
 MultipleDecl: Vec<SingleDecl> = {
-  <single_decl: SingleDecl> => vec![single_decl],
+  <SingleDecl> => vec![<>],
   <single_decl: SingleDecl> "," <rest: MultipleDecl> => {
     let mut decls = vec![single_decl];
     decls.extend(rest);
@@ -63,32 +69,32 @@ SingleDecl: SingleDecl = {
 BType: BType = "int" => BType::Int;
 
 Type: Type = {
-  "const" <btype: BType> => Type::Const(btype),
-  <btype: BType> => Type::Var(btype),
+  "const" <BType> => Type::Const(<>),
+  <BType> => Type::Var(<>),
 }
 
 Exp: Exp = {
-  <exp: LOrExp> => exp,
+  <LOrExp> => <>,
 }
 
 PrimaryExp: Exp = {
-  "(" <exp: Exp> ")" => exp,
-  <int_const: IntConst> => Exp::Number(int_const),
-  <ident: Ident> => Exp::Ident(ident),
+  "(" <Exp> ")" => <>,
+  <IntConst> => Exp::Number(<>),
+  <Ident> => Exp::Ident(<>),
 }
 
 UnaryExp: Exp = {
-  <primary_exp: PrimaryExp> => primary_exp,
+  <PrimaryExp> => <>,
   <op: UnaryOp> <exp: UnaryExp> => Exp::UnaryExp(op, Box::new(exp)),
 }
 
 MulExp: Exp = {
-  <unary_exp: UnaryExp> => unary_exp,
+  <UnaryExp> => <>,
   <mul_exp: MulExp> <op: MulOp> <unary_exp: UnaryExp> => Exp::BinaryExp(op, Box::new(mul_exp), Box::new(unary_exp)),
 }
 
 AddExp: Exp = {
-  <mul_exp: MulExp> => mul_exp,
+  <MulExp> => <>,
   <add_exp: AddExp> <op: AddOp> <mul_exp: MulExp> => Exp::BinaryExp(op, Box::new(add_exp), Box::new(mul_exp)),
 }
 
@@ -110,7 +116,7 @@ AddOp: BinaryOp = {
 }
 
 RelExp: Exp = {
-  <add_exp: AddExp> => add_exp,
+  AddExp => <>,
   <rel_exp: RelExp> <op: RelOp> <add_exp: AddExp> => Exp::BinaryExp(op, Box::new(rel_exp), Box::new(add_exp)),
 }
 
@@ -122,7 +128,7 @@ RelOp: BinaryOp = {
 }
 
 EqExp: Exp = {
-  <rel_exp: RelExp> => rel_exp,
+  RelExp => <>,
   <eq_exp: EqExp> <op: EqOp> <rel_exp: RelExp> => Exp::BinaryExp(op, Box::new(eq_exp), Box::new(rel_exp)),
 }
 
@@ -132,11 +138,11 @@ EqOp: BinaryOp = {
 }
 
 LAndExp: Exp = {
-  <eq_exp: EqExp> => eq_exp,
+  EqExp => <>,
   <land_exp: LAndExp> "&&" <eq_exp: EqExp> => Exp::BinaryExp(BinaryOp::And, Box::new(land_exp), Box::new(eq_exp)),
 }
 
 LOrExp: Exp = {
-  <land_exp: LAndExp> => land_exp,
+  LAndExp => <>,
   <lor_exp: LOrExp> "||" <land_exp: LAndExp> => Exp::BinaryExp(BinaryOp::Or, Box::new(lor_exp), Box::new(land_exp)),
 }

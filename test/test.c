@@ -1,4 +1,10 @@
 int main() {
-  1 + 2;;1;
-  return 1 + 2 * 3 + 2;
+  int a = 1;
+  int b = 2;
+  if (a < b) {
+    a = a + 1;
+  } else {
+    b = b + 1;
+  }
+  return a;
 }
