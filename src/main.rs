@@ -50,13 +50,15 @@ fn main() -> Result<()> {
         Mode::Koopa => {
             let input = read_to_string(args.input)?;
             let ast = sysy::CompUnitParser::new().parse(&input).expect("Failed to parse input");
-            let koopa_ir = ast.to_koopa_ir(&mut compile_sysy::ast::Background::new());
-            std::fs::write(args.output, koopa_ir)?;
+            let koopa_lines = ast.to_koopa_lines(&mut compile_sysy::ast::Background::new());
+            std::fs::write(args.output, koopa_lines.to_string())?;
         }
         Mode::Riscv => {
             let input = read_to_string(args.input)?;
             let ast = sysy::CompUnitParser::new().parse(&input).expect("Failed to parse input");
-            let koopa_ir = ast.to_koopa_ir(&mut compile_sysy::ast::Background::new());
+            let koopa_ir = ast
+                .to_koopa_lines(&mut compile_sysy::ast::Background::new())
+                .to_string();
             println!("Generated Koopa IR:\n{}", koopa_ir);
             let driver = koopa::front::Driver::from(koopa_ir);
             let program = driver.generate_program().unwrap();

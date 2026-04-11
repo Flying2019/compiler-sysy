@@ -1,15 +1,15 @@
-use crate::{ast::{Background, ReturnValue}, lalr::{BinaryOp, UnaryOp}};
+use crate::{ast::{AstNode, Background, ReturnValue}, lalr::{BinaryOp, Exp, UnaryOp}};
+use crate::koopa::{KoopaLine, KoopaLines};
 
 
 pub fn gen_unary_koopa_ir(op: &UnaryOp, src: String, background: &mut Background) -> ReturnValue {
     let dst = background.next_temp();
-    let ir =
-    match op {
-        UnaryOp::Pos => format!("  {} = add 0, {}\n", dst, src),
-        UnaryOp::Neg => format!("  {} = sub 0, {}\n", dst, src),
-        UnaryOp::Not => format!("  {} = eq {}, 0\n", dst, src),
+    let line = match op {
+        UnaryOp::Pos => KoopaLine::Binary(dst.clone(), "add".to_string(), "0".to_string(), src),
+        UnaryOp::Neg => KoopaLine::Binary(dst.clone(), "sub".to_string(), "0".to_string(), src),
+        UnaryOp::Not => KoopaLine::Binary(dst.clone(), "eq".to_string(), src, "0".to_string()),
     };
-    ReturnValue { value: Some(dst), content: ir }
+    ReturnValue { value: Some(dst), content: KoopaLines::with_line(line) }
 }
 
 pub fn eval_unary_const(op: &UnaryOp, value: i32) -> i32 {
@@ -20,44 +20,38 @@ pub fn eval_unary_const(op: &UnaryOp, value: i32) -> i32 {
     }
 }
 
-pub fn gen_binary_koopa_ir(op: &BinaryOp, lhs: String, rhs: String, background: &mut Background) -> ReturnValue {
+pub fn gen_binary_koopa_ir(op: &BinaryOp, lhs: &Box<Exp>, rhs: &Box<Exp>, bg: &mut Background) -> ReturnValue {
     match op {
-        BinaryOp::And => {
-            let dst_1 = background.next_temp();
-            let dst_2 = background.next_temp();
-            let dst = background.next_temp();
-            let ir = format!(
-                "  {} = ne {}, 0\n  {} = ne {}, 0\n  {} = and {}, {}\n",
-                dst_1, lhs, dst_2, rhs, dst, dst_1, dst_2);
-            return ReturnValue { value: Some(dst), content: ir }
+        BinaryOp::And | BinaryOp::Or => {
+            // These logical operations require short-circuit evaluation, so we need to generate more complex IR.
+            unimplemented!()
         }
-        BinaryOp::Or => {
-            let dst_1 = background.next_temp();
-            let dst = background.next_temp();
-            let ir = format!(
-                "  {} = or {}, {}\n  {} = ne {}, 0\n",
-                dst_1, lhs, rhs, dst, dst_1);
-            return ReturnValue { value: Some(dst), content: ir }
+        _ => {
+            let dst = bg.next_temp();
+            let op_name = match op {
+                BinaryOp::Add => "add",
+                BinaryOp::Sub => "sub",
+                BinaryOp::Mul => "mul",
+                BinaryOp::Div => "div",
+                BinaryOp::Mod => "mod",
+                BinaryOp::Lt => "lt",
+                BinaryOp::Gt => "gt",
+                BinaryOp::Le => "le",
+                BinaryOp::Ge => "ge",
+                BinaryOp::Eq => "eq",
+                BinaryOp::Ne => "ne",
+                _ => unimplemented!("Unsupported binary operation: {:?}", op),
+            };
+            let lhs_ret = lhs.to_koopa(bg);
+            let rhs_ret = rhs.to_koopa(bg);
+            let lhs_src = lhs_ret.value.clone().unwrap();
+            let rhs_src = rhs_ret.value.clone().unwrap();
+            let mut ir = lhs_ret.content;
+            ir.add_lines(rhs_ret.content);
+            ir.add_line(KoopaLine::Binary(dst.clone(), op_name.to_string(), lhs_src, rhs_src));
+            ReturnValue { value: Some(dst), content: ir }
         }
-        _ => {}
-    };
-    let dst = background.next_temp();
-    let ir =
-    match op {
-        BinaryOp::Add => format!("  {} = add {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Sub => format!("  {} = sub {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Mul => format!("  {} = mul {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Div => format!("  {} = div {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Mod => format!("  {} = mod {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Lt => format!("  {} = lt {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Gt => format!("  {} = gt {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Le => format!("  {} = le {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Ge => format!("  {} = ge {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Eq => format!("  {} = eq {}, {}\n", dst, lhs, rhs),
-        BinaryOp::Ne => format!("  {} = ne {}, {}\n", dst, lhs, rhs),
-        _ => unimplemented!("Unsupported binary operation: {:?}", op),
-    };
-    ReturnValue { value: Some(dst), content: ir }
+    }
 }
 
 pub fn eval_binary_const(op: &BinaryOp, lhs: i32, rhs: i32) -> i32 {
