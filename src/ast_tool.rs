@@ -70,12 +70,16 @@ impl RenameManager {
     }
 }
 
+type NextBb = Option<String>;
+
 pub struct Background {
     temp_counter: usize,
     branch_counter: usize,
     constant_map: HashMap<String, i32>,
     rename_manager: RenameManager,
-    next_bb: Option<String>,
+    next_bb: NextBb,
+    loop_next: NextBb,
+    loop_entry: NextBb,
 }
 
 impl Background {
@@ -86,6 +90,8 @@ impl Background {
             constant_map: HashMap::new(),
             rename_manager: RenameManager::new(),
             next_bb: None,
+            loop_next: None,
+            loop_entry: None,
         }
     }
 
@@ -131,25 +137,38 @@ impl Background {
         self.rename_manager.rollback(timestamp);
     }
 
-    pub fn new_branch(&mut self) -> String {
-        let branch_name = format!("%br{}", self.branch_counter);
+    pub fn new_bb(&mut self) -> String {
+        let branch_name = format!("%bb{}", self.branch_counter);
         self.branch_counter += 1;
         branch_name
     }
 
-    pub fn next_bb(&self) -> Option<String> {
+    pub fn next_bb(&self) -> NextBb {
         self.next_bb.clone()
     }
 
-    pub fn set_next_bb(&mut self, bb: Option<String>) {
+    pub fn set_next_bb(&mut self, bb: NextBb) {
         self.next_bb = bb;
     }
 
     pub fn new_next_bb_if_none(&mut self) {
         if self.next_bb.is_none() {
-            let new_bb = self.new_branch();
+            let new_bb = self.new_bb();
             self.next_bb = Some(new_bb);
         }
+    }
+
+    pub fn get_loop_next(&self) -> NextBb {
+        self.loop_next.clone()
+    }
+
+    pub fn get_loop_entry(&self) -> NextBb {
+        self.loop_entry.clone()
+    }
+
+    pub fn set_loop(&mut self, next: NextBb, entry: NextBb) {
+        self.loop_next = next;
+        self.loop_entry = entry;
     }
 }
 
@@ -182,7 +201,7 @@ pub fn gen_binary_koopa_ir(op: &BinaryOp, lhs: &Box<Exp>, rhs: &Box<Exp>, bg: &m
             // These logical operations require short-circuit evaluation, so we need to generate more complex IR.
             let mut ir = lhs_ret.content;
             
-            let br_label = bg.new_branch();
+            let br_label = bg.new_bb();
             let br_then = format!("{}_then", br_label);
             let br_else = format!("{}_else", br_label);
             let br_end = format!("{}_end", br_label);

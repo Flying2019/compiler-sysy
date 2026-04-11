@@ -54,6 +54,9 @@ ClosedStmt: Stmt = {
 
 NonIfStmt: Stmt = {
   <Type> <MultipleDecl> ";" => Stmt::Decl(<>),
+  "while" "(" <exp: Exp> ")" <stmt: NonIfStmt> => Stmt::While(exp, Box::new(stmt)),
+  "continue" ";" => Stmt::Continue,
+  "break" ";" => Stmt::Break,
   <Block> => Stmt::Block(<>),
   <Ident> "=" <Exp> ";" => Stmt::Assign(<>),
   "return" <Exp> ";" => Stmt::Return(<>),

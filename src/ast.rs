@@ -125,16 +125,16 @@ impl AstNode for Stmt {
                     }
                 }
             }
-            Stmt::If(_, _) | Stmt::IfElse(_, _, _) | Stmt::Return(_) => {
-                // These methods require the next stmts is closed. So if next_bb = None, we will generate a new bb for the next stmts.
+            Stmt::If(_, _) | Stmt::IfElse(_, _, _) | Stmt::Return(_) | Stmt::While(_, _) | Stmt::Continue | Stmt::Break => {
+                // These methods require a closed basic block.
                 let mut ir = KoopaLines::new();
                 bg.new_next_bb_if_none();
                 match self {
                     Stmt::If(exp, stmt) => {
                         let exp_ret = exp.to_koopa(bg);
                         let cond = exp_ret.value.unwrap();
-                        let br_name = bg.new_branch();
-                        let then_branch = format!("{}_then", br_name);
+                        let bb_name = bg.new_bb();
+                        let then_branch = format!("{}_then", bb_name);
                         ir.add_lines(exp_ret.content);
                         ir.add_line(KoopaLine::Br(cond, then_branch.clone(), bg.next_bb().clone().unwrap()));
                         // Then Block
@@ -143,18 +143,43 @@ impl AstNode for Stmt {
                     Stmt::IfElse(exp, then_stmt, else_stmt) => {
                         let exp_ret = exp.to_koopa(bg);
                         let cond = exp_ret.value.unwrap();
-                        let br_name = bg.new_branch();
-                        let then_branch = format!("{}_then", br_name);
-                        let else_branch = format!("{}_else", br_name);
+                        let bb_name = bg.new_bb();
+                        let then_branch = format!("{}_then", bb_name);
+                        let else_branch = format!("{}_else", bb_name);
                         ir.add_lines(exp_ret.content);
                         ir.add_line(KoopaLine::Br(cond, then_branch.clone(), else_branch.clone()));
                         ir.add_lines(KoopaLines::make_block(then_stmt.to_koopa_lines(bg), then_branch, bg.next_bb().clone()));
                         ir.add_lines(KoopaLines::make_block(else_stmt.to_koopa_lines(bg), else_branch, bg.next_bb().clone()));
                     }
+                    Stmt::While(exp, stmt) => {
+                        let old_entry = bg.get_loop_entry();
+                        let old_next = bg.get_loop_next();
+                        let bb_name = bg.new_bb();
+                        let entry_bb = format!("{}_entry", bb_name);
+                        let body_bb = format!("{}_body", bb_name);
+                        ir.add_line(KoopaLine::Jump(entry_bb.clone()));
+                        ir.add_line(KoopaLine::Label(entry_bb.clone()));
+                        let exp_ret = exp.to_koopa(bg);
+                        ir.add_lines(exp_ret.content);
+                        bg.set_loop(bg.next_bb(), Some(entry_bb.clone()));
+                        let cond = exp_ret.value.unwrap();
+                        ir.add_line(KoopaLine::Br(cond, body_bb.clone(), bg.next_bb().clone().unwrap()));
+                        let old_next_bb = bg.next_bb();
+                        bg.set_next_bb(Some(entry_bb.clone()));
+                        ir.add_lines(KoopaLines::make_block(stmt.to_koopa_lines(bg), body_bb, Some(entry_bb)));
+                        bg.set_next_bb(old_next_bb);
+                        bg.set_loop(old_next, old_entry);
+                    }
                     Stmt::Return(num) => {
                         let ret = num.to_koopa(bg);
                         ir.add_lines(ret.content);
                         ir.add_line(KoopaLine::Ret(ret.value.unwrap()));
+                    }
+                    Stmt::Break => {
+                        ir.add_line(KoopaLine::Jump(bg.get_loop_next().unwrap()));
+                    }
+                    Stmt::Continue => {
+                        ir.add_line(KoopaLine::Jump(bg.get_loop_entry().unwrap()));
                     }
                     _ => unreachable!(),
                 }

@@ -25,6 +25,9 @@ pub enum Stmt {
     Exp(Exp),
     If(Exp, Box<Stmt>),
     IfElse(Exp, Box<Stmt>, Box<Stmt>),
+    While(Exp, Box<Stmt>),
+    Continue,
+    Break,
     Empty,
 }
 
