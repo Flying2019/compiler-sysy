@@ -3,12 +3,14 @@ pub enum KoopaLine {
     FuncStart(String, String),
     FuncEnd,
     Label(String),
+    ArgLabel(String, String, String), // %br(%a: type)
     Alloc(String),
     Store(String, String),
     Load(String, String),
     Binary(String, String, String, String),
     Br(String, String, String),
     Jump(String),
+    ArgJump(String, String), // jump %bb(%arg)
     Ret(String),
 }
 
@@ -17,7 +19,8 @@ impl KoopaLine {
         match self {
             KoopaLine::FuncStart(name, ret_type) => format!("fun @{}(): {} {{", name, ret_type),
             KoopaLine::FuncEnd => "}".to_string(),
-            KoopaLine::Label(label) => format!("{}:", label),
+            KoopaLine::Label(label) => format!("\n{}:", label),
+            KoopaLine::ArgLabel(label, arg_name, arg_type) => format!("\n{}({}: {}):", label, arg_name, arg_type),
             KoopaLine::Alloc(ptr) => format!("\t{} = alloc i32", ptr),
             KoopaLine::Store(value, ptr) => format!("\tstore {}, {}", value, ptr),
             KoopaLine::Load(dest, ptr) => format!("\t{} = load {}", dest, ptr),
@@ -28,6 +31,7 @@ impl KoopaLine {
                 format!("\tbr {}, {}, {}", cond, then_bb, else_bb)
             }
             KoopaLine::Jump(target) => format!("\tjump {}", target),
+            KoopaLine::ArgJump(target, arg) => format!("\tjump {}({})", target, arg),
             KoopaLine::Ret(value) => format!("\tret {}", value),
         }
     }

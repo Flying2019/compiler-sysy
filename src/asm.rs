@@ -1,7 +1,8 @@
+use core::panic;
 use std::collections::{HashMap, HashSet};
 use koopa::ir::dfg::DataFlowGraph;
-use koopa::ir::entities::ValueData;
-use koopa::ir::values::{Binary, BinaryOp};
+use koopa::ir::entities::{BasicBlockData, ValueData};
+use koopa::ir::values::{Binary, BinaryOp, Store};
 use koopa::ir::{BasicBlock, Value, ValueKind};
 use koopa::ir::{FunctionData, Program};
 use crate::riscv::{AsmLine, AsmValue, RegAddress, RegLocation, RegName, RegisterAllocator};
@@ -96,6 +97,10 @@ impl<'a> Background<'a> {
         self.dfg.unwrap().value(value)
     }
 
+    pub fn get_bb_data(&self, bb: BasicBlock) -> &BasicBlockData {
+        self.dfg.unwrap().bb(bb)
+    }
+
     pub fn frame(&self) -> &FunctionFrame {
         self.frame.unwrap()
     }
@@ -131,27 +136,27 @@ impl AsmContext {
         }
     }
 
-    fn asm_mut(&mut self) -> &mut Asm {
+    pub fn asm_mut(&mut self) -> &mut Asm {
         &mut self.asm
     }
 
-    fn asm_add_line(&mut self, line: AsmLine) {
+    pub fn asm_add_line(&mut self, line: AsmLine) {
         self.asm.add_line(line);
     }
 
-    fn temp_value_mut(&mut self) -> &mut HashMap<Value, TempRecord> {
+    pub fn temp_value_mut(&mut self) -> &mut HashMap<Value, TempRecord> {
         &mut self.temp_value
     }
 
-    fn insert_temp_record(&mut self, value: Value, record: TempRecord) {
+    pub fn insert_temp_record(&mut self, value: Value, record: TempRecord) {
         self.temp_value.insert(value, record);
     }
     
-    fn remove_temp_record(&mut self, value: &Value) -> Option<TempRecord> {
+    pub fn remove_temp_record(&mut self, value: &Value) -> Option<TempRecord> {
         self.temp_value.remove(value)
     }
 
-    fn get_branch_id(&mut self, bb: BasicBlock) -> usize {
+    pub fn get_branch_id(&mut self, bb: BasicBlock) -> usize {
         if let Some(name) = self.branch.get(&bb) {
             name.clone()
         } else {
@@ -176,7 +181,7 @@ impl GenerateAsm for Program {
     }
 }
 
-struct TempRecord {
+pub struct TempRecord {
     loc: RegAddress,
     used_by: HashSet<Value>,
 }
@@ -214,28 +219,35 @@ impl Into<ConsumedTemp> for RegName {
     }
 }
 
+/// A function frame that manages the stack layout for a function, including the mapping from local allocations to stack slots and the total number of stack words needed for the function.
 pub struct FunctionFrame {
-    alloc_slots: HashMap<Value, usize>,
-    alloc_words: usize,
+    local_slots: HashMap<Value, usize>,
+    local_words: usize,
 }
 
 impl FunctionFrame {
     fn from_function(func: &FunctionData, bg: &Background) -> Self {
-        let mut alloc_slots = HashMap::new();
-        let mut alloc_words = 0;
+        let mut local_slots = HashMap::new();
+        let mut local_words = 0;
         for (&_bb, node) in func.layout().bbs() {
             for &inst in node.insts().keys() {
                 if matches!(bg.get_value(inst).kind(), ValueKind::Alloc(_)) {
-                    alloc_slots.insert(inst, alloc_words);
-                    alloc_words += 1;
+                    local_slots.insert(inst, local_words);
+                    local_words += 1;
                 }
             }
         }
-        Self { alloc_slots, alloc_words }
+        for (&bb, _node) in func.layout().bbs() {
+            for &param in bg.get_bb_data(bb).params() {
+                local_slots.insert(param, local_words);
+                local_words += 1;
+            }
+        }
+        Self { local_slots, local_words }
     }
 
-    fn alloc_slot(&self, ptr: Value) -> Option<usize> {
-        self.alloc_slots.get(&ptr).cloned()
+    fn local_slot(&self, value: Value) -> Option<usize> {
+        self.local_slots.get(&value).cloned()
     }
 
     fn stack_slot_to_addr(&self, slot: usize) -> AsmValue {
@@ -243,7 +255,7 @@ impl FunctionFrame {
     }
 
     fn spill_slot_to_addr(&self, slot: usize) -> AsmValue {
-        let absolute_slot = self.alloc_words + slot;
+        let absolute_slot = self.local_words + slot;
         self.stack_slot_to_addr(absolute_slot)
     }
 }
@@ -326,6 +338,7 @@ fn load_integer_operand(
     }
 }
 
+/// Load an operand into a register, returning the register and the temporary values it holds (if any).
 fn load_operand(
     operand: Value,
     user: Value,
@@ -338,14 +351,15 @@ fn load_operand(
     }
 }
 
+/// Store the value of a store instruction to its destination, which should be a local allocation. The source value can be an immediate integer or a temporary value.
 fn store_to_asm(
-    store: &koopa::ir::values::Store,
+    store: &Store,
     bg: &Background,
     context: &mut AsmContext,
     user: Value,
 ) {
     let dest_ptr = store.dest();
-    let slot = bg.frame().alloc_slot(dest_ptr).expect("store destination should be local alloc");
+    let slot = bg.frame().local_slot(dest_ptr).expect("store destination should be local alloc");
     let src = store.value();
     match bg.get_value(src).kind() {
         ValueKind::Integer(c) => {
@@ -366,13 +380,14 @@ fn store_to_asm(
     }
 }
 
+/// Load the value of a load instruction into its destination register, which can be either a physical register or a spill slot. The source pointer should be a local allocation.
 fn load_to_asm(
     value: Value,
     src_ptr: Value,
     bg: &Background,
     context: &mut AsmContext,
 ) -> RegAddress {
-    let slot = bg.frame().alloc_slot(src_ptr).expect("load source should be local alloc");
+    let slot = bg.frame().local_slot(src_ptr).expect("load source should be local alloc");
     let dest = bg.ra().register(value);
     match dest.location.clone() {
         RegLocation::Reg(reg) => {
@@ -438,6 +453,65 @@ fn binary_to_asm(
     dest
 }
 
+fn load_block_param(
+    param: Value,
+    bg: &Background,
+    context: &mut AsmContext,
+) -> RegAddress {
+    let slot = bg.frame().local_slot(param).expect("block parameter should have stack slot");
+    let dest = bg.ra().register(param);
+    match dest.location.clone() {
+        RegLocation::Reg(reg) => {
+            context.asm_add_line(AsmLine::Load(reg, bg.frame().stack_slot_to_addr(slot)));
+        }
+        RegLocation::Stack(_) => {
+            let temp_addr = alloc_temp_reg_from_ra(param, bg.ra()).expect("No free register for block parameter load");
+            let temp_reg = match temp_addr.location.clone() {
+                RegLocation::Reg(reg) => reg,
+                RegLocation::Stack(_) => unreachable!(),
+            };
+            context.asm_add_line(AsmLine::Load(temp_reg.clone(), bg.frame().stack_slot_to_addr(slot)));
+            write_reg_to_location(&dest, temp_reg, bg.frame(), context);
+        }
+    }
+    dest
+}
+
+fn store_block_args(
+    target: BasicBlock,
+    args: &[Value],
+    user: Value,
+    bg: &Background,
+    context: &mut AsmContext,
+) {
+    let params = bg.get_bb_data(target).params();
+    if params.len() != args.len() {
+        panic!("Argument count does not match for jump/branch target {:?}", target);
+    }
+    for pos in 0..params.len() {
+        let arg = args[pos];
+        let param = params[pos];
+        let slot = bg.frame().local_slot(param).expect("block parameter should have stack slot");
+        match bg.get_value(arg).kind() {
+            ValueKind::Integer(c) => {
+                let temp_addr = alloc_temp_reg_from_ra(arg, bg.ra()).expect("No free register for block argument immediate");
+                let temp_reg = match temp_addr.location.clone() {
+                    RegLocation::Reg(reg) => reg,
+                    RegLocation::Stack(_) => unreachable!(),
+                };
+                context.asm_add_line(AsmLine::Li(temp_reg.clone(), c.value()));
+                context.asm_add_line(AsmLine::Store(bg.frame().stack_slot_to_addr(slot), temp_reg));
+            }
+            _ => {
+                let arg_reg = load_temp_reg(arg, user, bg, context)
+                    .expect("block argument should be available")
+                    .reg();
+                context.asm_add_line(AsmLine::Store(bg.frame().stack_slot_to_addr(slot), arg_reg));
+            }
+        }
+    }
+}
+
 impl GenerateAsm for &FunctionData {
     fn to_asm(&self, bg: &Background) -> Asm {
         let bg = &bg.with_dfg(&self.dfg());
@@ -447,16 +521,16 @@ impl GenerateAsm for &FunctionData {
         let mut result = Asm::new();
         let mut context = AsmContext::new();
         let name = name_to_symbol(self.name());
-        // result.add_text("\t.text".to_string());
-        // result.add_text(format!("\t.globl {}", name));
-        // result.add_text(format!("{}:", name));
         result.add_line(AsmLine::Text);
         result.add_line(AsmLine::Global(name.clone()));
         result.add_line(AsmLine::Func(name.clone()));
         for (&bb, node) in self.layout().bbs() {
             let br_id = context.get_branch_id(bb);
             context.asm_add_line(AsmLine::Label(br_id));
-            println!("Processing basic block {:?}", bb);
+            for &param in bg.get_bb_data(bb).params() {
+                let loaded = load_block_param(param, bg, &mut context);
+                context.insert_temp_record(param, TempRecord::from_value(param, &bg, loaded));
+            }
             let insts = node.insts().keys();
             for &inst in insts {
                 let ret = inst_to_asm(inst, &bg, &mut context);
@@ -465,7 +539,7 @@ impl GenerateAsm for &FunctionData {
                 }
             }
         }
-        let stack_words = frame.alloc_words + ra.max_stack_size();
+        let stack_words = frame.local_words + ra.max_stack_size();
         if stack_words > 0 {
             let stack_len = stack_words as i32 * 4;
             result.add_line(AsmLine::Addi(RegName::Stack, RegName::Stack, -stack_len));
@@ -517,6 +591,8 @@ fn inst_to_asm(
         ValueKind::Binary(binary) => Some(binary_to_asm(value, binary, bg, context)),
         ValueKind::Branch(br) => {
             let cond = load_operand(br.cond(), value, bg, context);
+            store_block_args(br.true_bb(), br.true_args(), value, bg, context);
+            store_block_args(br.false_bb(), br.false_args(), value, bg, context);
             let then_id = context.get_branch_id(br.true_bb());
             let else_id = context.get_branch_id(br.false_bb());
             context.asm_add_line(AsmLine::Beqz(cond.reg(), else_id));
@@ -524,6 +600,7 @@ fn inst_to_asm(
             None
         }
         ValueKind::Jump(jump) => {
+            store_block_args(jump.target(), jump.args(), value, bg, context);
             let target_id = context.get_branch_id(jump.target());
             context.asm_add_line(AsmLine::Jump(target_id));
             None
