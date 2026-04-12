@@ -1,4 +1,9 @@
-use compile_sysy::asm::{Background, GenerateAsm};
+use compile_sysy::asm;
+use compile_sysy::ast_tool;
+use compile_sysy::asm::GenerateAsm;
+use compile_sysy::ast_tool::scan_global_symbol;
+use compile_sysy::koopa::KoopaLines;
+use compile_sysy::lalr::CompUnit;
 use lalrpop_util::lalrpop_mod;
 use compile_sysy::ast::*;
 use std::env;
@@ -18,18 +23,13 @@ struct Args {
     #[arg(short, long, value_enum)]
     mode: Mode,
 
-    /// 输入文件路径
     input: PathBuf,
 
-    /// 输出文件路径
     #[arg(short, long)]
     output: PathBuf,
 }
 
-// 引用 lalrpop 生成的解析器
-// 因为我们刚刚创建了 sysy.lalrpop, 所以模块名是 sysy
 lalrpop_mod!(sysy);
-
 
 // 为了支持非标准的 -koopa 和 -riscv 形式进行的预处理
 fn preprocess_args() -> Vec<String> {
@@ -44,25 +44,39 @@ fn preprocess_args() -> Vec<String> {
     raw_args
 }
 
+fn str_to_ast(input: &str) -> CompUnit {
+    sysy::CompUnitParser::new().parse(input).expect("Failed to parse input")
+}
+
+fn ast_to_koopa_lines(ast: &CompUnit) -> KoopaLines {
+    let mut bg = ast_tool::Background::new();
+    scan_global_symbol(ast.clone(), &mut bg);
+    ast.to_koopa_lines(&mut bg)
+}
+
+fn ir_to_asm(koopa_ir: &str) -> String {
+    let driver = koopa::front::Driver::from(koopa_ir.to_string());
+    let program = driver.generate_program().unwrap();
+    let asm = program.to_asm(&asm::Background::new());
+    asm.to_string()
+}
+
 fn main() -> Result<()> {
     let args = Args::parse_from(preprocess_args());
     match args.mode {
         Mode::Koopa => {
             let input = read_to_string(args.input)?;
-            let ast = sysy::CompUnitParser::new().parse(&input).expect("Failed to parse input");
-            let koopa_lines = ast.to_koopa_lines(&mut compile_sysy::ast_tool::Background::new());
+            let ast = str_to_ast(&input);
+            let koopa_lines = ast_to_koopa_lines(&ast);
             std::fs::write(args.output, koopa_lines.to_string())?;
         }
         Mode::Riscv => {
             let input = read_to_string(args.input)?;
-            let ast = sysy::CompUnitParser::new().parse(&input).expect("Failed to parse input");
-            let koopa_ir = ast
-                .to_koopa_lines(&mut compile_sysy::ast_tool::Background::new())
-                .to_string();
+            let ast = str_to_ast(&input);
+            let koopa_lines = ast_to_koopa_lines(&ast);
+            let koopa_ir = koopa_lines.to_string();
             println!("Generated Koopa IR:\n{}", koopa_ir);
-            let driver = koopa::front::Driver::from(koopa_ir);
-            let program = driver.generate_program().unwrap();
-            let asm = program.to_asm(&Background::new());
+            let asm = ir_to_asm(&koopa_ir);
             std::fs::write(args.output, asm.to_string())?;
         }
     }

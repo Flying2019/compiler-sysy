@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{ast::{AstNode, ReturnValue}, lalr::{BinaryOp, Exp, UnaryOp}};
+use crate::{ast::{AstNode, ReturnValue}, lalr::{BType, BinaryOp, CompUnit, Exp, FuncType, Type, UnaryOp}};
 use crate::koopa::{KoopaLine, KoopaLines};
 
 pub struct RenameManager {
@@ -72,7 +72,24 @@ impl RenameManager {
 
 type NextBb = Option<String>;
 
+struct GlobalSymbols {
+    global_variable: HashMap<String, Type>,
+    global_function: HashMap<String, (FuncType, Vec<BType>)>, // function name -> (return type, parameter types)
+    static_function: HashMap<String, (FuncType, Vec<BType>)>, // function name -> (return type, parameter types)
+}
+
+impl GlobalSymbols {
+    pub fn new() -> Self {
+        Self {
+            global_variable: HashMap::new(),
+            global_function: HashMap::new(),
+            static_function: HashMap::new(),
+        }
+    }
+}
+
 pub struct Background {
+    global_symbols: GlobalSymbols,
     temp_counter: usize,
     branch_counter: usize,
     constant_map: HashMap<String, i32>,
@@ -85,6 +102,7 @@ pub struct Background {
 impl Background {
     pub fn new() -> Self {
         Self {
+            global_symbols: GlobalSymbols::new(),
             temp_counter: 0,
             branch_counter: 0,
             constant_map: HashMap::new(),
@@ -92,6 +110,28 @@ impl Background {
             next_bb: None,
             loop_next: None,
             loop_entry: None,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.temp_counter = 0;
+        self.branch_counter = 0;
+        self.constant_map.clear();
+        self.rename_manager = RenameManager::new();
+        self.next_bb = None;
+        self.loop_next = None;
+        self.loop_entry = None;
+    }
+
+    pub fn get_global_variable(&self, name: String) -> Option<&Type> {
+        self.global_symbols.global_variable.get(&name)
+    }
+
+    pub fn get_function(&self, name: String) -> Option<&(FuncType, Vec<BType>)> {
+        if let Some(func) = self.global_symbols.global_function.get(&name) {
+            Some(func)
+        } else {
+            self.global_symbols.static_function.get(&name)
         }
     }
 
@@ -104,7 +144,7 @@ impl Background {
 
     pub fn get_variable(&self, name: String) -> String {
         // println!("Getting variable: {}", name);
-        let count = self.rename_manager.get_current_name(&name).expect("Variable not found in the current scope");
+        let count = self.rename_manager.get_current_name(&name).expect(&format!("Variable {} not found in the current scope", name));
         variable_rename(name, count)
     }
 
@@ -182,14 +222,6 @@ pub fn gen_unary_koopa_ir(op: &UnaryOp, src: String, background: &mut Background
     ReturnValue { value: Some(dst), content: KoopaLines::with_line(line) }
 }
 
-pub fn eval_unary_const(op: &UnaryOp, value: i32) -> i32 {
-    match op {
-        UnaryOp::Pos => value,
-        UnaryOp::Neg => -value,
-        UnaryOp::Not => if value == 0 { 1 } else { 0 },
-    }
-}
-
 pub fn gen_binary_koopa_ir(op: &BinaryOp, lhs: &Box<Exp>, rhs: &Box<Exp>, bg: &mut Background) -> ReturnValue {
     let dst = bg.next_temp();
     let lhs_ret = lhs.to_koopa(bg);
@@ -251,6 +283,14 @@ pub fn gen_binary_koopa_ir(op: &BinaryOp, lhs: &Box<Exp>, rhs: &Box<Exp>, bg: &m
     }
 }
 
+pub fn eval_unary_const(op: &UnaryOp, value: i32) -> i32 {
+    match op {
+        UnaryOp::Pos => value,
+        UnaryOp::Neg => -value,
+        UnaryOp::Not => if value == 0 { 1 } else { 0 },
+    }
+}
+
 pub fn eval_binary_const(op: &BinaryOp, lhs: i32, rhs: i32) -> i32 {
     match op {
         BinaryOp::Add => lhs + rhs,
@@ -266,5 +306,16 @@ pub fn eval_binary_const(op: &BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Ne => if lhs != rhs { 1 } else { 0 },
         BinaryOp::And => if (lhs != 0) && (rhs != 0) { 1 } else { 0 },
         BinaryOp::Or => if (lhs != 0) || (rhs != 0) { 1 } else { 0 },
+    }
+}
+
+pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
+    for func_def in comp_unit.func_def {
+        let func_name = func_def.ident.clone();
+        let params: Vec<BType> = func_def.func_params.iter().map(|param| param.btype.clone()).collect();
+        if bg.global_symbols.global_function.contains_key(&func_name) {
+            panic!("Duplicate function definition: {}", func_name);
+        }
+        bg.global_symbols.global_function.insert(func_name, (func_def.func_type, params));
     }
 }

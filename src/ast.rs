@@ -35,18 +35,31 @@ pub trait AstNode: Debug {
 
 impl AstNode for CompUnit {
     fn to_koopa_lines(&self, bg: &mut Background) -> KoopaLines {
-        self.func_def.to_koopa_lines(bg)
+        if bg.get_function("main".to_string()).is_none() {
+            panic!("No main function defined, or global symbol scanner didn't run");
+        }
+        let mut lines = KoopaLines::new();
+        for func_def in &self.func_def {
+            bg.clear();
+            lines.add_lines(func_def.to_koopa_lines(bg));
+        }
+        lines
     }
 }
 
 impl AstNode for FuncDef {
     fn to_koopa_lines(&self, bg: &mut Background) -> KoopaLines {
         let mut lines = KoopaLines::new();
-        lines.add_line(KoopaLine::FuncStart(self.ident.clone(), self.func_type.to_koopa_type()));
+        let params = self.func_params.iter().map(FuncParam::to_koopa_param).collect::<Vec<_>>().join(", ");
+        lines.add_line(KoopaLine::FuncStart(self.ident.clone(), params, self.func_type.to_koopa_type()));
         lines.add_line(KoopaLine::Label("%entry".to_string()));
+        for param in &self.func_params {
+            let ptr_name = bg.new_variable(param.name.clone());
+            lines.add_line(KoopaLine::Alloc(ptr_name.clone(), param.to_koopa_type()));
+            lines.add_line(KoopaLine::Store(param.to_koopa_name(), ptr_name.clone()));
+        }
         lines.add_lines(self.block.to_koopa_lines(bg));
-        lines.remove_last_label();
-        lines.add_line(KoopaLine::FuncEnd);
+        lines.close();
         lines
     }
 }
@@ -56,6 +69,26 @@ impl FuncType {
         match self {
             FuncType::Void => "void".to_string(),
             FuncType::Int => "i32".to_string(),
+        }
+    }
+}
+
+impl FuncParam {
+    fn to_koopa_type(&self) -> String {
+        self.btype.to_koopa_type()
+    }
+    fn to_koopa_name(&self) -> String {
+        format!("@arg_{}", self.name)
+    }
+    fn to_koopa_param(&self) -> String {
+        format!("{}: {}", self.to_koopa_name(), self.to_koopa_type())
+    }
+}
+
+impl BType {
+    fn to_koopa_type(&self) -> String {
+        match self {
+            BType::Int => "i32".to_string()
         }
     }
 }
@@ -100,10 +133,10 @@ impl AstNode for Stmt {
             Stmt::Decl(typ, decls) => {
                 let mut content = KoopaLines::new();
                 match typ {
-                    Type::Var(_t) => {
+                    Type::Var(btype) => {
                         for decl in decls {
                             let ptr_name = bg.new_variable(decl.ident.clone());
-                            content.add_line(KoopaLine::Alloc(ptr_name.clone()));
+                            content.add_line(KoopaLine::Alloc(ptr_name.clone(), btype.to_koopa_type()));
                             if let Some(init) = &decl.init {
                                 let init_ret = init.to_koopa(bg);
                                 content.add_lines(init_ret.content);
@@ -171,9 +204,14 @@ impl AstNode for Stmt {
                         bg.set_loop(old_next, old_entry);
                     }
                     Stmt::Return(num) => {
-                        let ret = num.to_koopa(bg);
-                        ir.add_lines(ret.content);
-                        ir.add_line(KoopaLine::Ret(ret.value.unwrap()));
+                        match num {
+                            Some(num) => {
+                                let ret = num.to_koopa(bg);
+                                ir.add_lines(ret.content);
+                                ir.add_line(KoopaLine::Ret(ret.value.unwrap()));
+                            }
+                            None => ir.add_line(KoopaLine::VoidRet),
+                        }
                     }
                     Stmt::Break => {
                         ir.add_line(KoopaLine::Jump(bg.get_loop_next().unwrap()));
@@ -219,6 +257,28 @@ impl AstNode for Exp {
                     ReturnValue::new(Some(loaded_name), content)
                 }
             }
+            Exp::FuncCall(name, args) => {
+                let func_type = bg.get_function(name.clone()).cloned().unwrap().0;
+                let mut ir = KoopaLines::new();
+                let mut arg_values = Vec::new();
+                for arg in args {
+                    let arg_ret = arg.to_koopa(bg);
+                    ir.add_lines(arg_ret.content);
+                    arg_values.push(arg_ret.value.unwrap());
+                }
+                let args = arg_values.join(", ");
+                match func_type {
+                    FuncType::Void => {
+                        ir.add_line(KoopaLine::VoidCall(name.clone(), args));
+                        ReturnValue { value: None, content: ir }
+                    }
+                    FuncType::Int => {
+                        let ret_value = bg.next_temp();
+                        ir.add_line(KoopaLine::Call(ret_value.clone(), name.clone(), args));
+                        ReturnValue { value: Some(ret_value), content: ir }
+                    }
+                }
+            }
         }
     }
 }
@@ -239,6 +299,7 @@ impl Exp {
             Exp::Ident(name) => {
                 bg.try_get_constant(name.clone())
             }
+            Exp::FuncCall(_, _) => None,
         }
     }
 }

@@ -1,27 +1,39 @@
+pub type Type = String;
+pub type Label = String;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KoopaLine {
-    FuncStart(String, String),
+    FuncStart(String, String, Type),
     FuncEnd,
-    Label(String),
-    ArgLabel(String, String, String), // %br(%a: type)
-    Alloc(String),
+    Label(Label),
+    ArgLabel(Label, Label, Type), // %br(%a: type)
+    Alloc(Label, Type),
     Store(String, String),
     Load(String, String),
     Binary(String, String, String, String),
-    Br(String, String, String),
-    Jump(String),
-    ArgJump(String, String), // jump %bb(%arg)
+    Br(String, Label, Label),
+    Jump(Label),
+    ArgJump(Label, String), // jump %bb(%arg)
+    Call(String, String, String), // %dest = call @func(%arg)
+    VoidCall(String, String), // call @func(%arg)
     Ret(String),
+    VoidRet,
 }
 
 impl KoopaLine {
     pub fn to_string(&self) -> String {
         match self {
-            KoopaLine::FuncStart(name, ret_type) => format!("fun @{}(): {} {{", name, ret_type),
+            KoopaLine::FuncStart(name, args, ret_type) => {
+                if matches!(ret_type.as_str(), "void") {
+                    format!("fun @{}({}) {{", name, args)
+                } else {
+                    format!("fun @{}({}): {} {{", name, args, ret_type)
+                }
+            }
             KoopaLine::FuncEnd => "}".to_string(),
             KoopaLine::Label(label) => format!("\n{}:", label),
             KoopaLine::ArgLabel(label, arg_name, arg_type) => format!("\n{}({}: {}):", label, arg_name, arg_type),
-            KoopaLine::Alloc(ptr) => format!("\t{} = alloc i32", ptr),
+            KoopaLine::Alloc(ptr_name, ptr_type) => format!("\t{} = alloc {}", ptr_name, ptr_type),
             KoopaLine::Store(value, ptr) => format!("\tstore {}, {}", value, ptr),
             KoopaLine::Load(dest, ptr) => format!("\t{} = load {}", dest, ptr),
             KoopaLine::Binary(dest, op, lhs, rhs) => {
@@ -32,7 +44,10 @@ impl KoopaLine {
             }
             KoopaLine::Jump(target) => format!("\tjump {}", target),
             KoopaLine::ArgJump(target, arg) => format!("\tjump {}({})", target, arg),
+            KoopaLine::Call(dest, func, arg) => format!("\t{} = call @{}({})", dest, func, arg),
+            KoopaLine::VoidCall(func, arg) => format!("\tcall @{}({})", func, arg),
             KoopaLine::Ret(value) => format!("\tret {}", value),
+            KoopaLine::VoidRet => format!("\tret")
         }
     }
 }
@@ -59,10 +74,11 @@ impl KoopaLines {
         }
     }
 
-    pub fn remove_last_label(&mut self) {
-        if let Some(KoopaLine::Label(_)) = self.lines.last() {
-            self.lines.pop();
+    pub fn close(&mut self) {
+        if !self.is_closed() {
+            self.add_line(KoopaLine::VoidRet);
         }
+        self.add_line(KoopaLine::FuncEnd);
     }
 
     pub fn make_block(origin: KoopaLines, this_bb: String, next_bb: Option<String>) -> Self {

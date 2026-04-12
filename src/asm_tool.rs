@@ -1,9 +1,6 @@
-use koopa::ir::dfg::DataFlowGraph;
-use koopa::ir::values::{Binary, BinaryOp};
 use koopa::ir::{Value, ValueKind};
-use koopa::ir::{FunctionData, Program};
 use crate::asm::{Asm, Background};
-use crate::riscv::{AsmLine, AsmValue, RegAddress, RegLocation, RegName, RegisterAllocator};
+use crate::riscv::{AsmLine, RegAddress, RegLocation, RegName};
 
 /// Transfer a value to a register, generating necessary instructions if needed.
 pub fn value_to_reg(value: Value, reg: RegName, bg: &Background, asm: &mut Asm) {
