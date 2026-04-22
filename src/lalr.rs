@@ -1,11 +1,17 @@
 #[derive(Debug, Clone)]
 pub struct CompUnit {
-    pub func_def: Vec<FuncDef>,
+    pub glob_defs: Vec<GlobleDef>,
+}
+
+#[derive(Debug, Clone)]
+pub enum GlobleDef {
+    FuncDef(FuncDef),
+    GlobleDecl(Type, Vec<SingleDecl>), // @global = decl type, init
 }
 
 #[derive(Debug, Clone)]
 pub struct FuncDef {
-    pub func_type: FuncType,
+    pub func_type: Type,
     pub ident: String,
     pub func_params: Vec<FuncParam>,
     pub block: Vec<Stmt>,
@@ -15,12 +21,6 @@ pub struct FuncDef {
 pub struct FuncParam {
     pub btype: BType,
     pub name: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum FuncType {
-    Void,
-    Int,
 }
 
 #[derive(Debug, Clone)]
@@ -46,12 +46,14 @@ pub struct SingleDecl {
 
 #[derive(Debug, Clone)]
 pub enum BType {
-    Int,
+    I32,
+    Void,
+    Ptr(Box<BType>),
 }
 
 #[derive(Debug, Clone)]
 pub enum Type {
-    Var(BType),
+    BType(BType),
     Const(BType),
 }
 

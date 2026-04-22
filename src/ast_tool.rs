@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use crate::{ast::{AstNode, ReturnValue}, lalr::{BType, BinaryOp, CompUnit, Exp, FuncType, Type, UnaryOp}};
+use crate::{ast::{AstNode, ReturnValue}, lalr::{BType, BinaryOp, CompUnit, Exp, Type, GlobleDef, UnaryOp}};
 use crate::koopa::{KoopaLine, KoopaLines};
 
+#[derive(Debug)]
 pub struct RenameManager {
     timestamp: usize,
     rename_count: HashMap<String, usize>,
@@ -72,10 +73,11 @@ impl RenameManager {
 
 type NextBb = Option<String>;
 
+#[derive(Debug)]
 struct GlobalSymbols {
     global_variable: HashMap<String, Type>,
-    global_function: HashMap<String, (FuncType, Vec<BType>)>, // function name -> (return type, parameter types)
-    static_function: HashMap<String, (FuncType, Vec<BType>)>, // function name -> (return type, parameter types)
+    global_function: HashMap<String, (Type, Vec<BType>)>, // function name -> (return type, parameter types)
+    static_function: HashMap<String, (Type, Vec<BType>)>, // function name -> (return type, parameter types)
 }
 
 impl GlobalSymbols {
@@ -88,6 +90,7 @@ impl GlobalSymbols {
     }
 }
 
+#[derive(Debug)]
 pub struct Background {
     global_symbols: GlobalSymbols,
     temp_counter: usize,
@@ -114,10 +117,6 @@ impl Background {
     }
 
     pub fn clear(&mut self) {
-        self.temp_counter = 0;
-        self.branch_counter = 0;
-        self.constant_map.clear();
-        self.rename_manager = RenameManager::new();
         self.next_bb = None;
         self.loop_next = None;
         self.loop_entry = None;
@@ -127,7 +126,7 @@ impl Background {
         self.global_symbols.global_variable.get(&name)
     }
 
-    pub fn get_function(&self, name: String) -> Option<&(FuncType, Vec<BType>)> {
+    pub fn get_function(&self, name: String) -> Option<&(Type, Vec<BType>)> {
         if let Some(func) = self.global_symbols.global_function.get(&name) {
             Some(func)
         } else {
@@ -135,6 +134,10 @@ impl Background {
         }
     }
 
+    pub fn get_static_functions_decl(&self) -> Vec<(String, Type, Vec<BType>)> {
+        self.global_symbols.static_function.iter().map(|(name, (func_type, params))| (name.clone(), func_type.clone(), params.clone())).collect()
+    }
+    
     pub fn next_temp(&mut self) -> String {
         let temp_name = format!("%{}", self.temp_counter);
         self.rename_manager.new_variable(temp_name.clone()).expect("Temp variable name conflict");
@@ -143,13 +146,11 @@ impl Background {
     }
 
     pub fn get_variable(&self, name: String) -> String {
-        // println!("Getting variable: {}", name);
         let count = self.rename_manager.get_current_name(&name).expect(&format!("Variable {} not found in the current scope", name));
         variable_rename(name, count)
     }
 
     pub fn new_variable(&mut self, name: String) -> String {
-        // println!("Creating variable: {}", name);
         let count = self.rename_manager.new_variable(name.clone()).expect("Variable name conflict in the same scope");
         let new_name = variable_rename(name.clone(), count);
         new_name
@@ -309,13 +310,52 @@ pub fn eval_binary_const(op: &BinaryOp, lhs: i32, rhs: i32) -> i32 {
     }
 }
 
+/// Returns the list of static functions with their types and parameter types.
+fn static_functions() -> Vec<(&'static str, Type, Vec<BType>)> {
+    let i32_type = Type::BType(BType::I32);
+    let void_type = Type::BType(BType::Void);
+    vec![
+        ("getint", i32_type.clone(), vec![]),
+        ("getch", i32_type.clone(), vec![]),
+        ("getarray", i32_type.clone(), vec![BType::Ptr(Box::new(BType::I32))]),
+        ("putint", void_type.clone(), vec![BType::I32]),
+        ("putch", void_type.clone(), vec![BType::I32]),
+        ("putarray", void_type.clone(), vec![BType::Ptr(Box::new(BType::I32)), BType::I32]),
+        ("starttime", i32_type.clone(), vec![]),
+        ("stoptime", i32_type.clone(), vec![]),
+    ]
+}
+
 pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
-    for func_def in comp_unit.func_def {
-        let func_name = func_def.ident.clone();
-        let params: Vec<BType> = func_def.func_params.iter().map(|param| param.btype.clone()).collect();
-        if bg.global_symbols.global_function.contains_key(&func_name) {
-            panic!("Duplicate function definition: {}", func_name);
+    for glob_def in comp_unit.glob_defs {
+        match glob_def {
+            GlobleDef::FuncDef(func_def) => {
+                let func_name = func_def.ident.clone();
+                let params: Vec<BType> = func_def.func_params.iter().map(|param| param.btype.clone()).collect();
+                if bg.global_symbols.global_function.contains_key(&func_name) {
+                    panic!("Duplicate function definition: {}", func_name);
+                }
+                bg.global_symbols.global_function.insert(func_name, (func_def.func_type, params));
+            }
+            GlobleDef::GlobleDecl(ty, decls) => {
+                if matches!(ty, Type::Const(_)) {
+                    continue; // Global constants are not stored in the symbol table
+                }
+                for decl in decls {
+                    let var_name = decl.ident.clone();
+                    if bg.global_symbols.global_variable.contains_key(&var_name) {
+                        panic!("Duplicate global variable definition: {}", var_name);
+                    }
+                    bg.global_symbols.global_variable.insert(var_name, ty.clone());
+                }
+            }
         }
-        bg.global_symbols.global_function.insert(func_name, (func_def.func_type, params));
+    }
+
+    for func_def in static_functions() {
+        let func_name = func_def.0.to_string();
+        let func_type = func_def.1.clone();
+        let params = func_def.2.clone();
+        bg.global_symbols.static_function.insert(func_name, (func_type, params));
     }
 }

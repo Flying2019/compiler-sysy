@@ -10,6 +10,7 @@ pub enum RegName {
     Param(usize),
     TempT(usize),
     TempS(usize),
+    Ra,
     Stack
 }
 
@@ -26,9 +27,10 @@ impl RegName {
     pub fn to_string(&self) -> String {
         match self {
             RegName::Ret => "a0".to_string(),
-            RegName::Param(i) => format!("a{}", i + 1),
+            RegName::Param(i) => format!("a{}", i),
             RegName::TempT(i) => format!("t{}", i),
             RegName::TempS(i) => format!("s{}", i),
+            RegName::Ra => "ra".to_string(),
             RegName::Stack => "sp".to_string(),
         }
     }
@@ -56,9 +58,12 @@ pub enum AsmLine {
 // PlaceHold
     PlaceHold(String),
 // Symbol
-    Text,
+    DirData,
+    DirText,
     Global(String),
-    Func(String),
+    GlobName(String),
+    DirZero(usize),
+    DirWord(i32),
 // Control flow
     Label(usize),
     Jump(usize),
@@ -101,12 +106,18 @@ impl AsmLine {
             AsmLine::PlaceHold(s)
                 => panic!("PlaceHold should not be converted to string: {}", s),
         // Symbol
-            AsmLine::Text
-                => "\t.text".to_string(),
+            AsmLine::DirText
+                => "\n\t.text".to_string(),
+            AsmLine::DirData
+                => "\n\t.data".to_string(),
             AsmLine::Global(name)
                 => format!("\t.global {}", name),
-            AsmLine::Func(name)
+            AsmLine::GlobName(name)
                 => format!("{}:", name),
+            AsmLine::DirZero(size)
+                => format!("\t.zero {}", size),
+            AsmLine::DirWord(value)
+                => format!("\t.word {}", value),
         // Control flow
             AsmLine::Label(id)
                 => format!("L{}:", id),
@@ -189,8 +200,10 @@ impl Into<AsmValue> for RegLocation {
     }
 }
 
+#[derive(Debug)]
 struct RegisterAllocatorState {
     regs: BTreeMap<RegName, bool>,
+    special_regs: BTreeMap<RegName, bool>,
     stack: Vec<bool>,
     mapping: HashMap<Value, RegLocation>,
 }
@@ -198,14 +211,19 @@ struct RegisterAllocatorState {
 impl RegisterAllocatorState {
     fn new() -> Self {
         let mut regs = BTreeMap::new();
+        let mut special_regs = BTreeMap::new();
         for i in 1..6 {
             regs.insert(RegName::TempT(i), false);
         }
         for i in 2..12 {
             regs.insert(RegName::TempS(i), false);
         }
+        for i in 0..8 {
+            special_regs.insert(RegName::Param(i), false);
+        }
         Self {
             regs,
+            special_regs,
             stack: Vec::new(),
             mapping: HashMap::new(),
         }
@@ -218,7 +236,13 @@ impl RegisterAllocatorState {
         self.mapping.remove(&value);
         match location {
             RegLocation::Reg(reg) => {
-                self.regs.insert(reg, false);
+                if let Some(used) = self.regs.get_mut(&reg) {
+                    *used = false;
+                } else if let Some(used) = self.special_regs.get_mut(&reg) {
+                    *used = false;
+                } else {
+                    panic!("Trying to free unknown register {:?}", reg);
+                }
             }
             RegLocation::Stack(index) => {
                 if let Some(used) = self.stack.get_mut(index) {
@@ -283,6 +307,16 @@ impl Into<RegLocation> for RegAddress {
     }
 }
 
+impl Into<RegName> for RegAddress {
+    fn into(self) -> RegName {
+        match self.location.clone() {
+            RegLocation::Reg(reg) => reg,
+            RegLocation::Stack(_) => panic!("Cannot convert stack location to register name"),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct RegisterAllocator {
     state: Rc<RefCell<RegisterAllocatorState>>,
 }
@@ -307,7 +341,9 @@ impl RegisterAllocator {
 
     pub fn register(&self, value: Value) -> RegAddress {
         let mut state = self.state.borrow_mut();
+        // println!("Registering value {:?} in register allocator", value);
         if let Some(location) = state.mapping.get(&value).cloned() {
+            // println!("Value {:?} is already mapped to location {:?}", value, location);
             return RegAddress::new(Rc::clone(&self.state), value, location, false);
         }
 
@@ -323,11 +359,24 @@ impl RegisterAllocator {
         if let Some(reg) = picked_reg {
             let location = RegLocation::Reg(reg);
             state.mapping.insert(value, location.clone());
+            // println!("Mapped value {:?} to register {:?}", value, location);
             return RegAddress::new(Rc::clone(&self.state), value, location, true);
         }
 
         let stack_index = state.alloc_stack_slot();
         let location = RegLocation::Stack(stack_index);
+        state.mapping.insert(value, location.clone());
+        // println!("No free register for value {:?}, allocated stack slot {}", value, stack_index);
+        RegAddress::new(Rc::clone(&self.state), value, location, true)
+    }
+
+    pub fn register_param(&self, value: Value, index: usize) -> RegAddress {
+        let mut state = self.state.borrow_mut();
+        let reg_name = RegName::Param(index);
+        if state.special_regs.get(&reg_name).cloned().unwrap() {
+            panic!("Parameter register {:?} is already used", reg_name);
+        }
+        let location = RegLocation::Reg(reg_name.clone());
         state.mapping.insert(value, location.clone());
         RegAddress::new(Rc::clone(&self.state), value, location, true)
     }

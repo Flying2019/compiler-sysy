@@ -3,11 +3,13 @@ pub type Label = String;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KoopaLine {
+    FuncDecl(String, String, Type), // @func(args): type
     FuncStart(String, String, Type),
     FuncEnd,
     Label(Label),
     ArgLabel(Label, Label, Type), // %br(%a: type)
-    Alloc(Label, Type),
+    GlobalAlloc(String, Type, String), // global = alloc type, init
+    Alloc(String, Type),
     Store(String, String),
     Load(String, String),
     Binary(String, String, String, String),
@@ -23,6 +25,13 @@ pub enum KoopaLine {
 impl KoopaLine {
     pub fn to_string(&self) -> String {
         match self {
+            KoopaLine::FuncDecl(name, args, ret_type) => {
+                if matches!(ret_type.as_str(), "void") {
+                    format!("decl @{}({})", name, args)
+                } else {
+                    format!("decl @{}({}): {}", name, args, ret_type)
+                }
+            }
             KoopaLine::FuncStart(name, args, ret_type) => {
                 if matches!(ret_type.as_str(), "void") {
                     format!("fun @{}({}) {{", name, args)
@@ -30,9 +39,10 @@ impl KoopaLine {
                     format!("fun @{}({}): {} {{", name, args, ret_type)
                 }
             }
-            KoopaLine::FuncEnd => "}".to_string(),
-            KoopaLine::Label(label) => format!("\n{}:", label),
+            KoopaLine::FuncEnd => "}\n".to_string(),
+            KoopaLine::Label(label) => format!("{}:", label),
             KoopaLine::ArgLabel(label, arg_name, arg_type) => format!("\n{}({}: {}):", label, arg_name, arg_type),
+            KoopaLine::GlobalAlloc(name, ty, init) => format!("global {} = alloc {}, {}\n", name, ty, init),
             KoopaLine::Alloc(ptr_name, ptr_type) => format!("\t{} = alloc {}", ptr_name, ptr_type),
             KoopaLine::Store(value, ptr) => format!("\tstore {}, {}", value, ptr),
             KoopaLine::Load(dest, ptr) => format!("\t{} = load {}", dest, ptr),

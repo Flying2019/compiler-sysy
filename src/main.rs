@@ -1,6 +1,6 @@
 use compile_sysy::asm;
+use compile_sysy::asm::program_to_asm;
 use compile_sysy::ast_tool;
-use compile_sysy::asm::GenerateAsm;
 use compile_sysy::ast_tool::scan_global_symbol;
 use compile_sysy::koopa::KoopaLines;
 use compile_sysy::lalr::CompUnit;
@@ -57,7 +57,7 @@ fn ast_to_koopa_lines(ast: &CompUnit) -> KoopaLines {
 fn ir_to_asm(koopa_ir: &str) -> String {
     let driver = koopa::front::Driver::from(koopa_ir.to_string());
     let program = driver.generate_program().unwrap();
-    let asm = program.to_asm(&asm::Background::new());
+    let asm = program_to_asm(&program, &asm::Background::new());
     asm.to_string()
 }
 

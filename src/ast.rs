@@ -39,16 +39,61 @@ impl AstNode for CompUnit {
             panic!("No main function defined, or global symbol scanner didn't run");
         }
         let mut lines = KoopaLines::new();
-        for func_def in &self.func_def {
-            bg.clear();
-            lines.add_lines(func_def.to_koopa_lines(bg));
+        for func in bg.get_static_functions_decl() {
+            let name = func.0;
+            let params = func.2.iter().map(|b| b.to_koopa_type()).collect::<Vec<_>>().join(", ");
+            let ret = func.1;
+            lines.add_line(KoopaLine::FuncDecl(name, params, ret.to_koopa_type()));
+        }
+        for glob_def in &self.glob_defs {
+            lines.add_lines(glob_def.to_koopa_lines(bg));
         }
         lines
     }
 }
 
+impl AstNode for GlobleDef {
+    fn to_koopa_lines(&self, bg: &mut Background) -> KoopaLines {
+        match self {
+            GlobleDef::FuncDef(func_def) => func_def.to_koopa_lines(bg),
+            GlobleDef::GlobleDecl(typ, decls) => {
+                let mut lines = KoopaLines::new();
+                match typ {
+                    Type::BType(btype) => {
+                        for decl in decls {
+                            let var_name = decl.ident.clone();
+                            let init_value = if let Some(init) = &decl.init {
+                                let value = init.try_eval_const(bg).expect("Global variable must be initialized with a constant expression");
+                                value.to_string()
+                            } else {
+                                "zeroinit".to_string() // Default initialization for global variables
+                            };
+                            let new_name = bg.new_variable(var_name);
+                            lines.add_line(KoopaLine::GlobalAlloc(new_name, btype.to_koopa_type(), init_value));
+                        }
+                        lines
+                    }
+                    Type::Const(_btype) => {
+                        for decl in decls {
+                            if let Some(init) = &decl.init {
+                                let value = init.try_eval_const(bg).expect("Const variable must be initialized with a constant expression");
+                                bg.set_constant(decl.ident.clone(), value);
+                            } else {
+                                panic!("Const variable {} must be initialized", decl.ident);
+                            }
+                        }
+                        lines
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl AstNode for FuncDef {
     fn to_koopa_lines(&self, bg: &mut Background) -> KoopaLines {
+        bg.clear();
+        let record = bg.record();
         let mut lines = KoopaLines::new();
         let params = self.func_params.iter().map(FuncParam::to_koopa_param).collect::<Vec<_>>().join(", ");
         lines.add_line(KoopaLine::FuncStart(self.ident.clone(), params, self.func_type.to_koopa_type()));
@@ -60,16 +105,8 @@ impl AstNode for FuncDef {
         }
         lines.add_lines(self.block.to_koopa_lines(bg));
         lines.close();
+        bg.rollback(record);
         lines
-    }
-}
-
-impl FuncType {
-    fn to_koopa_type(&self) -> String {
-        match self {
-            FuncType::Void => "void".to_string(),
-            FuncType::Int => "i32".to_string(),
-        }
     }
 }
 
@@ -88,7 +125,18 @@ impl FuncParam {
 impl BType {
     fn to_koopa_type(&self) -> String {
         match self {
-            BType::Int => "i32".to_string()
+            BType::I32 => "i32".to_string(),
+            BType::Void => "void".to_string(),
+            BType::Ptr(b) => format!("*{}", b.to_koopa_type()),
+        }
+    }
+}
+
+impl Type {
+    fn to_koopa_type(&self) -> String {
+        match self {
+            Type::BType(b) => b.to_koopa_type(),
+            Type::Const(b) => b.to_koopa_type(),
         }
     }
 }
@@ -133,7 +181,7 @@ impl AstNode for Stmt {
             Stmt::Decl(typ, decls) => {
                 let mut content = KoopaLines::new();
                 match typ {
-                    Type::Var(btype) => {
+                    Type::BType(btype) => {
                         for decl in decls {
                             let ptr_name = bg.new_variable(decl.ident.clone());
                             content.add_line(KoopaLine::Alloc(ptr_name.clone(), btype.to_koopa_type()));
@@ -268,15 +316,21 @@ impl AstNode for Exp {
                 }
                 let args = arg_values.join(", ");
                 match func_type {
-                    FuncType::Void => {
-                        ir.add_line(KoopaLine::VoidCall(name.clone(), args));
-                        ReturnValue { value: None, content: ir }
+                    Type::BType(func_type) => {
+                        match func_type {
+                            BType::Void => {
+                                ir.add_line(KoopaLine::VoidCall(name.clone(), args));
+                                ReturnValue { value: None, content: ir }
+                            }
+                            BType::I32 => {
+                                let ret_value = bg.next_temp();
+                                ir.add_line(KoopaLine::Call(ret_value.clone(), name.clone(), args));
+                                ReturnValue { value: Some(ret_value), content: ir }
+                            }
+                            _ => unimplemented!("Function return type {:?} not supported yet", func_type),
+                        }
                     }
-                    FuncType::Int => {
-                        let ret_value = bg.next_temp();
-                        ir.add_line(KoopaLine::Call(ret_value.clone(), name.clone(), args));
-                        ReturnValue { value: Some(ret_value), content: ir }
-                    }
+                    _ => unimplemented!("Function type {:?} not supported yet", func_type),
                 }
             }
         }

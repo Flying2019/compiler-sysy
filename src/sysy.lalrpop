@@ -18,16 +18,21 @@ IntConst: i32 = {
 }
 
 pub CompUnit: CompUnit = {
-  <func_def: FuncDef> => CompUnit { func_def: vec![<>] },
-  <func_def: FuncDef> <comp_unit: CompUnit> => {
-    let mut func_defs = vec![func_def];
-    func_defs.extend(comp_unit.func_def);
-    CompUnit { func_def: func_defs }
-  }
+  <glob_def: GlobleDef> => CompUnit { glob_defs: vec![<>] },
+  <glob_def: GlobleDef> <comp_unit: CompUnit> => {
+    let mut glob_defs = vec![glob_def];
+    glob_defs.extend(comp_unit.glob_defs);
+    CompUnit { glob_defs: glob_defs }
+  },
+}
+
+GlobleDef: GlobleDef = {
+  <FuncDef> => GlobleDef::FuncDef(<>),
+  <Type> <MultipleDecl> ";" => GlobleDef::GlobleDecl(<>),
 }
 
 FuncDef: FuncDef = {
-  <func_type: FuncType> <ident: Ident> "(" <func_params: FuncParams> ")" <block: Block> => FuncDef { <> }
+  <func_type: Type> <ident: Ident> "(" <func_params: FuncParams> ")" <block: Block> => FuncDef { <> }
 }
 
 FuncParams: Vec<FuncParam> = {
@@ -41,11 +46,6 @@ FuncParams: Vec<FuncParam> = {
 }
 
 FuncParam: FuncParam = <btype: BType> <name: Ident> => FuncParam { <> };
-
-FuncType: FuncType = {
-  "int" => FuncType::Int,
-  "void" => FuncType::Void,
-}
 
 Block: Vec<Stmt> = "{" <stmts: StmtList> "}" => stmts;
 
@@ -101,7 +101,6 @@ SingleDecl: SingleDecl = {
 }
 
 FuncArgs: Vec<Exp> = {
-  => Vec::new(),
   <Exp> => vec![<>],
   <single_arg: Exp> "," <rest: FuncArgs> => {
     let mut args = vec![single_arg];
@@ -110,11 +109,14 @@ FuncArgs: Vec<Exp> = {
   }
 }
 
-BType: BType = "int" => BType::Int;
+BType: BType = {
+  "int" => BType::I32,
+  "void" => BType::Void,
+}
 
 Type: Type = {
   "const" <BType> => Type::Const(<>),
-  <BType> => Type::Var(<>),
+  <BType> => Type::BType(<>),
 }
 
 Exp: Exp = {
@@ -122,6 +124,8 @@ Exp: Exp = {
 }
 
 PrimaryExp: Exp = {
+  <ident: Ident> "(" ")" => Exp::FuncCall(ident, Vec::new()),
+  <Ident> "(" <FuncArgs> ")" => Exp::FuncCall(<>),
   "(" <Exp> ")" => <>,
   <IntConst> => Exp::Number(<>),
   <Ident> => Exp::Ident(<>),
@@ -129,7 +133,6 @@ PrimaryExp: Exp = {
 
 UnaryExp: Exp = {
   <PrimaryExp> => <>,
-  <Ident> "(" <FuncArgs> ")" => Exp::FuncCall(<>),
   <op: UnaryOp> <exp: UnaryExp> => Exp::UnaryExp(op, Box::new(exp)),
 }
 
