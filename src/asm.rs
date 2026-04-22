@@ -1,11 +1,11 @@
+use crate::riscv::{AsmLine, AsmValue, RegAddress, RegLocation, RegName, RegisterAllocator};
 use core::panic;
-use std::collections::{HashMap, HashSet};
 use koopa::ir::dfg::DataFlowGraph;
 use koopa::ir::entities::{BasicBlockData, ValueData};
 use koopa::ir::values::{Binary, BinaryOp, Store};
 use koopa::ir::{BasicBlock, Function, Value, ValueKind};
 use koopa::ir::{FunctionData, Program};
-use crate::riscv::{AsmLine, AsmValue, RegAddress, RegLocation, RegName, RegisterAllocator};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 fn name_to_symbol(name: &str) -> String {
     if name.starts_with("@") {
@@ -23,7 +23,9 @@ pub struct Asm {
 
 impl Asm {
     pub fn new() -> Self {
-        Self { content: Vec::new() }
+        Self {
+            content: Vec::new(),
+        }
     }
 
     pub fn add_asm(&mut self, func_asm: Asm) {
@@ -39,8 +41,7 @@ impl Asm {
         for line in self.content.iter_mut() {
             if *line == AsmLine::PlaceHold(placeholder.clone()) {
                 result.extend(replacement.clone());
-            }
-            else {
+            } else {
                 result.push(line.clone());
             }
         }
@@ -48,7 +49,11 @@ impl Asm {
     }
 
     pub fn to_string(&self) -> String {
-        self.content.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n")
+        self.content
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -70,27 +75,43 @@ impl<'a> Background<'a> {
     }
 
     pub fn with_prog<'b>(&self, prog: &'b Program) -> Background<'b>
-        where 'a: 'b,
+    where
+        'a: 'b,
     {
-        Background { prog: Some(prog), ..self.clone() }
+        Background {
+            prog: Some(prog),
+            ..self.clone()
+        }
     }
 
     pub fn with_dfg<'b>(&self, dfg: &'b DataFlowGraph) -> Background<'b>
-        where 'a: 'b,
+    where
+        'a: 'b,
     {
-        Background { dfg: Some(dfg), ..self.clone() }
+        Background {
+            dfg: Some(dfg),
+            ..self.clone()
+        }
     }
 
     pub fn with_frame<'b>(&self, frame: &'b FunctionFrame) -> Background<'b>
-        where 'a: 'b,
+    where
+        'a: 'b,
     {
-        Background { frame: Some(frame), ..self.clone() }
+        Background {
+            frame: Some(frame),
+            ..self.clone()
+        }
     }
 
     pub fn with_ra<'b>(&self, ra: &'b RegisterAllocator) -> Background<'b>
-        where 'a: 'b,
+    where
+        'a: 'b,
     {
-        Background { ra: Some(ra), ..self.clone() }
+        Background {
+            ra: Some(ra),
+            ..self.clone()
+        }
     }
 
     pub fn get_value(&self, value: Value) -> &ValueData {
@@ -159,7 +180,7 @@ impl AsmContext {
     pub fn insert_temp_record(&mut self, value: Value, record: TempRecord) {
         self.temp_value.insert(value, record);
     }
-    
+
     pub fn remove_temp_record(&mut self, value: &Value) -> Option<TempRecord> {
         self.temp_value.remove(value)
     }
@@ -199,16 +220,23 @@ pub fn program_to_asm(progrma: &Program, bg: &Background) -> Asm {
                         ValueKind::Integer(i) => {
                             result.add_line(AsmLine::DirWord(i.value()));
                         }
-                        _ => unimplemented!("Unsupported global variable initializer: {:?}", init_data.kind()),
+                        _ => unimplemented!(
+                            "Unsupported global variable initializer: {:?}",
+                            init_data.kind()
+                        ),
                     }
                 }
-                _ => unreachable!()
+                _ => unreachable!(),
             }
         }
     }
     for &func in progrma.func_layout() {
         context.clear();
-        result.add_asm(function_to_asm(&progrma.func(func), &bg.with_prog(&progrma), &mut context));
+        result.add_asm(function_to_asm(
+            &progrma.func(func),
+            &bg.with_prog(&progrma),
+            &mut context,
+        ));
     }
     result
 }
@@ -255,14 +283,19 @@ impl Into<ConsumedTemp> for RegName {
 pub struct FunctionFrame {
     local_slots: HashMap<Value, usize>,
     local_words: usize,
-    reserve_words: usize, // used to save arguments
+    arg_words: usize,
+    caller_save_words: usize,
+    save_ra: bool,
 }
+
+const CALLER_SAVE_WORDS: usize = 7; // t0-t6
 
 impl FunctionFrame {
     fn from_function(func: &FunctionData, bg: &Background) -> Self {
         let mut local_slots = HashMap::new();
         let mut local_words = 0;
-        let mut reserve_words = 0;
+        let mut arg_words = 0;
+        let mut has_call = false;
         for (&_bb, node) in func.layout().bbs() {
             for &inst in node.insts().keys() {
                 if matches!(bg.get_value(inst).kind(), ValueKind::Alloc(_)) {
@@ -286,30 +319,44 @@ impl FunctionFrame {
                 match bg.get_value(inst).kind() {
                     ValueKind::Call(call) => {
                         let arg_count = call.args().len();
-                        reserve_words = reserve_words.max(1 + (arg_count as isize - 8).max(0) as usize); // reserve 1 for register "ra"
-                    },
-                    _ => continue
+                        arg_words = arg_words.max((arg_count as isize - 8).max(0) as usize);
+                        has_call = true;
+                    }
+                    _ => continue,
                 };
             }
         }
 
-        Self { local_slots, local_words, reserve_words }
+        Self {
+            local_slots,
+            local_words,
+            arg_words,
+            caller_save_words: if has_call { CALLER_SAVE_WORDS } else { 0 },
+            save_ra: has_call,
+        }
     }
 
     /*
-        |-----------------------------------|
-        |  Needed for spilled temps         | <- spill words (allocated by register allocator)
-        |-----------------------------------|
-        |  Local allocs and block params    | <- local words
-        |-----------------------------------|
-        |  saved ra (if needed)             | <-+
-        |-----------------------------------|   +- reserve words
-        |  Arguments (if needed)            | <-+
-        |-----------------------------------| <- sp
-     */
+       |-----------------------------------|
+       |  Needed for spilled temps         | <- spill words (allocated by register allocator)
+       |-----------------------------------|
+       |  Local allocs and block params    | <- local words
+       |-----------------------------------|
+       |  saved ra (if needed)             | <-+
+       |-----------------------------------|   |
+       |  caller-saved regs (if needed)    |   +- reserve words
+       |-----------------------------------|   |
+       |  Arguments (if needed)            | <-+
+       |-----------------------------------|
+       |                                   | <- sp
+    */
+
+    fn reserve_words(&self) -> usize {
+        self.arg_words + self.caller_save_words + usize::from(self.save_ra)
+    }
 
     fn local_slot(&self, value: Value) -> Option<usize> {
-        Some(self.local_slots.get(&value).cloned()? + self.reserve_words)
+        Some(self.local_slots.get(&value).cloned()? + self.reserve_words())
     }
 
     fn stack_slot_to_addr(&self, slot: usize) -> AsmValue {
@@ -317,21 +364,32 @@ impl FunctionFrame {
     }
 
     fn spill_slot_to_addr(&self, slot: usize) -> AsmValue {
-        let absolute_slot = self.local_words + self.reserve_words + slot;
+        let absolute_slot = self.local_words + self.reserve_words() + slot;
         self.stack_slot_to_addr(absolute_slot)
     }
 
     fn arg_to_addr(&self, slot: usize) -> AsmValue {
-        assert!(slot < self.reserve_words);
+        assert!(slot < self.arg_words);
         self.stack_slot_to_addr(slot)
     }
 
+    fn caller_save_to_addr(&self, slot: usize) -> AsmValue {
+        assert!(slot < self.caller_save_words);
+        self.stack_slot_to_addr(self.arg_words + slot)
+    }
+
     fn ra_to_addr(&self) -> AsmValue {
-        self.arg_to_addr(self.reserve_words - 1)
+        assert!(self.save_ra);
+        self.stack_slot_to_addr(self.arg_words + self.caller_save_words)
     }
 }
 
-fn write_reg_to_location(loc: &RegAddress, src: RegName, frame: &FunctionFrame, context: &mut AsmContext) {
+fn write_reg_to_location(
+    loc: &RegAddress,
+    src: RegName,
+    frame: &FunctionFrame,
+    context: &mut AsmContext,
+) {
     match loc.location.clone() {
         RegLocation::Reg(reg) => {
             context.asm_add_line(AsmLine::Mv(reg, src));
@@ -339,6 +397,48 @@ fn write_reg_to_location(loc: &RegAddress, src: RegName, frame: &FunctionFrame, 
         RegLocation::Stack(slot) => {
             context.asm_add_line(AsmLine::Store(frame.spill_slot_to_addr(slot), src));
         }
+    }
+}
+
+fn caller_saved_slot(reg: &RegName) -> Option<usize> {
+    match reg {
+        RegName::TempT(i) if *i < 7 => Some(*i),
+        _ => None,
+    }
+}
+
+fn live_caller_saved_regs_across_call(call_inst: Value, context: &AsmContext) -> Vec<RegName> {
+    let mut regs = BTreeSet::new();
+    for record in context.temp_value.values() {
+        if !record.used_by.iter().any(|user| *user != call_inst) {
+            continue;
+        }
+        if let RegLocation::Reg(reg) = record.loc.location.clone() {
+            if caller_saved_slot(&reg).is_some() {
+                regs.insert(reg);
+            }
+        }
+    }
+    regs.into_iter().collect()
+}
+
+fn save_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut AsmContext) {
+    for reg in regs {
+        let slot = caller_saved_slot(reg).expect("caller-saved register should have stack slot");
+        context.asm_add_line(AsmLine::Store(
+            bg.frame().caller_save_to_addr(slot),
+            reg.clone(),
+        ));
+    }
+}
+
+fn restore_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut AsmContext) {
+    for reg in regs.iter().rev() {
+        let slot = caller_saved_slot(reg).expect("caller-saved register should have stack slot");
+        context.asm_add_line(AsmLine::Load(
+            reg.clone(),
+            bg.frame().caller_save_to_addr(slot),
+        ));
     }
 }
 
@@ -352,14 +452,10 @@ fn load_temp_reg(
         let record = context.temp_value_mut().get_mut(&src)?;
         record.used_by.remove(&dest);
         (record.loc.location.clone(), record.used_by.is_empty())
-    };    
+    };
     let mut holds = Vec::new();
     let reg: RegName = match loc {
-        RegLocation::Reg(reg) => {
-            let dest_addr = bg.ra().register(dest);
-            write_reg_to_location(&dest_addr, reg.clone(), bg.frame(), context);
-            dest_addr.into()
-        }
+        RegLocation::Reg(reg) => reg,
         RegLocation::Stack(slot) => {
             let addr = bg.frame().spill_slot_to_addr(slot);
             let dest_addr = bg.ra().register(dest);
@@ -412,12 +508,7 @@ fn load_operand(
 }
 
 /// Store the value of a store instruction to its destination, which should be a local allocation. The source value can be an immediate integer or a temporary value.
-fn store_to_asm(
-    store: &Store,
-    bg: &Background,
-    context: &mut AsmContext,
-    user: Value,
-) {
+fn store_to_asm(store: &Store, bg: &Background, context: &mut AsmContext, user: Value) {
     let dest_ptr = store.dest();
     let src = store.value();
     let dest_regname = match bg.get_value(src).kind() {
@@ -425,37 +516,39 @@ fn store_to_asm(
             let temp_addr = bg.ra().register(src);
             let temp_reg = match temp_addr.location.clone() {
                 RegLocation::Reg(reg) => reg,
-                RegLocation::Stack(_) => unimplemented!("Integer operand cannot be loaded to stack slot"),
+                RegLocation::Stack(_) => {
+                    unimplemented!("Integer operand cannot be loaded to stack slot")
+                }
             };
             context.asm_add_line(AsmLine::Li(temp_reg.clone(), c.value()));
             temp_reg
         }
         _ => load_temp_reg(src, user, bg, context)
             .expect("store source should be available")
-            .reg()
+            .reg(),
     };
     if let Some(value_data) = bg.get_glob(dest_ptr) {
         // Store to a global variable, we need to load its address first
         let name = value_data.name().clone().unwrap();
         let temp_reg = RegName::TempT(0);
         context.asm_add_line(AsmLine::La(temp_reg.clone(), name_to_symbol(&name)));
-        context.asm_add_line(AsmLine::Store(AsmValue::Offset(0, temp_reg.clone()), dest_regname));
+        context.asm_add_line(AsmLine::Store(
+            AsmValue::Offset(0, temp_reg.clone()),
+            dest_regname,
+        ));
         return;
-    }
-    else {
-        let slot = bg.frame().local_slot(dest_ptr).expect("store destination should be local alloc");
+    } else {
+        let slot = bg
+            .frame()
+            .local_slot(dest_ptr)
+            .expect("store destination should be local alloc");
         let addr = bg.frame().stack_slot_to_addr(slot);
         context.asm_add_line(AsmLine::Store(addr, dest_regname));
     }
 }
 
 /// Load the value of a load instruction into its destination register, which can be either a physical register or a spill slot. The source pointer should be a local allocation.
-fn load_to_asm(
-    value: Value,
-    src: Value,
-    bg: &Background,
-    context: &mut AsmContext,
-) -> RegAddress {
+fn load_to_asm(value: Value, src: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
     let frame = bg.frame();
     let ra = bg.ra();
     let src_address = if let Some(slot) = frame.local_slot(src) {
@@ -497,11 +590,21 @@ fn binary_to_asm(
     };
 
     match binary.op() {
-        BinaryOp::Add => context.asm_add_line(AsmLine::Add(result_reg.clone(), lhs.reg(), rhs.reg())),
-        BinaryOp::Sub => context.asm_add_line(AsmLine::Sub(result_reg.clone(), lhs.reg(), rhs.reg())),
-        BinaryOp::Mul => context.asm_add_line(AsmLine::Mul(result_reg.clone(), lhs.reg(), rhs.reg())),
-        BinaryOp::Div => context.asm_add_line(AsmLine::Div(result_reg.clone(), lhs.reg(), rhs.reg())),
-        BinaryOp::Mod => context.asm_add_line(AsmLine::Rem(result_reg.clone(), lhs.reg(), rhs.reg())),
+        BinaryOp::Add => {
+            context.asm_add_line(AsmLine::Add(result_reg.clone(), lhs.reg(), rhs.reg()))
+        }
+        BinaryOp::Sub => {
+            context.asm_add_line(AsmLine::Sub(result_reg.clone(), lhs.reg(), rhs.reg()))
+        }
+        BinaryOp::Mul => {
+            context.asm_add_line(AsmLine::Mul(result_reg.clone(), lhs.reg(), rhs.reg()))
+        }
+        BinaryOp::Div => {
+            context.asm_add_line(AsmLine::Div(result_reg.clone(), lhs.reg(), rhs.reg()))
+        }
+        BinaryOp::Mod => {
+            context.asm_add_line(AsmLine::Rem(result_reg.clone(), lhs.reg(), rhs.reg()))
+        }
         BinaryOp::Eq => {
             context.asm_add_line(AsmLine::Xor(result_reg.clone(), lhs.reg(), rhs.reg()));
             context.asm_add_line(AsmLine::Seqz(result_reg.clone(), result_reg.clone()));
@@ -514,28 +617,35 @@ fn binary_to_asm(
             context.asm_add_line(AsmLine::Slt(result_reg.clone(), rhs.reg(), lhs.reg()));
             context.asm_add_line(AsmLine::Xori(result_reg.clone(), result_reg.clone(), 1));
         }
-        BinaryOp::Lt => context.asm_add_line(AsmLine::Slt(result_reg.clone(), lhs.reg(), rhs.reg())),
+        BinaryOp::Lt => {
+            context.asm_add_line(AsmLine::Slt(result_reg.clone(), lhs.reg(), rhs.reg()))
+        }
         BinaryOp::Ge => {
             context.asm_add_line(AsmLine::Slt(result_reg.clone(), lhs.reg(), rhs.reg()));
             context.asm_add_line(AsmLine::Xori(result_reg.clone(), result_reg.clone(), 1));
         }
-        BinaryOp::Gt => context.asm_add_line(AsmLine::Slt(result_reg.clone(), rhs.reg(), lhs.reg())),
-        BinaryOp::And => context.asm_add_line(AsmLine::And(result_reg.clone(), lhs.reg(), rhs.reg())),
+        BinaryOp::Gt => {
+            context.asm_add_line(AsmLine::Slt(result_reg.clone(), rhs.reg(), lhs.reg()))
+        }
+        BinaryOp::And => {
+            context.asm_add_line(AsmLine::And(result_reg.clone(), lhs.reg(), rhs.reg()))
+        }
         BinaryOp::Or => context.asm_add_line(AsmLine::Or(result_reg.clone(), lhs.reg(), rhs.reg())),
-        _ => unimplemented!("{}", format!("Unsupported binary operation: {:?}", binary.op())),
+        _ => unimplemented!(
+            "{}",
+            format!("Unsupported binary operation: {:?}", binary.op())
+        ),
     }
 
     write_reg_to_location(&dest, result_reg, bg.frame(), context);
     dest
 }
 
-fn load_block_param(
-    param: Value,
-    bg: &Background,
-    context: &mut AsmContext,
-) -> RegAddress {
+fn load_block_param(param: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
     let frame = bg.frame();
-    let slot = frame.local_slot(param).expect("block parameter should have stack slot");
+    let slot = frame
+        .local_slot(param)
+        .expect("block parameter should have stack slot");
     let addr = frame.stack_slot_to_addr(slot);
     let dest = bg.ra().register(param);
     match dest.location.clone() {
@@ -564,12 +674,18 @@ fn store_block_args(
 ) {
     let params = bg.get_bb_data(target).params();
     if params.len() != args.len() {
-        panic!("Argument count does not match for jump/branch target {:?}", target);
+        panic!(
+            "Argument count does not match for jump/branch target {:?}",
+            target
+        );
     }
     for pos in 0..params.len() {
         let arg = args[pos];
         let param = params[pos];
-        let slot = bg.frame().local_slot(param).expect("block parameter should have stack slot");
+        let slot = bg
+            .frame()
+            .local_slot(param)
+            .expect("block parameter should have stack slot");
         let addr = bg.frame().stack_slot_to_addr(slot);
         match bg.get_value(arg).kind() {
             ValueKind::Integer(c) => {
@@ -625,40 +741,47 @@ fn function_to_asm(func: &FunctionData, bg: &Background, context: &mut AsmContex
             }
         }
     }
-    let stack_words = frame.local_words + frame.reserve_words + ra.max_stack_size();
+    let stack_words = frame.local_words + frame.reserve_words() + ra.max_stack_size();
     if stack_words > 0 {
         let stack_len = stack_words as i32 * 4;
         // Align stack to 16 bytes for function calls
         let aligned_stack_len = ((stack_len + 15) / 16) * 16;
-        result.add_line(AsmLine::Addi(RegName::Stack, RegName::Stack, -aligned_stack_len));
-        if frame.reserve_words > 0 {
+        result.add_line(AsmLine::Addi(
+            RegName::Stack,
+            RegName::Stack,
+            -aligned_stack_len,
+        ));
+        if frame.save_ra {
             // Save ra if needed
             result.add_line(AsmLine::Store(frame.ra_to_addr(), RegName::Ra));
-            context.asm_mut().convert_placehold("return".to_string(), vec![
-                AsmLine::Load(RegName::Ra, frame.ra_to_addr()),
-                AsmLine::Addi(RegName::Stack, RegName::Stack, aligned_stack_len),
-                AsmLine::Ret
-            ]);
-        }
-        else {
-            context.asm_mut().convert_placehold("return".to_string(), vec![
-                AsmLine::Addi(RegName::Stack, RegName::Stack, aligned_stack_len),
-                AsmLine::Ret
-            ]);
+            context.asm_mut().convert_placehold(
+                "return".to_string(),
+                vec![
+                    AsmLine::Load(RegName::Ra, frame.ra_to_addr()),
+                    AsmLine::Addi(RegName::Stack, RegName::Stack, aligned_stack_len),
+                    AsmLine::Ret,
+                ],
+            );
+        } else {
+            context.asm_mut().convert_placehold(
+                "return".to_string(),
+                vec![
+                    AsmLine::Addi(RegName::Stack, RegName::Stack, aligned_stack_len),
+                    AsmLine::Ret,
+                ],
+            );
         }
         result.add_asm(context.asm_mut().clone());
     } else {
-        context.asm_mut().convert_placehold("return".to_string(), vec![AsmLine::Ret]);
+        context
+            .asm_mut()
+            .convert_placehold("return".to_string(), vec![AsmLine::Ret]);
         result.add_asm(context.asm_mut().clone());
     }
     result
 }
 
-fn inst_to_asm(
-    value: Value,
-    bg: &Background,
-    context: &mut AsmContext,
-) -> Option<RegAddress> {
+fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Option<RegAddress> {
     let inst = bg.get_value(value);
     match inst.kind() {
         ValueKind::Return(r) => {
@@ -707,6 +830,8 @@ fn inst_to_asm(
             let frame = bg.frame();
             let func_data = bg.get_func(call.callee());
             let args = call.args();
+            let saved_regs = live_caller_saved_regs_across_call(value, context);
+            save_caller_saved_regs(&saved_regs, bg, context);
             for (i, &arg) in args.iter().enumerate() {
                 let arg_reg = load_operand(arg, value, bg, context);
                 if i < 8 {
@@ -721,10 +846,12 @@ fn inst_to_asm(
                 RegLocation::Reg(reg) => {
                     context.asm_add_line(AsmLine::Mv(reg, RegName::Ret));
                 }
-                RegLocation::Stack(_) => {
-                    context.asm_add_line(AsmLine::Store(frame.ra_to_addr(), RegName::Ret));
+                RegLocation::Stack(slot) => {
+                    context
+                        .asm_add_line(AsmLine::Store(frame.spill_slot_to_addr(slot), RegName::Ret));
                 }
             }
+            restore_caller_saved_regs(&saved_regs, bg, context);
             ret.into()
         }
         _ => panic!("Unsupported instruction: {:?}", inst.kind()),

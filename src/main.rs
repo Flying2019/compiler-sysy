@@ -1,15 +1,15 @@
+use clap::{Parser, ValueEnum};
 use compile_sysy::asm;
 use compile_sysy::asm::program_to_asm;
+use compile_sysy::ast::*;
 use compile_sysy::ast_tool;
 use compile_sysy::ast_tool::scan_global_symbol;
 use compile_sysy::koopa::KoopaLines;
 use compile_sysy::lalr::CompUnit;
 use lalrpop_util::lalrpop_mod;
-use compile_sysy::ast::*;
 use std::env;
-use std::{fs::read_to_string, path::PathBuf};
 use std::io::Result;
-use clap::{Parser, ValueEnum};
+use std::{fs::read_to_string, path::PathBuf};
 
 #[derive(ValueEnum, Clone, Debug)]
 enum Mode {
@@ -45,7 +45,9 @@ fn preprocess_args() -> Vec<String> {
 }
 
 fn str_to_ast(input: &str) -> CompUnit {
-    sysy::CompUnitParser::new().parse(input).expect("Failed to parse input")
+    sysy::CompUnitParser::new()
+        .parse(input)
+        .expect("Failed to parse input")
 }
 
 fn ast_to_koopa_lines(ast: &CompUnit) -> KoopaLines {

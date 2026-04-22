@@ -1,7 +1,7 @@
-pub mod ast;
-pub mod koopa;
 pub mod asm;
-pub mod riscv;
 pub mod asm_tool;
+pub mod ast;
 pub mod ast_tool;
+pub mod koopa;
 pub mod lalr;
+pub mod riscv;

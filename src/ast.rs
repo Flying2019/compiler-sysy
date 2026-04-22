@@ -1,7 +1,9 @@
-use std::fmt::Debug;
-use crate::ast_tool::{Background, eval_binary_const, eval_unary_const, gen_binary_koopa_ir, gen_unary_koopa_ir};
+use crate::ast_tool::{
+    eval_binary_const, eval_unary_const, gen_binary_koopa_ir, gen_unary_koopa_ir, Background,
+};
 use crate::koopa::{KoopaLine, KoopaLines};
 use crate::lalr::*;
+use std::fmt::Debug;
 
 #[derive(Debug, Clone)]
 pub struct ReturnValue {
@@ -14,7 +16,10 @@ impl ReturnValue {
         Self { value, content }
     }
     pub fn with_content(content: KoopaLines) -> Self {
-        Self { value: None, content }
+        Self {
+            value: None,
+            content,
+        }
     }
     pub fn extend(mut self, additional: ReturnValue) -> Self {
         self.content.add_lines(additional.content);
@@ -41,7 +46,12 @@ impl AstNode for CompUnit {
         let mut lines = KoopaLines::new();
         for func in bg.get_static_functions_decl() {
             let name = func.0;
-            let params = func.2.iter().map(|b| b.to_koopa_type()).collect::<Vec<_>>().join(", ");
+            let params = func
+                .2
+                .iter()
+                .map(|b| b.to_koopa_type())
+                .collect::<Vec<_>>()
+                .join(", ");
             let ret = func.1;
             lines.add_line(KoopaLine::FuncDecl(name, params, ret.to_koopa_type()));
         }
@@ -69,14 +79,20 @@ impl AstNode for GlobleDef {
                                 "zeroinit".to_string() // Default initialization for global variables
                             };
                             let new_name = bg.new_variable(var_name);
-                            lines.add_line(KoopaLine::GlobalAlloc(new_name, btype.to_koopa_type(), init_value));
+                            lines.add_line(KoopaLine::GlobalAlloc(
+                                new_name,
+                                btype.to_koopa_type(),
+                                init_value,
+                            ));
                         }
                         lines
                     }
                     Type::Const(_btype) => {
                         for decl in decls {
                             if let Some(init) = &decl.init {
-                                let value = init.try_eval_const(bg).expect("Const variable must be initialized with a constant expression");
+                                let value = init.try_eval_const(bg).expect(
+                                    "Const variable must be initialized with a constant expression",
+                                );
                                 bg.set_constant(decl.ident.clone(), value);
                             } else {
                                 panic!("Const variable {} must be initialized", decl.ident);
@@ -95,8 +111,17 @@ impl AstNode for FuncDef {
         bg.clear();
         let record = bg.record();
         let mut lines = KoopaLines::new();
-        let params = self.func_params.iter().map(FuncParam::to_koopa_param).collect::<Vec<_>>().join(", ");
-        lines.add_line(KoopaLine::FuncStart(self.ident.clone(), params, self.func_type.to_koopa_type()));
+        let params = self
+            .func_params
+            .iter()
+            .map(FuncParam::to_koopa_param)
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.add_line(KoopaLine::FuncStart(
+            self.ident.clone(),
+            params,
+            self.func_type.to_koopa_type(),
+        ));
         lines.add_line(KoopaLine::Label("%entry".to_string()));
         for param in &self.func_params {
             let ptr_name = bg.new_variable(param.name.clone());
@@ -184,11 +209,15 @@ impl AstNode for Stmt {
                     Type::BType(btype) => {
                         for decl in decls {
                             let ptr_name = bg.new_variable(decl.ident.clone());
-                            content.add_line(KoopaLine::Alloc(ptr_name.clone(), btype.to_koopa_type()));
+                            content.add_line(KoopaLine::Alloc(
+                                ptr_name.clone(),
+                                btype.to_koopa_type(),
+                            ));
                             if let Some(init) = &decl.init {
                                 let init_ret = init.to_koopa(bg);
                                 content.add_lines(init_ret.content);
-                                content.add_line(KoopaLine::Store(init_ret.value.unwrap(), ptr_name));
+                                content
+                                    .add_line(KoopaLine::Store(init_ret.value.unwrap(), ptr_name));
                             }
                         }
                         content
@@ -196,7 +225,9 @@ impl AstNode for Stmt {
                     Type::Const(_) => {
                         for decl in decls {
                             if let Some(init) = &decl.init {
-                                let value = init.try_eval_const(bg).expect("Const variable must be initialized with a constant expression");
+                                let value = init.try_eval_const(bg).expect(
+                                    "Const variable must be initialized with a constant expression",
+                                );
                                 bg.set_constant(decl.ident.clone(), value);
                             } else {
                                 panic!("Const variable {} must be initialized", decl.ident);
@@ -206,7 +237,12 @@ impl AstNode for Stmt {
                     }
                 }
             }
-            Stmt::If(_, _) | Stmt::IfElse(_, _, _) | Stmt::Return(_) | Stmt::While(_, _) | Stmt::Continue | Stmt::Break => {
+            Stmt::If(_, _)
+            | Stmt::IfElse(_, _, _)
+            | Stmt::Return(_)
+            | Stmt::While(_, _)
+            | Stmt::Continue
+            | Stmt::Break => {
                 // These methods require a closed basic block.
                 let mut ir = KoopaLines::new();
                 bg.new_next_bb_if_none();
@@ -217,9 +253,17 @@ impl AstNode for Stmt {
                         let bb_name = bg.new_bb();
                         let then_branch = format!("{}_then", bb_name);
                         ir.add_lines(exp_ret.content);
-                        ir.add_line(KoopaLine::Br(cond, then_branch.clone(), bg.next_bb().clone().unwrap()));
+                        ir.add_line(KoopaLine::Br(
+                            cond,
+                            then_branch.clone(),
+                            bg.next_bb().clone().unwrap(),
+                        ));
                         // Then Block
-                        ir.add_lines(KoopaLines::make_block(stmt.to_koopa_lines(bg), then_branch, bg.next_bb().clone()));
+                        ir.add_lines(KoopaLines::make_block(
+                            stmt.to_koopa_lines(bg),
+                            then_branch,
+                            bg.next_bb().clone(),
+                        ));
                     }
                     Stmt::IfElse(exp, then_stmt, else_stmt) => {
                         let exp_ret = exp.to_koopa(bg);
@@ -228,9 +272,21 @@ impl AstNode for Stmt {
                         let then_branch = format!("{}_then", bb_name);
                         let else_branch = format!("{}_else", bb_name);
                         ir.add_lines(exp_ret.content);
-                        ir.add_line(KoopaLine::Br(cond, then_branch.clone(), else_branch.clone()));
-                        ir.add_lines(KoopaLines::make_block(then_stmt.to_koopa_lines(bg), then_branch, bg.next_bb().clone()));
-                        ir.add_lines(KoopaLines::make_block(else_stmt.to_koopa_lines(bg), else_branch, bg.next_bb().clone()));
+                        ir.add_line(KoopaLine::Br(
+                            cond,
+                            then_branch.clone(),
+                            else_branch.clone(),
+                        ));
+                        ir.add_lines(KoopaLines::make_block(
+                            then_stmt.to_koopa_lines(bg),
+                            then_branch,
+                            bg.next_bb().clone(),
+                        ));
+                        ir.add_lines(KoopaLines::make_block(
+                            else_stmt.to_koopa_lines(bg),
+                            else_branch,
+                            bg.next_bb().clone(),
+                        ));
                     }
                     Stmt::While(exp, stmt) => {
                         let old_entry = bg.get_loop_entry();
@@ -244,23 +300,29 @@ impl AstNode for Stmt {
                         ir.add_lines(exp_ret.content);
                         bg.set_loop(bg.next_bb(), Some(entry_bb.clone()));
                         let cond = exp_ret.value.unwrap();
-                        ir.add_line(KoopaLine::Br(cond, body_bb.clone(), bg.next_bb().clone().unwrap()));
+                        ir.add_line(KoopaLine::Br(
+                            cond,
+                            body_bb.clone(),
+                            bg.next_bb().clone().unwrap(),
+                        ));
                         let old_next_bb = bg.next_bb();
                         bg.set_next_bb(Some(entry_bb.clone()));
-                        ir.add_lines(KoopaLines::make_block(stmt.to_koopa_lines(bg), body_bb, Some(entry_bb)));
+                        ir.add_lines(KoopaLines::make_block(
+                            stmt.to_koopa_lines(bg),
+                            body_bb,
+                            Some(entry_bb),
+                        ));
                         bg.set_next_bb(old_next_bb);
                         bg.set_loop(old_next, old_entry);
                     }
-                    Stmt::Return(num) => {
-                        match num {
-                            Some(num) => {
-                                let ret = num.to_koopa(bg);
-                                ir.add_lines(ret.content);
-                                ir.add_line(KoopaLine::Ret(ret.value.unwrap()));
-                            }
-                            None => ir.add_line(KoopaLine::VoidRet),
+                    Stmt::Return(num) => match num {
+                        Some(num) => {
+                            let ret = num.to_koopa(bg);
+                            ir.add_lines(ret.content);
+                            ir.add_line(KoopaLine::Ret(ret.value.unwrap()));
                         }
-                    }
+                        None => ir.add_line(KoopaLine::VoidRet),
+                    },
                     Stmt::Break => {
                         ir.add_line(KoopaLine::Jump(bg.get_loop_next().unwrap()));
                     }
@@ -287,13 +349,9 @@ impl AstNode for Exp {
             Exp::UnaryExp(op, exp) => {
                 let exp_ret = exp.to_koopa(bg);
                 let src = exp_ret.value.clone().unwrap();
-                exp_ret.extend(
-                    gen_unary_koopa_ir(op, src, bg)
-                )
+                exp_ret.extend(gen_unary_koopa_ir(op, src, bg))
             }
-            Exp::BinaryExp(op, left, right) => {
-                gen_binary_koopa_ir(op, left, right, bg)
-            }
+            Exp::BinaryExp(op, left, right) => gen_binary_koopa_ir(op, left, right, bg),
             Exp::Ident(name) => {
                 if let Some(const_value) = bg.try_get_constant(name.clone()) {
                     ReturnValue::new(Some(const_value.to_string()), KoopaLines::new())
@@ -316,20 +374,26 @@ impl AstNode for Exp {
                 }
                 let args = arg_values.join(", ");
                 match func_type {
-                    Type::BType(func_type) => {
-                        match func_type {
-                            BType::Void => {
-                                ir.add_line(KoopaLine::VoidCall(name.clone(), args));
-                                ReturnValue { value: None, content: ir }
+                    Type::BType(func_type) => match func_type {
+                        BType::Void => {
+                            ir.add_line(KoopaLine::VoidCall(name.clone(), args));
+                            ReturnValue {
+                                value: None,
+                                content: ir,
                             }
-                            BType::I32 => {
-                                let ret_value = bg.next_temp();
-                                ir.add_line(KoopaLine::Call(ret_value.clone(), name.clone(), args));
-                                ReturnValue { value: Some(ret_value), content: ir }
-                            }
-                            _ => unimplemented!("Function return type {:?} not supported yet", func_type),
                         }
-                    }
+                        BType::I32 => {
+                            let ret_value = bg.next_temp();
+                            ir.add_line(KoopaLine::Call(ret_value.clone(), name.clone(), args));
+                            ReturnValue {
+                                value: Some(ret_value),
+                                content: ir,
+                            }
+                        }
+                        _ => {
+                            unimplemented!("Function return type {:?} not supported yet", func_type)
+                        }
+                    },
                     _ => unimplemented!("Function type {:?} not supported yet", func_type),
                 }
             }
@@ -350,9 +414,7 @@ impl Exp {
                 let rhs = right.try_eval_const(bg)?;
                 Some(eval_binary_const(op, lhs, rhs))
             }
-            Exp::Ident(name) => {
-                bg.try_get_constant(name.clone())
-            }
+            Exp::Ident(name) => bg.try_get_constant(name.clone()),
             Exp::FuncCall(_, _) => None,
         }
     }

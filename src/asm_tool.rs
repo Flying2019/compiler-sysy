@@ -1,6 +1,6 @@
-use koopa::ir::{Value, ValueKind};
 use crate::asm::{Asm, Background};
 use crate::riscv::{AsmLine, RegAddress, RegLocation, RegName};
+use koopa::ir::{Value, ValueKind};
 
 /// Transfer a value to a register, generating necessary instructions if needed.
 pub fn value_to_reg(value: Value, reg: RegName, bg: &Background, asm: &mut Asm) {

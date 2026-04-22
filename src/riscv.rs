@@ -11,7 +11,7 @@ pub enum RegName {
     TempT(usize),
     TempS(usize),
     Ra,
-    Stack
+    Stack,
 }
 
 impl Ord for RegName {
@@ -55,29 +55,29 @@ impl AsmValue {
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum AsmLine {
-// PlaceHold
+    // PlaceHold
     PlaceHold(String),
-// Symbol
+    // Symbol
     DirData,
     DirText,
     Global(String),
     GlobName(String),
     DirZero(usize),
     DirWord(i32),
-// Control flow
+    // Control flow
     Label(usize),
     Jump(usize),
     Ret,
     Call(String),
     Beqz(RegName, usize),
     Bnez(RegName, usize),
-// Data movement
+    // Data movement
     Mv(RegName, RegName),
     Load(RegName, AsmValue),
     Store(AsmValue, RegName),
     Li(RegName, i32),
     La(RegName, String),
-// Arithmetic
+    // Arithmetic
     Add(RegName, RegName, RegName),
     Addi(RegName, RegName, i32),
     Sub(RegName, RegName, RegName),
@@ -102,85 +102,121 @@ pub enum AsmLine {
 impl AsmLine {
     pub fn to_string(&self) -> String {
         match self {
-        // PlaceHold
-            AsmLine::PlaceHold(s)
-                => panic!("PlaceHold should not be converted to string: {}", s),
-        // Symbol
-            AsmLine::DirText
-                => "\n\t.text".to_string(),
-            AsmLine::DirData
-                => "\n\t.data".to_string(),
-            AsmLine::Global(name)
-                => format!("\t.global {}", name),
-            AsmLine::GlobName(name)
-                => format!("{}:", name),
-            AsmLine::DirZero(size)
-                => format!("\t.zero {}", size),
-            AsmLine::DirWord(value)
-                => format!("\t.word {}", value),
-        // Control flow
-            AsmLine::Label(id)
-                => format!("L{}:", id),
-            AsmLine::Jump(id)
-                => format!("\tj L{}", id),
-            AsmLine::Ret
-                => "\tret".to_string(),
-            AsmLine::Call(func)
-                => format!("\tcall {}", func),
-            AsmLine::Beqz(reg, id)
-                => format!("\tbeqz {}, L{}", reg.to_string(), id),
-            AsmLine::Bnez(reg, id)
-                => format!("\tbnez {}, L{}", reg.to_string(), id),
-        // Data movement
-            AsmLine::Mv(dest, src)
-                => format!("\tmv {}, {}", dest.to_string(), src.to_string()),
-            AsmLine::Load(dest, addr)
-                => format!("\tlw {}, {}", dest.to_string(), addr.to_string()),
-            AsmLine::Store(addr, src)
-                => format!("\tsw {}, {}", src.to_string(), addr.to_string()),
-            AsmLine::La(dest, label)
-                => format!("\tla {}, {}", dest.to_string(), label),
-            AsmLine::Li(dest, imm)
-                => format!("\tli {}, {}", dest.to_string(), imm),
-        // Arithmetic
-            AsmLine::Add(dest, src1, src2)
-                => format!("\tadd {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Addi(dest, src, imm)
-                => format!("\taddi {}, {}, {}", dest.to_string(), src.to_string(), imm),
-            AsmLine::Sub(dest, src1, src2)
-                => format!("\tsub {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Slt(dest, src1, src2)
-                => format!("\tslt {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Sgt(dest, src1, src2)
-                => format!("\tsgt {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Seqz(dest, src)
-                => format!("\tseqz {}, {}", dest.to_string(), src.to_string()),
-            AsmLine::Snez(dest, src)
-                => format!("\tsnez {}, {}", dest.to_string(), src.to_string()),
-            AsmLine::Xor(dest, src1, src2)
-                => format!("\txor {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Xori(dest, src, imm)
-                => format!("\txori {}, {}, {}", dest.to_string(), src.to_string(), imm),
-            AsmLine::Or(dest, src1, src2)
-                => format!("\tor {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Ori(dest, src, imm)
-                => format!("\tori {}, {}, {}", dest.to_string(), src.to_string(), imm),
-            AsmLine::And(dest, src1, src2)
-                => format!("\tand {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Andi(dest, src, imm)
-                => format!("\tandi {}, {}, {}", dest.to_string(), src.to_string(), imm),
-            AsmLine::Sll(dest, src1, src2)
-                => format!("\tsll {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Srl(dest, src1, src2)
-                => format!("\tsrl {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Sra(dest, src1, src2)
-                => format!("\tsra {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Mul(dest, src1, src2)
-                => format!("\tmul {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Div(dest, src1, src2)
-                => format!("\tdiv {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
-            AsmLine::Rem(dest, src1, src2)
-                => format!("\trem {}, {}, {}", dest.to_string(), src1.to_string(), src2.to_string()),
+            // PlaceHold
+            AsmLine::PlaceHold(s) => panic!("PlaceHold should not be converted to string: {}", s),
+            // Symbol
+            AsmLine::DirText => "\n\t.text".to_string(),
+            AsmLine::DirData => "\n\t.data".to_string(),
+            AsmLine::Global(name) => format!("\t.global {}", name),
+            AsmLine::GlobName(name) => format!("{}:", name),
+            AsmLine::DirZero(size) => format!("\t.zero {}", size),
+            AsmLine::DirWord(value) => format!("\t.word {}", value),
+            // Control flow
+            AsmLine::Label(id) => format!("L{}:", id),
+            AsmLine::Jump(id) => format!("\tj L{}", id),
+            AsmLine::Ret => "\tret".to_string(),
+            AsmLine::Call(func) => format!("\tcall {}", func),
+            AsmLine::Beqz(reg, id) => format!("\tbeqz {}, L{}", reg.to_string(), id),
+            AsmLine::Bnez(reg, id) => format!("\tbnez {}, L{}", reg.to_string(), id),
+            // Data movement
+            AsmLine::Mv(dest, src) => format!("\tmv {}, {}", dest.to_string(), src.to_string()),
+            AsmLine::Load(dest, addr) => format!("\tlw {}, {}", dest.to_string(), addr.to_string()),
+            AsmLine::Store(addr, src) => format!("\tsw {}, {}", src.to_string(), addr.to_string()),
+            AsmLine::La(dest, label) => format!("\tla {}, {}", dest.to_string(), label),
+            AsmLine::Li(dest, imm) => format!("\tli {}, {}", dest.to_string(), imm),
+            // Arithmetic
+            AsmLine::Add(dest, src1, src2) => format!(
+                "\tadd {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Addi(dest, src, imm) => {
+                format!("\taddi {}, {}, {}", dest.to_string(), src.to_string(), imm)
+            }
+            AsmLine::Sub(dest, src1, src2) => format!(
+                "\tsub {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Slt(dest, src1, src2) => format!(
+                "\tslt {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Sgt(dest, src1, src2) => format!(
+                "\tsgt {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Seqz(dest, src) => format!("\tseqz {}, {}", dest.to_string(), src.to_string()),
+            AsmLine::Snez(dest, src) => format!("\tsnez {}, {}", dest.to_string(), src.to_string()),
+            AsmLine::Xor(dest, src1, src2) => format!(
+                "\txor {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Xori(dest, src, imm) => {
+                format!("\txori {}, {}, {}", dest.to_string(), src.to_string(), imm)
+            }
+            AsmLine::Or(dest, src1, src2) => format!(
+                "\tor {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Ori(dest, src, imm) => {
+                format!("\tori {}, {}, {}", dest.to_string(), src.to_string(), imm)
+            }
+            AsmLine::And(dest, src1, src2) => format!(
+                "\tand {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Andi(dest, src, imm) => {
+                format!("\tandi {}, {}, {}", dest.to_string(), src.to_string(), imm)
+            }
+            AsmLine::Sll(dest, src1, src2) => format!(
+                "\tsll {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Srl(dest, src1, src2) => format!(
+                "\tsrl {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Sra(dest, src1, src2) => format!(
+                "\tsra {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Mul(dest, src1, src2) => format!(
+                "\tmul {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Div(dest, src1, src2) => format!(
+                "\tdiv {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
+            AsmLine::Rem(dest, src1, src2) => format!(
+                "\trem {}, {}, {}",
+                dest.to_string(),
+                src1.to_string(),
+                src2.to_string()
+            ),
         }
     }
 }

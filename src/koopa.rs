@@ -7,7 +7,7 @@ pub enum KoopaLine {
     FuncStart(String, String, Type),
     FuncEnd,
     Label(Label),
-    ArgLabel(Label, Label, Type), // %br(%a: type)
+    ArgLabel(Label, Label, Type),      // %br(%a: type)
     GlobalAlloc(String, Type, String), // global = alloc type, init
     Alloc(String, Type),
     Store(String, String),
@@ -15,9 +15,9 @@ pub enum KoopaLine {
     Binary(String, String, String, String),
     Br(String, Label, Label),
     Jump(Label),
-    ArgJump(Label, String), // jump %bb(%arg)
+    ArgJump(Label, String),       // jump %bb(%arg)
     Call(String, String, String), // %dest = call @func(%arg)
-    VoidCall(String, String), // call @func(%arg)
+    VoidCall(String, String),     // call @func(%arg)
     Ret(String),
     VoidRet,
 }
@@ -41,8 +41,12 @@ impl KoopaLine {
             }
             KoopaLine::FuncEnd => "}\n".to_string(),
             KoopaLine::Label(label) => format!("{}:", label),
-            KoopaLine::ArgLabel(label, arg_name, arg_type) => format!("\n{}({}: {}):", label, arg_name, arg_type),
-            KoopaLine::GlobalAlloc(name, ty, init) => format!("global {} = alloc {}, {}\n", name, ty, init),
+            KoopaLine::ArgLabel(label, arg_name, arg_type) => {
+                format!("\n{}({}: {}):", label, arg_name, arg_type)
+            }
+            KoopaLine::GlobalAlloc(name, ty, init) => {
+                format!("global {} = alloc {}, {}\n", name, ty, init)
+            }
             KoopaLine::Alloc(ptr_name, ptr_type) => format!("\t{} = alloc {}", ptr_name, ptr_type),
             KoopaLine::Store(value, ptr) => format!("\tstore {}, {}", value, ptr),
             KoopaLine::Load(dest, ptr) => format!("\t{} = load {}", dest, ptr),
@@ -57,7 +61,7 @@ impl KoopaLine {
             KoopaLine::Call(dest, func, arg) => format!("\t{} = call @{}({})", dest, func, arg),
             KoopaLine::VoidCall(func, arg) => format!("\tcall @{}({})", func, arg),
             KoopaLine::Ret(value) => format!("\tret {}", value),
-            KoopaLine::VoidRet => format!("\tret")
+            KoopaLine::VoidRet => format!("\tret"),
         }
     }
 }
@@ -78,7 +82,10 @@ impl KoopaLines {
 
     fn is_closed(&self) -> bool {
         if let Some(last_line) = self.lines.last() {
-            matches!(last_line, KoopaLine::Ret(_) | KoopaLine::Jump(_) | KoopaLine::Br(_, _, _))
+            matches!(
+                last_line,
+                KoopaLine::Ret(_) | KoopaLine::Jump(_) | KoopaLine::Br(_, _, _)
+            )
         } else {
             false
         }
@@ -97,8 +104,7 @@ impl KoopaLines {
         if !block_lines.is_closed() {
             if let Some(next_bb) = next_bb {
                 block_lines.add_line(KoopaLine::Jump(next_bb));
-            }
-            else {
+            } else {
                 panic!("Block is not closed and no next block provided");
             }
         }

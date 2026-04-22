@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
-use crate::{ast::{AstNode, ReturnValue}, lalr::{BType, BinaryOp, CompUnit, Exp, Type, GlobleDef, UnaryOp}};
 use crate::koopa::{KoopaLine, KoopaLines};
+use crate::{
+    ast::{AstNode, ReturnValue},
+    lalr::{BType, BinaryOp, CompUnit, Exp, GlobleDef, Type, UnaryOp},
+};
 
 #[derive(Debug)]
 pub struct RenameManager {
@@ -26,7 +29,7 @@ impl RenameManager {
             rename_record: HashMap::new(),
         }
     }
-    
+
     pub fn new_variable(&mut self, name: String) -> Option<usize> {
         let count = self.rename_count.entry(name.clone()).or_insert(0);
         *count += 1;
@@ -135,23 +138,35 @@ impl Background {
     }
 
     pub fn get_static_functions_decl(&self) -> Vec<(String, Type, Vec<BType>)> {
-        self.global_symbols.static_function.iter().map(|(name, (func_type, params))| (name.clone(), func_type.clone(), params.clone())).collect()
+        self.global_symbols
+            .static_function
+            .iter()
+            .map(|(name, (func_type, params))| (name.clone(), func_type.clone(), params.clone()))
+            .collect()
     }
-    
+
     pub fn next_temp(&mut self) -> String {
         let temp_name = format!("%{}", self.temp_counter);
-        self.rename_manager.new_variable(temp_name.clone()).expect("Temp variable name conflict");
+        self.rename_manager
+            .new_variable(temp_name.clone())
+            .expect("Temp variable name conflict");
         self.temp_counter += 1;
         temp_name
     }
 
     pub fn get_variable(&self, name: String) -> String {
-        let count = self.rename_manager.get_current_name(&name).expect(&format!("Variable {} not found in the current scope", name));
+        let count = self
+            .rename_manager
+            .get_current_name(&name)
+            .expect(&format!("Variable {} not found in the current scope", name));
         variable_rename(name, count)
     }
 
     pub fn new_variable(&mut self, name: String) -> String {
-        let count = self.rename_manager.new_variable(name.clone()).expect("Variable name conflict in the same scope");
+        let count = self
+            .rename_manager
+            .new_variable(name.clone())
+            .expect("Variable name conflict in the same scope");
         let new_name = variable_rename(name.clone(), count);
         new_name
     }
@@ -220,10 +235,18 @@ pub fn gen_unary_koopa_ir(op: &UnaryOp, src: String, background: &mut Background
         UnaryOp::Neg => KoopaLine::Binary(dst.clone(), "sub".to_string(), "0".to_string(), src),
         UnaryOp::Not => KoopaLine::Binary(dst.clone(), "eq".to_string(), src, "0".to_string()),
     };
-    ReturnValue { value: Some(dst), content: KoopaLines::with_line(line) }
+    ReturnValue {
+        value: Some(dst),
+        content: KoopaLines::with_line(line),
+    }
 }
 
-pub fn gen_binary_koopa_ir(op: &BinaryOp, lhs: &Box<Exp>, rhs: &Box<Exp>, bg: &mut Background) -> ReturnValue {
+pub fn gen_binary_koopa_ir(
+    op: &BinaryOp,
+    lhs: &Box<Exp>,
+    rhs: &Box<Exp>,
+    bg: &mut Background,
+) -> ReturnValue {
     let dst = bg.next_temp();
     let lhs_ret = lhs.to_koopa(bg);
     let rhs_ret = rhs.to_koopa(bg);
@@ -233,22 +256,35 @@ pub fn gen_binary_koopa_ir(op: &BinaryOp, lhs: &Box<Exp>, rhs: &Box<Exp>, bg: &m
         BinaryOp::And | BinaryOp::Or => {
             // These logical operations require short-circuit evaluation, so we need to generate more complex IR.
             let mut ir = lhs_ret.content;
-            
+
             let br_label = bg.new_bb();
             let br_then = format!("{}_then", br_label);
             let br_else = format!("{}_else", br_label);
             let br_end = format!("{}_end", br_label);
             // Using ArgLabel to implement SSA form for short-circuit evaluation
             if matches!(op, BinaryOp::And) {
-                ir.add_line(KoopaLine::Br(lhs_src.clone(), br_then.clone(), br_else.clone()));
+                ir.add_line(KoopaLine::Br(
+                    lhs_src.clone(),
+                    br_then.clone(),
+                    br_else.clone(),
+                ));
             } else {
-                ir.add_line(KoopaLine::Br(lhs_src.clone(), br_else.clone(), br_then.clone()));
+                ir.add_line(KoopaLine::Br(
+                    lhs_src.clone(),
+                    br_else.clone(),
+                    br_then.clone(),
+                ));
             }
             // Then block
             ir.add_line(KoopaLine::Label(br_then));
             ir.add_lines(rhs_ret.content);
             let tmp = bg.next_temp();
-            ir.add_lines(KoopaLines::with_line(KoopaLine::Binary(tmp.clone(), "ne".to_string(), rhs_src.clone(), "0".to_string())));
+            ir.add_lines(KoopaLines::with_line(KoopaLine::Binary(
+                tmp.clone(),
+                "ne".to_string(),
+                rhs_src.clone(),
+                "0".to_string(),
+            )));
             ir.add_line(KoopaLine::ArgJump(br_end.clone(), tmp));
             // Else block
             ir.add_line(KoopaLine::Label(br_else));
@@ -259,7 +295,10 @@ pub fn gen_binary_koopa_ir(op: &BinaryOp, lhs: &Box<Exp>, rhs: &Box<Exp>, bg: &m
             }
             // End block
             ir.add_line(KoopaLine::ArgLabel(br_end, dst.clone(), "i32".to_string()));
-            ReturnValue { value: Some(dst), content: ir }
+            ReturnValue {
+                value: Some(dst),
+                content: ir,
+            }
         }
         _ => {
             let op_name = match op {
@@ -278,8 +317,16 @@ pub fn gen_binary_koopa_ir(op: &BinaryOp, lhs: &Box<Exp>, rhs: &Box<Exp>, bg: &m
             };
             let mut ir = lhs_ret.content;
             ir.add_lines(rhs_ret.content);
-            ir.add_line(KoopaLine::Binary(dst.clone(), op_name.to_string(), lhs_src, rhs_src));
-            ReturnValue { value: Some(dst), content: ir }
+            ir.add_line(KoopaLine::Binary(
+                dst.clone(),
+                op_name.to_string(),
+                lhs_src,
+                rhs_src,
+            ));
+            ReturnValue {
+                value: Some(dst),
+                content: ir,
+            }
         }
     }
 }
@@ -288,7 +335,13 @@ pub fn eval_unary_const(op: &UnaryOp, value: i32) -> i32 {
     match op {
         UnaryOp::Pos => value,
         UnaryOp::Neg => -value,
-        UnaryOp::Not => if value == 0 { 1 } else { 0 },
+        UnaryOp::Not => {
+            if value == 0 {
+                1
+            } else {
+                0
+            }
+        }
     }
 }
 
@@ -299,14 +352,62 @@ pub fn eval_binary_const(op: &BinaryOp, lhs: i32, rhs: i32) -> i32 {
         BinaryOp::Mul => lhs * rhs,
         BinaryOp::Div => lhs / rhs,
         BinaryOp::Mod => lhs % rhs,
-        BinaryOp::Lt => if lhs < rhs { 1 } else { 0 },
-        BinaryOp::Gt => if lhs > rhs { 1 } else { 0 },
-        BinaryOp::Le => if lhs <= rhs { 1 } else { 0 },
-        BinaryOp::Ge => if lhs >= rhs { 1 } else { 0 },
-        BinaryOp::Eq => if lhs == rhs { 1 } else { 0 },
-        BinaryOp::Ne => if lhs != rhs { 1 } else { 0 },
-        BinaryOp::And => if (lhs != 0) && (rhs != 0) { 1 } else { 0 },
-        BinaryOp::Or => if (lhs != 0) || (rhs != 0) { 1 } else { 0 },
+        BinaryOp::Lt => {
+            if lhs < rhs {
+                1
+            } else {
+                0
+            }
+        }
+        BinaryOp::Gt => {
+            if lhs > rhs {
+                1
+            } else {
+                0
+            }
+        }
+        BinaryOp::Le => {
+            if lhs <= rhs {
+                1
+            } else {
+                0
+            }
+        }
+        BinaryOp::Ge => {
+            if lhs >= rhs {
+                1
+            } else {
+                0
+            }
+        }
+        BinaryOp::Eq => {
+            if lhs == rhs {
+                1
+            } else {
+                0
+            }
+        }
+        BinaryOp::Ne => {
+            if lhs != rhs {
+                1
+            } else {
+                0
+            }
+        }
+        BinaryOp::And => {
+            if (lhs != 0) && (rhs != 0) {
+                1
+            } else {
+                0
+            }
+        }
+        BinaryOp::Or => {
+            if (lhs != 0) || (rhs != 0) {
+                1
+            } else {
+                0
+            }
+        }
     }
 }
 
@@ -317,10 +418,18 @@ fn static_functions() -> Vec<(&'static str, Type, Vec<BType>)> {
     vec![
         ("getint", i32_type.clone(), vec![]),
         ("getch", i32_type.clone(), vec![]),
-        ("getarray", i32_type.clone(), vec![BType::Ptr(Box::new(BType::I32))]),
+        (
+            "getarray",
+            i32_type.clone(),
+            vec![BType::Ptr(Box::new(BType::I32))],
+        ),
         ("putint", void_type.clone(), vec![BType::I32]),
         ("putch", void_type.clone(), vec![BType::I32]),
-        ("putarray", void_type.clone(), vec![BType::Ptr(Box::new(BType::I32)), BType::I32]),
+        (
+            "putarray",
+            void_type.clone(),
+            vec![BType::Ptr(Box::new(BType::I32)), BType::I32],
+        ),
         ("starttime", i32_type.clone(), vec![]),
         ("stoptime", i32_type.clone(), vec![]),
     ]
@@ -331,11 +440,17 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
         match glob_def {
             GlobleDef::FuncDef(func_def) => {
                 let func_name = func_def.ident.clone();
-                let params: Vec<BType> = func_def.func_params.iter().map(|param| param.btype.clone()).collect();
+                let params: Vec<BType> = func_def
+                    .func_params
+                    .iter()
+                    .map(|param| param.btype.clone())
+                    .collect();
                 if bg.global_symbols.global_function.contains_key(&func_name) {
                     panic!("Duplicate function definition: {}", func_name);
                 }
-                bg.global_symbols.global_function.insert(func_name, (func_def.func_type, params));
+                bg.global_symbols
+                    .global_function
+                    .insert(func_name, (func_def.func_type, params));
             }
             GlobleDef::GlobleDecl(ty, decls) => {
                 if matches!(ty, Type::Const(_)) {
@@ -346,7 +461,9 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                     if bg.global_symbols.global_variable.contains_key(&var_name) {
                         panic!("Duplicate global variable definition: {}", var_name);
                     }
-                    bg.global_symbols.global_variable.insert(var_name, ty.clone());
+                    bg.global_symbols
+                        .global_variable
+                        .insert(var_name, ty.clone());
                 }
             }
         }
@@ -356,6 +473,8 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
         let func_name = func_def.0.to_string();
         let func_type = func_def.1.clone();
         let params = func_def.2.clone();
-        bg.global_symbols.static_function.insert(func_name, (func_type, params));
+        bg.global_symbols
+            .static_function
+            .insert(func_name, (func_type, params));
     }
 }
