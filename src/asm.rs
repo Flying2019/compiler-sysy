@@ -206,7 +206,7 @@ pub fn program_to_asm(progrma: &Program, bg: &Background) -> Asm {
     for &glob_var in progrma.borrow_values().keys() {
         let var_data = progrma.borrow_value(glob_var);
         if let Some(name) = var_data.clone().name() {
-            result.add_line(AsmLine::DirText);
+            result.add_line(AsmLine::DirData);
             result.add_line(AsmLine::Global(name_to_symbol(name)));
             result.add_line(AsmLine::GlobName(name_to_symbol(name)));
             match var_data.kind() {
@@ -442,6 +442,25 @@ fn restore_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut As
     }
 }
 
+fn new_temp_reg(loc: RegLocation, dest: Value, bg: &Background, context: &mut AsmContext,) -> (RegName, Vec<RegAddress>) {
+    match loc {
+        RegLocation::Reg(reg) => (reg, Vec::new()),
+        RegLocation::Stack(slot) => {
+            let addr = bg.frame().spill_slot_to_addr(slot);
+            let dest_addr = bg.ra().register(dest);
+            match dest_addr.location.clone() {
+                RegLocation::Reg(reg) => {
+                    context.asm_add_line(AsmLine::Load(reg.clone(), addr));
+                    (reg, vec![dest_addr])
+                }
+                RegLocation::Stack(_) => {
+                    panic!("No free register for temporary load");
+                }
+            }
+        }
+    }
+}
+
 fn load_temp_reg(
     src: Value,
     dest: Value,
@@ -453,29 +472,35 @@ fn load_temp_reg(
         record.used_by.remove(&dest);
         (record.loc.location.clone(), record.used_by.is_empty())
     };
-    let mut holds = Vec::new();
-    let reg: RegName = match loc {
-        RegLocation::Reg(reg) => reg,
-        RegLocation::Stack(slot) => {
-            let addr = bg.frame().spill_slot_to_addr(slot);
-            let dest_addr = bg.ra().register(dest);
-            match dest_addr.location.clone() {
-                RegLocation::Reg(reg) => {
-                    context.asm_add_line(AsmLine::Load(reg.clone(), addr));
-                    holds.push(dest_addr);
-                    reg
-                }
-                RegLocation::Stack(_) => {
-                    panic!("No free register for temporary load");
-                }
-            }
-        }
-    };
+    let (reg, mut holds) = new_temp_reg(loc, dest, bg, context);
     if is_last_use {
         let released = context.remove_temp_record(&src)?;
         holds.push(released.loc);
     }
     Some(ConsumedTemp::new(reg, holds))
+}
+
+fn peek_temp_reg(
+    src: Value,
+    dest: Value,
+    bg: &Background,
+    context: &mut AsmContext,
+) -> Option<ConsumedTemp> {
+    let loc = context.temp_value_mut().get(&src)?.loc.location.clone();
+    let (reg, holds) = new_temp_reg(loc, dest, bg, context);
+    Some(ConsumedTemp::new(reg, holds))
+}
+
+fn release_temp_if_unused(value: Value, context: &mut AsmContext) -> Option<RegAddress> {
+    if context
+        .temp_value_mut()
+        .get(&value)
+        .is_some_and(|record| record.used_by.is_empty())
+    {
+        context.remove_temp_record(&value).map(|record| record.loc)
+    } else {
+        None
+    }
 }
 
 fn load_integer_operand(
@@ -668,10 +693,9 @@ fn load_block_param(param: Value, bg: &Background, context: &mut AsmContext) -> 
 fn store_block_args(
     target: BasicBlock,
     args: &[Value],
-    user: Value,
     bg: &Background,
     context: &mut AsmContext,
-) {
+) -> Vec<Value> {
     let params = bg.get_bb_data(target).params();
     if params.len() != args.len() {
         panic!(
@@ -679,6 +703,7 @@ fn store_block_args(
             target
         );
     }
+    let mut block_args = Vec::new();
     for pos in 0..params.len() {
         let arg = args[pos];
         let param = params[pos];
@@ -698,13 +723,28 @@ fn store_block_args(
                 context.asm_add_line(AsmLine::Store(addr, temp_reg));
             }
             _ => {
-                let arg_reg = load_temp_reg(arg, user, bg, context)
+                let arg_reg = peek_temp_reg(arg, param, bg, context)
                     .expect("block argument should be available")
                     .reg();
                 context.asm_add_line(AsmLine::Store(bg.frame().stack_slot_to_addr(slot), arg_reg));
+                block_args.push(arg);
             }
         }
     }
+    block_args
+}
+
+fn release_block_args(block_args: Vec<Value>, context: &mut AsmContext) -> Vec<RegAddress> {
+    let mut released = Vec::new();
+    let mut seen = HashSet::new();
+    for arg in block_args {
+        if seen.insert(arg) {
+            if let Some(loc) = release_temp_if_unused(arg, context) {
+                released.push(loc);
+            }
+        }
+    }
+    released
 }
 
 fn function_to_asm(func: &FunctionData, bg: &Background, context: &mut AsmContext) -> Asm {
@@ -737,7 +777,10 @@ fn function_to_asm(func: &FunctionData, bg: &Background, context: &mut AsmContex
         for &inst in insts {
             let ret = inst_to_asm(inst, &bg, context);
             if let Some(ret) = ret {
-                context.insert_temp_record(inst, TempRecord::from_value(inst, &bg, ret));
+                let temp_record = TempRecord::from_value(inst, &bg, ret);
+                if !temp_record.used_by.is_empty() {
+                    context.insert_temp_record(inst, temp_record);
+                }
             }
         }
     }
@@ -811,9 +854,15 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
         }
         ValueKind::Binary(binary) => Some(binary_to_asm(value, binary, bg, context)),
         ValueKind::Branch(br) => {
+            let mut block_args = store_block_args(br.true_bb(), br.true_args(), bg, context);
+            block_args.extend(store_block_args(
+                br.false_bb(),
+                br.false_args(),
+                bg,
+                context,
+            ));
             let cond = load_operand(br.cond(), value, bg, context);
-            store_block_args(br.true_bb(), br.true_args(), value, bg, context);
-            store_block_args(br.false_bb(), br.false_args(), value, bg, context);
+            let _released_block_args = release_block_args(block_args, context);
             let then_id = context.get_branch_id(br.true_bb());
             let else_id = context.get_branch_id(br.false_bb());
             context.asm_add_line(AsmLine::Beqz(cond.reg(), else_id));
@@ -821,7 +870,8 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
             None
         }
         ValueKind::Jump(jump) => {
-            store_block_args(jump.target(), jump.args(), value, bg, context);
+            let block_args = store_block_args(jump.target(), jump.args(), bg, context);
+            let _released_block_args = release_block_args(block_args, context);
             let target_id = context.get_branch_id(jump.target());
             context.asm_add_line(AsmLine::Jump(target_id));
             None
@@ -832,6 +882,7 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
             let args = call.args();
             let saved_regs = live_caller_saved_regs_across_call(value, context);
             save_caller_saved_regs(&saved_regs, bg, context);
+            let mut arg_holds = Vec::new();
             for (i, &arg) in args.iter().enumerate() {
                 let arg_reg = load_operand(arg, value, bg, context);
                 if i < 8 {
@@ -839,8 +890,14 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
                 } else {
                     context.asm_add_line(AsmLine::Store(frame.arg_to_addr(i - 8), arg_reg.reg()));
                 }
+                arg_holds.push(arg_reg);
             }
             context.asm_add_line(AsmLine::Call(name_to_symbol(func_data.name())));
+            drop(arg_holds);
+            if inst.ty().is_unit() {
+                restore_caller_saved_regs(&saved_regs, bg, context);
+                return None;
+            }
             let ret = bg.ra().register(value);
             match ret.location.clone() {
                 RegLocation::Reg(reg) => {
