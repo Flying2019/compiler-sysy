@@ -255,30 +255,6 @@ impl TempRecord {
     }
 }
 
-struct ConsumedTemp {
-    reg: RegName,
-    _holds: Vec<RegAddress>,
-}
-
-impl ConsumedTemp {
-    fn new(reg: RegName, holds: Vec<RegAddress>) -> Self {
-        Self { reg, _holds: holds }
-    }
-
-    fn reg(&self) -> RegName {
-        self.reg.clone()
-    }
-}
-
-impl Into<ConsumedTemp> for RegName {
-    fn into(self) -> ConsumedTemp {
-        ConsumedTemp {
-            reg: self,
-            _holds: Vec::new(),
-        }
-    }
-}
-
 /// A function frame that manages the stack layout for a function, including the mapping from local allocations to stack slots and the total number of stack words needed for the function.
 pub struct FunctionFrame {
     local_slots: HashMap<Value, usize>,
@@ -442,23 +418,17 @@ fn restore_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut As
     }
 }
 
-fn new_temp_reg(loc: RegLocation, dest: Value, bg: &Background, context: &mut AsmContext,) -> (RegName, Vec<RegAddress>) {
+fn new_temp_reg(loc: RegLocation, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    let dest_addr = bg.ra().register_temp();
+    let dest_reg: RegName = dest_addr.get_reg_name();
     match loc {
-        RegLocation::Reg(reg) => (reg, Vec::new()),
+        RegLocation::Reg(reg) => context.asm_add_line(AsmLine::Mv(dest_reg.clone(), reg)),
         RegLocation::Stack(slot) => {
             let addr = bg.frame().spill_slot_to_addr(slot);
-            let dest_addr = bg.ra().register(dest);
-            match dest_addr.location.clone() {
-                RegLocation::Reg(reg) => {
-                    context.asm_add_line(AsmLine::Load(reg.clone(), addr));
-                    (reg, vec![dest_addr])
-                }
-                RegLocation::Stack(_) => {
-                    panic!("No free register for temporary load");
-                }
-            }
+            context.asm_add_line(AsmLine::Load(dest_reg.clone(), addr));
         }
-    }
+    };
+    dest_addr
 }
 
 fn load_temp_reg(
@@ -466,29 +436,26 @@ fn load_temp_reg(
     dest: Value,
     bg: &Background,
     context: &mut AsmContext,
-) -> Option<ConsumedTemp> {
+) -> RegAddress {
     let (loc, is_last_use) = {
-        let record = context.temp_value_mut().get_mut(&src)?;
+        let record = context.temp_value_mut().get_mut(&src).expect(&format!("temporary value should be available: {:?}", src));
         record.used_by.remove(&dest);
         (record.loc.location.clone(), record.used_by.is_empty())
     };
-    let (reg, mut holds) = new_temp_reg(loc, dest, bg, context);
+    let reg = new_temp_reg(loc, bg, context);
     if is_last_use {
-        let released = context.remove_temp_record(&src)?;
-        holds.push(released.loc);
+        context.remove_temp_record(&src).expect("temporary value should be available");
     }
-    Some(ConsumedTemp::new(reg, holds))
+    reg
 }
 
 fn peek_temp_reg(
     src: Value,
-    dest: Value,
     bg: &Background,
     context: &mut AsmContext,
-) -> Option<ConsumedTemp> {
-    let loc = context.temp_value_mut().get(&src)?.loc.location.clone();
-    let (reg, holds) = new_temp_reg(loc, dest, bg, context);
-    Some(ConsumedTemp::new(reg, holds))
+) -> RegAddress {
+    let reg_rec = context.temp_value_mut().get(&src).expect("temporary value should be available");
+    new_temp_reg(reg_rec.loc.location.clone(), bg, context)
 }
 
 fn release_temp_if_unused(value: Value, context: &mut AsmContext) -> Option<RegAddress> {
@@ -503,72 +470,65 @@ fn release_temp_if_unused(value: Value, context: &mut AsmContext) -> Option<RegA
     }
 }
 
-fn load_integer_operand(
-    dest: Value,
-    ra: &RegisterAllocator,
-    context: &mut AsmContext,
-    imm: i32,
-) -> ConsumedTemp {
-    let temp_addr = ra.register(dest);
-    match temp_addr.location.clone() {
-        RegLocation::Reg(reg) => {
-            context.asm_add_line(AsmLine::Li(reg.clone(), imm));
-            ConsumedTemp::new(reg, vec![temp_addr])
-        }
-        RegLocation::Stack(_) => unimplemented!("Integer operand cannot be loaded to stack slot"),
-    }
-}
-
 /// Load an operand into a register, returning the register and the temporary values it holds (if any).
 fn load_operand(
     src: Value,
     dest: Value,
     bg: &Background,
     context: &mut AsmContext,
-) -> ConsumedTemp {
+) -> RegAddress {
+    let reg_addr = bg.ra().register(dest);
     match bg.get_value(src).kind() {
-        ValueKind::Integer(c) => load_integer_operand(src, bg.ra(), context, c.value()),
-        _ => load_temp_reg(src, dest, bg, context).unwrap(),
-    }
+        ValueKind::Integer(c) => {
+            match reg_addr.location.clone() {
+                RegLocation::Reg(reg) => {
+                    context.asm_add_line(AsmLine::Li(reg.clone(), c.value()));
+                }
+                RegLocation::Stack(_) => {
+                    let temp_reg = bg.ra().register_temp();
+                    context.asm_add_line(AsmLine::Li(temp_reg.get_reg_name(), c.value()));
+                    write_reg_to_location(&reg_addr, temp_reg.get_reg_name(), bg.frame(), context);
+                }
+            };
+        },
+        _ => {
+            let temp_reg = load_temp_reg(src, dest, bg, context);
+            write_reg_to_location(&reg_addr, temp_reg.get_reg_name(), bg.frame(), context);
+        }
+    };
+    reg_addr
 }
 
 /// Store the value of a store instruction to its destination, which should be a local allocation. The source value can be an immediate integer or a temporary value.
 fn store_to_asm(store: &Store, bg: &Background, context: &mut AsmContext, user: Value) {
     let dest_ptr = store.dest();
     let src = store.value();
-    let dest_regname = match bg.get_value(src).kind() {
+    let temp_addr = match bg.get_value(src).kind() {
         ValueKind::Integer(c) => {
-            let temp_addr = bg.ra().register(src);
-            let temp_reg = match temp_addr.location.clone() {
-                RegLocation::Reg(reg) => reg,
-                RegLocation::Stack(_) => {
-                    unimplemented!("Integer operand cannot be loaded to stack slot")
-                }
-            };
+            let temp_addr = bg.ra().register_temp();
+            let temp_reg = temp_addr.get_reg_name();
             context.asm_add_line(AsmLine::Li(temp_reg.clone(), c.value()));
-            temp_reg
+            temp_addr
         }
         _ => load_temp_reg(src, user, bg, context)
-            .expect("store source should be available")
-            .reg(),
     };
     if let Some(value_data) = bg.get_glob(dest_ptr) {
         // Store to a global variable, we need to load its address first
         let name = value_data.name().clone().unwrap();
-        let temp_reg = RegName::TempT(0);
-        context.asm_add_line(AsmLine::La(temp_reg.clone(), name_to_symbol(&name)));
+        let temp_glob_addr = bg.ra().register_temp();
+        let temp_glob_reg = temp_glob_addr.get_reg_name();
+        context.asm_add_line(AsmLine::La(temp_glob_reg.clone(), name_to_symbol(&name)));
         context.asm_add_line(AsmLine::Store(
-            AsmValue::Offset(0, temp_reg.clone()),
-            dest_regname,
+            AsmValue::Offset(0, temp_glob_reg.clone()),
+            temp_addr.get_reg_name(),
         ));
-        return;
     } else {
         let slot = bg
             .frame()
             .local_slot(dest_ptr)
             .expect("store destination should be local alloc");
         let addr = bg.frame().stack_slot_to_addr(slot);
-        context.asm_add_line(AsmLine::Store(addr, dest_regname));
+        context.asm_add_line(AsmLine::Store(addr, temp_addr.get_reg_name()));
     }
 }
 
@@ -576,25 +536,25 @@ fn store_to_asm(store: &Store, bg: &Background, context: &mut AsmContext, user: 
 fn load_to_asm(value: Value, src: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
     let frame = bg.frame();
     let ra = bg.ra();
-    let src_address = if let Some(slot) = frame.local_slot(src) {
+    let temp_src = if let Some(slot) = frame.local_slot(src) {
         frame.stack_slot_to_addr(slot)
     } else if let Some(value_data) = bg.get_glob(src) {
         let name = value_data.name().clone().unwrap();
-        let temp_reg = RegName::TempT(0);
-        context.asm_add_line(AsmLine::La(temp_reg.clone(), name_to_symbol(&name)));
-        AsmValue::Offset(0, temp_reg.clone())
+        let temp_reg = ra.register_temp();
+        context.asm_add_line(AsmLine::La(temp_reg.get_reg_name(), name_to_symbol(&name)));
+        AsmValue::Offset(0, temp_reg.get_reg_name())
     } else {
         panic!("load source should be either local alloc or global variable");
     };
     let dest = ra.register(value);
     match dest.location.clone() {
         RegLocation::Reg(reg) => {
-            context.asm_add_line(AsmLine::Load(reg, src_address));
+            context.asm_add_line(AsmLine::Load(reg, temp_src));
         }
         RegLocation::Stack(_) => {
-            let temp_reg = RegName::TempT(0);
-            context.asm_add_line(AsmLine::Load(temp_reg.clone(), src_address));
-            write_reg_to_location(&dest, temp_reg, frame, context);
+            let temp_reg = ra.register_temp();
+            context.asm_add_line(AsmLine::Load(temp_reg.get_reg_name(), temp_src));
+            write_reg_to_location(&dest, temp_reg.get_reg_name(), frame, context);
         }
     }
     dest
@@ -611,51 +571,51 @@ fn binary_to_asm(
     let rhs = load_operand(binary.rhs(), value, bg, context);
     let result_reg = match dest.location {
         RegLocation::Reg(ref reg) => reg.clone(),
-        RegLocation::Stack(_) => lhs.reg(),
+        RegLocation::Stack(_) => lhs.get_reg_name(),
     };
 
     match binary.op() {
         BinaryOp::Add => {
-            context.asm_add_line(AsmLine::Add(result_reg.clone(), lhs.reg(), rhs.reg()))
+            context.asm_add_line(AsmLine::Add(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
         }
         BinaryOp::Sub => {
-            context.asm_add_line(AsmLine::Sub(result_reg.clone(), lhs.reg(), rhs.reg()))
+            context.asm_add_line(AsmLine::Sub(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
         }
         BinaryOp::Mul => {
-            context.asm_add_line(AsmLine::Mul(result_reg.clone(), lhs.reg(), rhs.reg()))
+            context.asm_add_line(AsmLine::Mul(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
         }
         BinaryOp::Div => {
-            context.asm_add_line(AsmLine::Div(result_reg.clone(), lhs.reg(), rhs.reg()))
+            context.asm_add_line(AsmLine::Div(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
         }
         BinaryOp::Mod => {
-            context.asm_add_line(AsmLine::Rem(result_reg.clone(), lhs.reg(), rhs.reg()))
+            context.asm_add_line(AsmLine::Rem(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
         }
         BinaryOp::Eq => {
-            context.asm_add_line(AsmLine::Xor(result_reg.clone(), lhs.reg(), rhs.reg()));
+            context.asm_add_line(AsmLine::Xor(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()));
             context.asm_add_line(AsmLine::Seqz(result_reg.clone(), result_reg.clone()));
         }
         BinaryOp::NotEq => {
-            context.asm_add_line(AsmLine::Xor(result_reg.clone(), lhs.reg(), rhs.reg()));
+            context.asm_add_line(AsmLine::Xor(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()));
             context.asm_add_line(AsmLine::Snez(result_reg.clone(), result_reg.clone()));
         }
         BinaryOp::Le => {
-            context.asm_add_line(AsmLine::Slt(result_reg.clone(), rhs.reg(), lhs.reg()));
+            context.asm_add_line(AsmLine::Slt(result_reg.clone(), rhs.get_reg_name(), lhs.get_reg_name()));
             context.asm_add_line(AsmLine::Xori(result_reg.clone(), result_reg.clone(), 1));
         }
         BinaryOp::Lt => {
-            context.asm_add_line(AsmLine::Slt(result_reg.clone(), lhs.reg(), rhs.reg()))
+            context.asm_add_line(AsmLine::Slt(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
         }
         BinaryOp::Ge => {
-            context.asm_add_line(AsmLine::Slt(result_reg.clone(), lhs.reg(), rhs.reg()));
+            context.asm_add_line(AsmLine::Slt(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()));
             context.asm_add_line(AsmLine::Xori(result_reg.clone(), result_reg.clone(), 1));
         }
         BinaryOp::Gt => {
-            context.asm_add_line(AsmLine::Slt(result_reg.clone(), rhs.reg(), lhs.reg()))
+            context.asm_add_line(AsmLine::Slt(result_reg.clone(), rhs.get_reg_name(), lhs.get_reg_name()))
         }
         BinaryOp::And => {
-            context.asm_add_line(AsmLine::And(result_reg.clone(), lhs.reg(), rhs.reg()))
+            context.asm_add_line(AsmLine::And(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
         }
-        BinaryOp::Or => context.asm_add_line(AsmLine::Or(result_reg.clone(), lhs.reg(), rhs.reg())),
+        BinaryOp::Or => context.asm_add_line(AsmLine::Or(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name())),
         _ => unimplemented!(
             "{}",
             format!("Unsupported binary operation: {:?}", binary.op())
@@ -678,11 +638,8 @@ fn load_block_param(param: Value, bg: &Background, context: &mut AsmContext) -> 
             context.asm_add_line(AsmLine::Load(reg, addr));
         }
         RegLocation::Stack(_) => {
-            let temp_addr = bg.ra().register(param);
-            let temp_reg = match temp_addr.location.clone() {
-                RegLocation::Reg(reg) => reg,
-                RegLocation::Stack(_) => unreachable!(),
-            };
+            let temp_addr = bg.ra().register_temp();
+            let temp_reg = temp_addr.get_reg_name();
             context.asm_add_line(AsmLine::Load(temp_reg.clone(), addr));
             write_reg_to_location(&dest, temp_reg, frame, context);
         }
@@ -714,19 +671,14 @@ fn store_block_args(
         let addr = bg.frame().stack_slot_to_addr(slot);
         match bg.get_value(arg).kind() {
             ValueKind::Integer(c) => {
-                let temp_addr = bg.ra().register(arg);
-                let temp_reg = match temp_addr.location.clone() {
-                    RegLocation::Reg(reg) => reg,
-                    RegLocation::Stack(_) => unreachable!(),
-                };
+                let temp_addr = bg.ra().register_temp();
+                let temp_reg = temp_addr.get_reg_name();
                 context.asm_add_line(AsmLine::Li(temp_reg.clone(), c.value()));
                 context.asm_add_line(AsmLine::Store(addr, temp_reg));
             }
             _ => {
-                let arg_reg = peek_temp_reg(arg, param, bg, context)
-                    .expect("block argument should be available")
-                    .reg();
-                context.asm_add_line(AsmLine::Store(bg.frame().stack_slot_to_addr(slot), arg_reg));
+                let temp_reg = peek_temp_reg(arg, bg, context);
+                context.asm_add_line(AsmLine::Store(bg.frame().stack_slot_to_addr(slot), temp_reg.get_reg_name()));
                 block_args.push(arg);
             }
         }
@@ -834,9 +786,8 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
                         context.asm_add_line(AsmLine::Li(RegName::Ret, c.value()));
                     }
                     _ => {
-                        let ret = load_temp_reg(ret_value, value, bg, context)
-                            .expect("return value should be available");
-                        context.asm_add_line(AsmLine::Mv(RegName::Ret, ret.reg()));
+                        let ret = load_temp_reg(ret_value, value, bg, context);
+                        context.asm_add_line(AsmLine::Mv(RegName::Ret, ret.get_reg_name()));
                     }
                 }
             }
@@ -865,7 +816,7 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
             let _released_block_args = release_block_args(block_args, context);
             let then_id = context.get_branch_id(br.true_bb());
             let else_id = context.get_branch_id(br.false_bb());
-            context.asm_add_line(AsmLine::Beqz(cond.reg(), else_id));
+            context.asm_add_line(AsmLine::Beqz(cond.get_reg_name(), else_id));
             context.asm_add_line(AsmLine::Jump(then_id));
             None
         }
@@ -886,9 +837,9 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
             for (i, &arg) in args.iter().enumerate() {
                 let arg_reg = load_operand(arg, value, bg, context);
                 if i < 8 {
-                    context.asm_add_line(AsmLine::Mv(RegName::Param(i), arg_reg.reg()));
+                    context.asm_add_line(AsmLine::Mv(RegName::Param(i), arg_reg.get_reg_name()));
                 } else {
-                    context.asm_add_line(AsmLine::Store(frame.arg_to_addr(i - 8), arg_reg.reg()));
+                    context.asm_add_line(AsmLine::Store(frame.arg_to_addr(i - 8), arg_reg.get_reg_name()));
                 }
                 arg_holds.push(arg_reg);
             }
@@ -899,15 +850,7 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
                 return None;
             }
             let ret = bg.ra().register(value);
-            match ret.location.clone() {
-                RegLocation::Reg(reg) => {
-                    context.asm_add_line(AsmLine::Mv(reg, RegName::Ret));
-                }
-                RegLocation::Stack(slot) => {
-                    context
-                        .asm_add_line(AsmLine::Store(frame.spill_slot_to_addr(slot), RegName::Ret));
-                }
-            }
+            write_reg_to_location(&ret, RegName::Ret, frame, context);
             restore_caller_saved_regs(&saved_regs, bg, context);
             ret.into()
         }
