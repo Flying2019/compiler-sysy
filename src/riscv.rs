@@ -239,7 +239,7 @@ impl Into<AsmValue> for RegLocation {
 #[derive(Debug)]
 struct RegisterAllocatorState {
     regs: BTreeMap<RegName, bool>,
-    special_regs: BTreeMap<RegName, bool>,
+    temp_regs: BTreeMap<RegName, bool>,
     stack: Vec<bool>,
     mapping: HashMap<Value, RegLocation>,
 }
@@ -247,36 +247,36 @@ struct RegisterAllocatorState {
 impl RegisterAllocatorState {
     fn new() -> Self {
         let mut regs = BTreeMap::new();
-        let mut special_regs = BTreeMap::new();
-        for i in 2..6 {
+        let mut temp_regs = BTreeMap::new();
+        for i in 3..6 {
             regs.insert(RegName::TempT(i), false);
         }
         for i in 2..12 {
             regs.insert(RegName::TempS(i), false);
         }
-        for i in 0..8 {
-            special_regs.insert(RegName::Param(i), false);
+        for i in 0..3 {
+            temp_regs.insert(RegName::TempT(i), false);
         }
-        special_regs.insert(RegName::TempT(0), false);
-        special_regs.insert(RegName::TempT(1), false);
         Self {
             regs,
-            special_regs,
+            temp_regs,
             stack: Vec::new(),
             mapping: HashMap::new(),
         }
     }
 
-    fn free_location(&mut self, value: Value, location: RegLocation) {
-        if self.mapping.get(&value) != Some(&location) {
-            return;
+    fn free_location(&mut self, value: Option<Value>, location: RegLocation) {
+        if let Some(value) = value {
+            if self.mapping.get(&value) != Some(&location) {
+                return;
+            }
+            self.mapping.remove(&value);
         }
-        self.mapping.remove(&value);
         match location {
             RegLocation::Reg(reg) => {
                 if let Some(used) = self.regs.get_mut(&reg) {
                     *used = false;
-                } else if let Some(used) = self.special_regs.get_mut(&reg) {
+                } else if let Some(used) = self.temp_regs.get_mut(&reg) {
                     *used = false;
                 } else {
                     panic!("Trying to free unknown register {:?}", reg);
@@ -335,9 +335,7 @@ impl Drop for RegAddress {
             return;
         }
         let mut state = self.state.borrow_mut();
-        if let Some(value) = self.value.clone() {
-            state.free_location(value, self.location.clone());
-        }
+        state.free_location(self.value, self.location.clone());
     }
 }
 
@@ -381,9 +379,7 @@ impl RegisterAllocator {
 
     pub fn register(&self, value: Value) -> RegAddress {
         let mut state = self.state.borrow_mut();
-        // println!("Registering value {:?} in register allocator", value);
         if let Some(location) = state.mapping.get(&value).cloned() {
-            // println!("Value {:?} is already mapped to location {:?}", value, location);
             return RegAddress::new(Rc::clone(&self.state), Some(value), location, false);
         }
 
@@ -399,39 +395,30 @@ impl RegisterAllocator {
         if let Some(reg) = picked_reg {
             let location = RegLocation::Reg(reg);
             state.mapping.insert(value, location.clone());
-            // println!("Mapped value {:?} to register {:?}", value, location);
             return RegAddress::new(Rc::clone(&self.state), Some(value), location, true);
         }
 
         let stack_index = state.alloc_stack_slot();
         let location = RegLocation::Stack(stack_index);
         state.mapping.insert(value, location.clone());
-        // println!("No free register for value {:?}, allocated stack slot {}", value, stack_index);
-        RegAddress::new(Rc::clone(&self.state), Some(value), location, true)
-    }
-
-    pub fn register_param(&self, value: Value, index: usize) -> RegAddress {
-        let mut state = self.state.borrow_mut();
-        let reg_name = RegName::Param(index);
-        if state.special_regs.get(&reg_name).cloned().unwrap() {
-            panic!("Parameter register {:?} is already used", reg_name);
-        }
-        let location = RegLocation::Reg(reg_name.clone());
-        state.mapping.insert(value, location.clone());
         RegAddress::new(Rc::clone(&self.state), Some(value), location, true)
     }
 
     pub fn register_temp(&self) -> RegAddress {
-        let state = self.state.borrow_mut();
-        let mut reg_name = RegName::TempT(0);
-        if state.special_regs.get(&reg_name).cloned().unwrap() {
-            reg_name = RegName::TempT(1);
-            if state.special_regs.get(&reg_name).cloned().unwrap() {
-                panic!("Temporary registers are all used");
+        let mut state = self.state.borrow_mut();
+        let mut reg_name: Option<RegName> = None;
+        for (reg, used) in state.temp_regs.iter_mut() {
+            if !*used {
+                *used = true;
+                reg_name = Some(reg.clone());
+                break;
             }
         }
-        let location = RegLocation::Reg(reg_name.clone());
-        RegAddress::new(Rc::clone(&self.state), None, location, true)
+        if let Some(reg) = reg_name {
+            let location = RegLocation::Reg(reg);
+            return RegAddress::new(Rc::clone(&self.state), None, location, true);
+        }
+        unreachable!("No free temporary register available");
     }
 
     pub fn max_stack_size(&self) -> usize {

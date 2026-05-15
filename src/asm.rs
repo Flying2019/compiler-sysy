@@ -153,6 +153,7 @@ impl<'a> Clone for Background<'a> {
 pub struct AsmContext {
     asm: Asm,
     temp_value: HashMap<Value, TempRecord>,
+    param_value: HashMap<Value, RegLocation>,
     branch: HashMap<BasicBlock, usize>,
 }
 
@@ -161,6 +162,7 @@ impl AsmContext {
         Self {
             asm: Asm::new(),
             temp_value: HashMap::new(),
+            param_value: HashMap::new(),
             branch: HashMap::new(),
         }
     }
@@ -173,15 +175,35 @@ impl AsmContext {
         self.asm.add_line(line);
     }
 
-    pub fn temp_value_mut(&mut self) -> &mut HashMap<Value, TempRecord> {
-        &mut self.temp_value
+    pub fn register_param(&mut self, value: Value, id: usize) {
+        if id < 8 {
+            self.param_value
+                .insert(value, RegLocation::Reg(RegName::Param(id as usize)));
+        } else {
+            self.param_value
+                .insert(value, RegLocation::Stack((id - 8) as usize));
+        }
+    }
+
+    pub fn get_param(&self, value: &Value) -> Option<&RegLocation> {
+        self.param_value.get(value)
+    }
+
+    pub fn get_temp_value(&self, value: &Value) -> Option<&TempRecord> {
+        self.temp_value.get(value)
+    }
+
+    pub fn get_temp_value_mut(&mut self, value: &Value) -> Option<&mut TempRecord> {
+        self.temp_value.get_mut(value)
     }
 
     pub fn insert_temp_record(&mut self, value: Value, record: TempRecord) {
+        // println!("Insert temp record for value {:?} at location {:?}", value, record.loc.location);
         self.temp_value.insert(value, record);
     }
 
     pub fn remove_temp_record(&mut self, value: &Value) -> Option<TempRecord> {
+        // println!("Remove temp record for value {:?}", value);
         self.temp_value.remove(value)
     }
 
@@ -197,6 +219,7 @@ impl AsmContext {
 
     pub fn clear(&mut self) {
         self.asm = Asm::new();
+        self.param_value.clear();
     }
 }
 
@@ -431,37 +454,41 @@ fn new_temp_reg(loc: RegLocation, bg: &Background, context: &mut AsmContext) -> 
     dest_addr
 }
 
-fn load_temp_reg(
-    src: Value,
-    dest: Value,
-    bg: &Background,
-    context: &mut AsmContext,
-) -> RegAddress {
+fn load_temp_reg(src: Value, dest: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
     let (loc, is_last_use) = {
-        let record = context.temp_value_mut().get_mut(&src).expect(&format!("temporary value should be available: {:?}", src));
-        record.used_by.remove(&dest);
-        (record.loc.location.clone(), record.used_by.is_empty())
+        if let Some(loc) = context.get_param(&src) {
+            (loc.clone(), false)
+        } else {
+            let record = context
+                .get_temp_value_mut(&src)
+                .expect(&format!("temporary value should be available: {:?}", src));
+            record.used_by.remove(&dest);
+            (record.loc.location.clone(), record.used_by.is_empty())
+        }
     };
     let reg = new_temp_reg(loc, bg, context);
     if is_last_use {
-        context.remove_temp_record(&src).expect("temporary value should be available");
+        context
+            .remove_temp_record(&src)
+            .expect("temporary value should be available");
     }
     reg
 }
 
-fn peek_temp_reg(
-    src: Value,
-    bg: &Background,
-    context: &mut AsmContext,
-) -> RegAddress {
-    let reg_rec = context.temp_value_mut().get(&src).expect("temporary value should be available");
-    new_temp_reg(reg_rec.loc.location.clone(), bg, context)
+fn peek_temp_reg(src: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    if let Some(loc) = context.get_param(&src) {
+        new_temp_reg(loc.clone(), bg, context)
+    } else {
+        let reg_rec = context
+            .get_temp_value(&src)
+            .expect("temporary value should be available");
+        new_temp_reg(reg_rec.loc.location.clone(), bg, context)
+    }
 }
 
 fn release_temp_if_unused(value: Value, context: &mut AsmContext) -> Option<RegAddress> {
     if context
-        .temp_value_mut()
-        .get(&value)
+        .get_temp_value(&value)
         .is_some_and(|record| record.used_by.is_empty())
     {
         context.remove_temp_record(&value).map(|record| record.loc)
@@ -471,32 +498,15 @@ fn release_temp_if_unused(value: Value, context: &mut AsmContext) -> Option<RegA
 }
 
 /// Load an operand into a register, returning the register and the temporary values it holds (if any).
-fn load_operand(
-    src: Value,
-    dest: Value,
-    bg: &Background,
-    context: &mut AsmContext,
-) -> RegAddress {
-    let reg_addr = bg.ra().register(dest);
+fn load_operand_temp(src: Value, user: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
     match bg.get_value(src).kind() {
         ValueKind::Integer(c) => {
-            match reg_addr.location.clone() {
-                RegLocation::Reg(reg) => {
-                    context.asm_add_line(AsmLine::Li(reg.clone(), c.value()));
-                }
-                RegLocation::Stack(_) => {
-                    let temp_reg = bg.ra().register_temp();
-                    context.asm_add_line(AsmLine::Li(temp_reg.get_reg_name(), c.value()));
-                    write_reg_to_location(&reg_addr, temp_reg.get_reg_name(), bg.frame(), context);
-                }
-            };
-        },
-        _ => {
-            let temp_reg = load_temp_reg(src, dest, bg, context);
-            write_reg_to_location(&reg_addr, temp_reg.get_reg_name(), bg.frame(), context);
+            let temp_reg = bg.ra().register_temp();
+            context.asm_add_line(AsmLine::Li(temp_reg.get_reg_name(), c.value()));
+            temp_reg
         }
-    };
-    reg_addr
+        _ => load_temp_reg(src, user, bg, context),
+    }
 }
 
 /// Store the value of a store instruction to its destination, which should be a local allocation. The source value can be an immediate integer or a temporary value.
@@ -510,7 +520,7 @@ fn store_to_asm(store: &Store, bg: &Background, context: &mut AsmContext, user: 
             context.asm_add_line(AsmLine::Li(temp_reg.clone(), c.value()));
             temp_addr
         }
-        _ => load_temp_reg(src, user, bg, context)
+        _ => load_temp_reg(src, user, bg, context),
     };
     if let Some(value_data) = bg.get_glob(dest_ptr) {
         // Store to a global variable, we need to load its address first
@@ -567,55 +577,91 @@ fn binary_to_asm(
     context: &mut AsmContext,
 ) -> RegAddress {
     let dest = bg.ra().register(value);
-    let lhs = load_operand(binary.lhs(), value, bg, context);
-    let rhs = load_operand(binary.rhs(), value, bg, context);
+    let lhs = load_operand_temp(binary.lhs(), value, bg, context);
+    let rhs = load_operand_temp(binary.rhs(), value, bg, context);
     let result_reg = match dest.location {
         RegLocation::Reg(ref reg) => reg.clone(),
         RegLocation::Stack(_) => lhs.get_reg_name(),
     };
 
     match binary.op() {
-        BinaryOp::Add => {
-            context.asm_add_line(AsmLine::Add(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
-        }
-        BinaryOp::Sub => {
-            context.asm_add_line(AsmLine::Sub(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
-        }
-        BinaryOp::Mul => {
-            context.asm_add_line(AsmLine::Mul(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
-        }
-        BinaryOp::Div => {
-            context.asm_add_line(AsmLine::Div(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
-        }
-        BinaryOp::Mod => {
-            context.asm_add_line(AsmLine::Rem(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
-        }
+        BinaryOp::Add => context.asm_add_line(AsmLine::Add(
+            result_reg.clone(),
+            lhs.get_reg_name(),
+            rhs.get_reg_name(),
+        )),
+        BinaryOp::Sub => context.asm_add_line(AsmLine::Sub(
+            result_reg.clone(),
+            lhs.get_reg_name(),
+            rhs.get_reg_name(),
+        )),
+        BinaryOp::Mul => context.asm_add_line(AsmLine::Mul(
+            result_reg.clone(),
+            lhs.get_reg_name(),
+            rhs.get_reg_name(),
+        )),
+        BinaryOp::Div => context.asm_add_line(AsmLine::Div(
+            result_reg.clone(),
+            lhs.get_reg_name(),
+            rhs.get_reg_name(),
+        )),
+        BinaryOp::Mod => context.asm_add_line(AsmLine::Rem(
+            result_reg.clone(),
+            lhs.get_reg_name(),
+            rhs.get_reg_name(),
+        )),
         BinaryOp::Eq => {
-            context.asm_add_line(AsmLine::Xor(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()));
+            context.asm_add_line(AsmLine::Xor(
+                result_reg.clone(),
+                lhs.get_reg_name(),
+                rhs.get_reg_name(),
+            ));
             context.asm_add_line(AsmLine::Seqz(result_reg.clone(), result_reg.clone()));
         }
         BinaryOp::NotEq => {
-            context.asm_add_line(AsmLine::Xor(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()));
+            context.asm_add_line(AsmLine::Xor(
+                result_reg.clone(),
+                lhs.get_reg_name(),
+                rhs.get_reg_name(),
+            ));
             context.asm_add_line(AsmLine::Snez(result_reg.clone(), result_reg.clone()));
         }
         BinaryOp::Le => {
-            context.asm_add_line(AsmLine::Slt(result_reg.clone(), rhs.get_reg_name(), lhs.get_reg_name()));
+            context.asm_add_line(AsmLine::Slt(
+                result_reg.clone(),
+                rhs.get_reg_name(),
+                lhs.get_reg_name(),
+            ));
             context.asm_add_line(AsmLine::Xori(result_reg.clone(), result_reg.clone(), 1));
         }
-        BinaryOp::Lt => {
-            context.asm_add_line(AsmLine::Slt(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
-        }
+        BinaryOp::Lt => context.asm_add_line(AsmLine::Slt(
+            result_reg.clone(),
+            lhs.get_reg_name(),
+            rhs.get_reg_name(),
+        )),
         BinaryOp::Ge => {
-            context.asm_add_line(AsmLine::Slt(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()));
+            context.asm_add_line(AsmLine::Slt(
+                result_reg.clone(),
+                lhs.get_reg_name(),
+                rhs.get_reg_name(),
+            ));
             context.asm_add_line(AsmLine::Xori(result_reg.clone(), result_reg.clone(), 1));
         }
-        BinaryOp::Gt => {
-            context.asm_add_line(AsmLine::Slt(result_reg.clone(), rhs.get_reg_name(), lhs.get_reg_name()))
-        }
-        BinaryOp::And => {
-            context.asm_add_line(AsmLine::And(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name()))
-        }
-        BinaryOp::Or => context.asm_add_line(AsmLine::Or(result_reg.clone(), lhs.get_reg_name(), rhs.get_reg_name())),
+        BinaryOp::Gt => context.asm_add_line(AsmLine::Slt(
+            result_reg.clone(),
+            rhs.get_reg_name(),
+            lhs.get_reg_name(),
+        )),
+        BinaryOp::And => context.asm_add_line(AsmLine::And(
+            result_reg.clone(),
+            lhs.get_reg_name(),
+            rhs.get_reg_name(),
+        )),
+        BinaryOp::Or => context.asm_add_line(AsmLine::Or(
+            result_reg.clone(),
+            lhs.get_reg_name(),
+            rhs.get_reg_name(),
+        )),
         _ => unimplemented!(
             "{}",
             format!("Unsupported binary operation: {:?}", binary.op())
@@ -678,7 +724,10 @@ fn store_block_args(
             }
             _ => {
                 let temp_reg = peek_temp_reg(arg, bg, context);
-                context.asm_add_line(AsmLine::Store(bg.frame().stack_slot_to_addr(slot), temp_reg.get_reg_name()));
+                context.asm_add_line(AsmLine::Store(
+                    bg.frame().stack_slot_to_addr(slot),
+                    temp_reg.get_reg_name(),
+                ));
                 block_args.push(arg);
             }
         }
@@ -713,10 +762,8 @@ fn function_to_asm(func: &FunctionData, bg: &Background, context: &mut AsmContex
     result.add_line(AsmLine::DirText);
     result.add_line(AsmLine::Global(name.clone()));
     result.add_line(AsmLine::GlobName(name.clone()));
-    // First 8 args store in a0 ~ a7
-    for (id, &arg) in func.params().iter().enumerate().take(8) {
-        let loc = bg.ra().register_param(arg, id);
-        context.insert_temp_record(arg, TempRecord::from_value(arg, bg, loc));
+    for (id, &arg) in func.params().iter().enumerate() {
+        context.register_param(arg, id);
     }
     for (&bb, node) in func.layout().bbs() {
         let br_id = context.get_branch_id(bb);
@@ -812,7 +859,7 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
                 bg,
                 context,
             ));
-            let cond = load_operand(br.cond(), value, bg, context);
+            let cond = load_operand_temp(br.cond(), value, bg, context);
             let _released_block_args = release_block_args(block_args, context);
             let then_id = context.get_branch_id(br.true_bb());
             let else_id = context.get_branch_id(br.false_bb());
@@ -833,18 +880,18 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
             let args = call.args();
             let saved_regs = live_caller_saved_regs_across_call(value, context);
             save_caller_saved_regs(&saved_regs, bg, context);
-            let mut arg_holds = Vec::new();
             for (i, &arg) in args.iter().enumerate() {
-                let arg_reg = load_operand(arg, value, bg, context);
+                let temp_reg = load_operand_temp(arg, value, bg, context);
                 if i < 8 {
-                    context.asm_add_line(AsmLine::Mv(RegName::Param(i), arg_reg.get_reg_name()));
+                    context.asm_add_line(AsmLine::Mv(RegName::Param(i), temp_reg.get_reg_name()));
                 } else {
-                    context.asm_add_line(AsmLine::Store(frame.arg_to_addr(i - 8), arg_reg.get_reg_name()));
+                    context.asm_add_line(AsmLine::Store(
+                        frame.arg_to_addr(i - 8),
+                        temp_reg.get_reg_name(),
+                    ));
                 }
-                arg_holds.push(arg_reg);
             }
             context.asm_add_line(AsmLine::Call(name_to_symbol(func_data.name())));
-            drop(arg_holds);
             if inst.ty().is_unit() {
                 restore_caller_saved_regs(&saved_regs, bg, context);
                 return None;
