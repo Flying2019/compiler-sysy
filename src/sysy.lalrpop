@@ -79,7 +79,7 @@ NonIfStmt: Stmt = {
   "continue" ";" => Stmt::Continue,
   "break" ";" => Stmt::Break,
   <Block> => Stmt::Block(<>),
-  <Ident> "=" <Exp> ";" => Stmt::Assign(<>),
+  <ArrayExp> "=" <Exp> ";" => Stmt::Assign(<>),
   "return" <Exp> ";" => Stmt::Return(Some(<>)),
   "return" ";" => Stmt::Return(None),
   <Exp> ";" => Stmt::Exp(<>),
@@ -95,9 +95,28 @@ MultipleDecl: Vec<SingleDecl> = {
   }
 }
 
+InitVal: InitVal = {
+  <exp: Exp> => InitVal::Exp(<>),
+  "{" <MultiInitVal> "}" => InitVal::Arr(<>)
+}
+
+MultiInitVal: Vec<InitVal> = {
+  <InitVal> => vec![<>],
+  <single_init: InitVal> "," <rest: MultiInitVal> => {
+    let mut inits = vec![single_init];
+    inits.extend(rest);
+    inits
+  }
+}
+
+VarDecl: VarDecl = {
+  <Ident> => VarDecl::Ident(<>),
+  <var: VarDecl> "[" <exp: Exp> "]" => VarDecl::Array(Box::new(var), exp)
+}
+
 SingleDecl: SingleDecl = {
-  <ident: Ident> => SingleDecl { ident: ident, init: None },
-  <ident: Ident> "=" <exp: Exp> => SingleDecl { ident: ident, init: Some(exp) },
+  <var: VarDecl> => SingleDecl { var: var, init: None },
+  <var: VarDecl> "=" <init_val: InitVal> => SingleDecl { var: var, init: Some(init_val) },
 }
 
 FuncArgs: Vec<Exp> = {
@@ -123,12 +142,17 @@ Exp: Exp = {
   <LOrExp> => <>,
 }
 
+ArrayExp: Exp = {
+  <Ident> => Exp::Ident(<>),
+  <arr: ArrayExp> "[" <pos: Exp> "]" => Exp::ArrGet(Box::new(arr), Box::new(pos)),
+}
+
 PrimaryExp: Exp = {
+  <ArrayExp> => <>,
   <ident: Ident> "(" ")" => Exp::FuncCall(ident, Vec::new()),
   <Ident> "(" <FuncArgs> ")" => Exp::FuncCall(<>),
   "(" <Exp> ")" => <>,
   <IntConst> => Exp::Number(<>),
-  <Ident> => Exp::Ident(<>),
 }
 
 UnaryExp: Exp = {

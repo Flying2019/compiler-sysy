@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::koopa::{KoopaLine, KoopaLines};
+use crate::lalr::VarDecl;
 use crate::{
     ast::{AstNode, ReturnValue},
     lalr::{BType, BinaryOp, CompUnit, Exp, GlobleDef, Type, UnaryOp},
@@ -457,13 +458,18 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                     continue; // Global constants are not stored in the symbol table
                 }
                 for decl in decls {
-                    let var_name = decl.ident.clone();
-                    if bg.global_symbols.global_variable.contains_key(&var_name) {
-                        panic!("Duplicate global variable definition: {}", var_name);
+                    let var = decl.var.clone();
+                    match var {
+                        VarDecl::Ident(var_name) => {
+                            if bg.global_symbols.global_variable.contains_key(&var_name) {
+                                panic!("Duplicate global variable definition: {}", var_name);
+                            }
+                            bg.global_symbols
+                                .global_variable
+                                .insert(var_name, ty.clone());
+                        }
+                        _ => unimplemented!()
                     }
-                    bg.global_symbols
-                        .global_variable
-                        .insert(var_name, ty.clone());
                 }
             }
         }

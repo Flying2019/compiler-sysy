@@ -26,7 +26,7 @@ pub struct FuncParam {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Block(Vec<Stmt>),
-    Assign(String, Exp),
+    Assign(Exp, Exp),
     Decl(Type, Vec<SingleDecl>),
     Exp(Exp),
     If(Exp, Box<Stmt>),
@@ -39,9 +39,21 @@ pub enum Stmt {
 }
 
 #[derive(Debug, Clone)]
+pub enum VarDecl{
+    Ident(String),
+    Array(Box<VarDecl>, Exp)
+}
+
+#[derive(Debug, Clone)]
 pub struct SingleDecl {
-    pub ident: String,
-    pub init: Option<Exp>,
+    pub var: VarDecl,
+    pub init: Option<InitVal>,
+}
+
+#[derive(Debug, Clone)]
+pub enum InitVal {
+    Exp(Exp),
+    Arr(Vec<InitVal>)
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +75,7 @@ pub enum Exp {
     UnaryExp(UnaryOp, Box<Exp>),
     BinaryExp(BinaryOp, Box<Exp>, Box<Exp>),
     FuncCall(String, Vec<Exp>),
+    ArrGet(Box<Exp>, Box<Exp>),
     Ident(String),
 }
 

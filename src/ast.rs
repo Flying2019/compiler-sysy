@@ -71,19 +71,24 @@ impl AstNode for GlobleDef {
                 match typ {
                     Type::BType(btype) => {
                         for decl in decls {
-                            let var_name = decl.ident.clone();
+                            let var = decl.var.clone();
                             let init_value = if let Some(init) = &decl.init {
                                 let value = init.try_eval_const(bg).expect("Global variable must be initialized with a constant expression");
                                 value.to_string()
                             } else {
                                 "zeroinit".to_string() // Default initialization for global variables
                             };
-                            let new_name = bg.new_variable(var_name);
-                            lines.add_line(KoopaLine::GlobalAlloc(
-                                new_name,
-                                btype.to_koopa_type(),
-                                init_value,
-                            ));
+                            match var {
+                                VarDecl::Ident(var_name) => {
+                                    let new_name = bg.new_variable(var_name);
+                                    lines.add_line(KoopaLine::GlobalAlloc(
+                                        new_name,
+                                        btype.to_koopa_type(),
+                                        init_value,
+                                    ));
+                                }
+                                _ => unimplemented!()
+                            }
                         }
                         lines
                     }
@@ -93,9 +98,13 @@ impl AstNode for GlobleDef {
                                 let value = init.try_eval_const(bg).expect(
                                     "Const variable must be initialized with a constant expression",
                                 );
-                                bg.set_constant(decl.ident.clone(), value);
+                                match decl.var.clone() {
+                                    VarDecl::Ident(var_name) => bg.set_constant(var_name, value),
+                                    _ => unimplemented!()
+                                }
+                                
                             } else {
-                                panic!("Const variable {} must be initialized", decl.ident);
+                                panic!("Const variable {:?} must be initialized", decl.var);
                             }
                         }
                         lines
@@ -196,28 +205,39 @@ impl AstNode for Stmt {
         // next_bb = None means the next stmts hasn't closed yet.
         match self {
             Stmt::Block(block) => block.to_koopa_lines(bg),
-            Stmt::Assign(ident, exp) => {
-                let exp_ret = exp.to_koopa(bg);
-                let ptr = bg.get_variable(ident.clone());
-                let mut content = exp_ret.content;
-                content.add_line(KoopaLine::Store(exp_ret.value.unwrap(), ptr));
-                content
+            Stmt::Assign(left, right) => {
+                if let Exp::Ident(ident) = left {
+                    let exp_ret = right.to_koopa(bg);
+                    let ptr = bg.get_variable(ident.clone());
+                    let mut content = exp_ret.content;
+                    content.add_line(KoopaLine::Store(exp_ret.value.unwrap(), ptr));
+                    content
+                }
+                else {
+                    unimplemented!()
+                }
             }
             Stmt::Decl(typ, decls) => {
                 let mut content = KoopaLines::new();
                 match typ {
                     Type::BType(btype) => {
                         for decl in decls {
-                            let ptr_name = bg.new_variable(decl.ident.clone());
-                            content.add_line(KoopaLine::Alloc(
-                                ptr_name.clone(),
-                                btype.to_koopa_type(),
-                            ));
-                            if let Some(init) = &decl.init {
-                                let init_ret = init.to_koopa(bg);
-                                content.add_lines(init_ret.content);
-                                content
-                                    .add_line(KoopaLine::Store(init_ret.value.unwrap(), ptr_name));
+                            let var = decl.var.clone();
+                            match var {
+                                VarDecl::Ident(var_name) => {
+                                    let ptr_name = bg.new_variable(var_name);
+                                    content.add_line(KoopaLine::Alloc(
+                                        ptr_name.clone(),
+                                        btype.to_koopa_type(),
+                                    ));
+                                    if let Some(init) = &decl.init {
+                                        let init_ret = init.to_koopa(bg);
+                                        content.add_lines(init_ret.content);
+                                        content
+                                            .add_line(KoopaLine::Store(init_ret.value.unwrap(), ptr_name));
+                                    }
+                                }
+                                _ => unimplemented!()
                             }
                         }
                         content
@@ -228,9 +248,13 @@ impl AstNode for Stmt {
                                 let value = init.try_eval_const(bg).expect(
                                     "Const variable must be initialized with a constant expression",
                                 );
-                                bg.set_constant(decl.ident.clone(), value);
+                                let var = decl.var.clone();
+                                match var {
+                                    VarDecl::Ident(var_name) => bg.set_constant(var_name, value),
+                                    _ => unimplemented!()
+                                }
                             } else {
-                                panic!("Const variable {} must be initialized", decl.ident);
+                                panic!("Const variable {:?} must be initialized", decl.var);
                             }
                         }
                         content
@@ -396,7 +420,8 @@ impl AstNode for Exp {
                     },
                     _ => unimplemented!("Function type {:?} not supported yet", func_type),
                 }
-            }
+            },
+            Exp::ArrGet(_, _) => unimplemented!()
         }
     }
 }
@@ -416,6 +441,25 @@ impl Exp {
             }
             Exp::Ident(name) => bg.try_get_constant(name.clone()),
             Exp::FuncCall(_, _) => None,
+            Exp::ArrGet(_, _) => None,
+        }
+    }
+}
+
+impl InitVal {
+    fn try_eval_const(&self, bg: &Background) -> Option<i32> {
+        match self {
+            InitVal::Arr(_) => None,
+            InitVal::Exp(exp) => exp.try_eval_const(bg)
+        }
+    }
+}
+
+impl AstNode for InitVal {
+    fn to_koopa(&self, bg: &mut Background) -> ReturnValue {
+        match self {
+            InitVal::Arr(_) => unimplemented!(),
+            InitVal::Exp(exp) => exp.to_koopa(bg)
         }
     }
 }
