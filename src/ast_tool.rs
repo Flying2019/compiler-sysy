@@ -7,6 +7,40 @@ use crate::{
     lalr::{BType, BinaryOp, CompUnit, Exp, GlobleDef, Type, UnaryOp},
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueType {
+    Int,
+    Pointer(Box<ValueType>),
+    Array(usize, Box<ValueType>),
+}
+
+impl ValueType {
+    pub fn from_btype(btype: &BType) -> Self {
+        match btype {
+            BType::I32 => ValueType::Int,
+            BType::Ptr(inner) => ValueType::Pointer(Box::new(ValueType::from_btype(inner))),
+            BType::Array(len, inner) => ValueType::Array(*len, Box::new(ValueType::from_btype(inner))),
+            BType::Void => panic!("Void is not a storable value type"),
+        }
+    }
+
+    pub fn from_dims(dims: &[usize]) -> Self {
+        let mut ty = ValueType::Int;
+        for len in dims.iter().rev() {
+            ty = ValueType::Array(*len, Box::new(ty));
+        }
+        ty
+    }
+
+    pub fn to_koopa_type(&self) -> String {
+        match self {
+            ValueType::Int => "i32".to_string(),
+            ValueType::Pointer(inner) => format!("*{}", inner.to_koopa_type()),
+            ValueType::Array(len, inner) => format!("[{}, {}]", inner.to_koopa_type(), len),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RenameManager {
     timestamp: usize,
@@ -79,7 +113,7 @@ type NextBb = Option<String>;
 
 #[derive(Debug)]
 struct GlobalSymbols {
-    global_variable: HashMap<String, Type>,
+    global_variable: HashMap<String, ValueType>,
     global_function: HashMap<String, (Type, Vec<BType>)>, // function name -> (return type, parameter types)
     static_function: HashMap<String, (Type, Vec<BType>)>, // function name -> (return type, parameter types)
 }
@@ -100,6 +134,7 @@ pub struct Background {
     temp_counter: usize,
     branch_counter: usize,
     constant_map: HashMap<String, i32>,
+    variable_types: HashMap<String, ValueType>,
     rename_manager: RenameManager,
     next_bb: NextBb,
     loop_next: NextBb,
@@ -113,6 +148,7 @@ impl Background {
             temp_counter: 0,
             branch_counter: 0,
             constant_map: HashMap::new(),
+            variable_types: HashMap::new(),
             rename_manager: RenameManager::new(),
             next_bb: None,
             loop_next: None,
@@ -126,7 +162,7 @@ impl Background {
         self.loop_entry = None;
     }
 
-    pub fn get_global_variable(&self, name: String) -> Option<&Type> {
+    pub fn get_global_variable(&self, name: String) -> Option<&ValueType> {
         self.global_symbols.global_variable.get(&name)
     }
 
@@ -163,6 +199,18 @@ impl Background {
         variable_rename(name, count)
     }
 
+    pub fn get_variable_type(&self, name: String) -> ValueType {
+        let renamed = self.get_variable(name);
+        self.variable_types
+            .get(&renamed)
+            .cloned()
+            .expect("Variable type not found")
+    }
+
+    pub fn set_variable_type(&mut self, renamed: String, ty: ValueType) {
+        self.variable_types.insert(renamed, ty);
+    }
+
     pub fn new_variable(&mut self, name: String) -> String {
         let count = self
             .rename_manager
@@ -173,8 +221,9 @@ impl Background {
     }
 
     pub fn try_get_constant(&self, name: String) -> Option<i32> {
-        let name = self.get_variable(name);
-        self.constant_map.get(&name).cloned()
+        let count = self.rename_manager.get_current_name(&name)?;
+        let renamed = variable_rename(name, count);
+        self.constant_map.get(&renamed).cloned()
     }
 
     pub fn set_constant(&mut self, name: String, value: i32) {
@@ -429,7 +478,7 @@ fn static_functions() -> Vec<(&'static str, Type, Vec<BType>)> {
         (
             "putarray",
             void_type.clone(),
-            vec![BType::Ptr(Box::new(BType::I32)), BType::I32],
+            vec![BType::I32, BType::Ptr(Box::new(BType::I32))],
         ),
         ("starttime", i32_type.clone(), vec![]),
         ("stoptime", i32_type.clone(), vec![]),
@@ -454,21 +503,30 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                     .insert(func_name, (func_def.func_type, params));
             }
             GlobleDef::GlobleDecl(ty, decls) => {
-                if matches!(ty, Type::Const(_)) {
-                    continue; // Global constants are not stored in the symbol table
-                }
                 for decl in decls {
+                    if matches!(ty, Type::Const(_)) {
+                        if let (VarDecl::Ident(var_name), Some(crate::lalr::InitVal::Exp(exp))) =
+                            (&decl.var, &decl.init)
+                        {
+                            if let Some(value) = exp.try_eval_const(bg) {
+                                bg.set_constant(var_name.clone(), value);
+                            }
+                        }
+                    }
                     let var = decl.var.clone();
-                    match var {
-                        VarDecl::Ident(var_name) => {
+                    match var_decl_value_type(&var, bg) {
+                        Some((var_name, value_type)) => {
+                            let is_scalar_const = matches!(ty, Type::Const(_))
+                                && matches!(value_type, ValueType::Int);
+                            if is_scalar_const {
+                                continue;
+                            }
                             if bg.global_symbols.global_variable.contains_key(&var_name) {
                                 panic!("Duplicate global variable definition: {}", var_name);
                             }
-                            bg.global_symbols
-                                .global_variable
-                                .insert(var_name, ty.clone());
+                            bg.global_symbols.global_variable.insert(var_name, value_type);
                         }
-                        _ => unimplemented!()
+                        None => unimplemented!(),
                     }
                 }
             }
@@ -483,4 +541,32 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
             .static_function
             .insert(func_name, (func_type, params));
     }
+}
+
+fn var_decl_value_type(var: &VarDecl, bg: &Background) -> Option<(String, ValueType)> {
+    match var {
+        VarDecl::Ident(name) => Some((name.clone(), ValueType::Int)),
+        VarDecl::Array(_, _) => {
+            let (name, dims) = flatten_var_decl(var, bg)?;
+            Some((name, ValueType::from_dims(&dims)))
+        }
+    }
+}
+
+fn flatten_var_decl(var: &VarDecl, bg: &Background) -> Option<(String, Vec<usize>)> {
+    fn inner(var: &VarDecl, bg: &Background, dims: &mut Vec<usize>) -> Option<String> {
+        match var {
+            VarDecl::Ident(name) => Some(name.clone()),
+            VarDecl::Array(base, len) => {
+                let name = inner(base, bg, dims)?;
+                let len = len.try_eval_const(bg)? as usize;
+                dims.push(len);
+                Some(name)
+            }
+        }
+    }
+
+    let mut dims = Vec::new();
+    let name = inner(var, bg, &mut dims)?;
+    Some((name, dims))
 }

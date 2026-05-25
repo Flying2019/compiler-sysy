@@ -12,6 +12,8 @@ pub enum KoopaLine {
     Alloc(String, Type),
     Store(String, String),
     Load(String, String),
+    GetPtr(String, String, String),
+    GetElemPtr(String, String, String),
     Binary(String, String, String, String),
     Br(String, Label, Label),
     Jump(Label),
@@ -50,6 +52,10 @@ impl KoopaLine {
             KoopaLine::Alloc(ptr_name, ptr_type) => format!("\t{} = alloc {}", ptr_name, ptr_type),
             KoopaLine::Store(value, ptr) => format!("\tstore {}, {}", value, ptr),
             KoopaLine::Load(dest, ptr) => format!("\t{} = load {}", dest, ptr),
+            KoopaLine::GetPtr(dest, ptr, idx) => format!("\t{} = getptr {}, {}", dest, ptr, idx),
+            KoopaLine::GetElemPtr(dest, ptr, idx) => {
+                format!("\t{} = getelemptr {}, {}", dest, ptr, idx)
+            }
             KoopaLine::Binary(dest, op, lhs, rhs) => {
                 format!("\t{} = {} {}, {}", dest, op, lhs, rhs)
             }
@@ -84,7 +90,7 @@ impl KoopaLines {
         if let Some(last_line) = self.lines.last() {
             matches!(
                 last_line,
-                KoopaLine::Ret(_) | KoopaLine::Jump(_) | KoopaLine::Br(_, _, _)
+                KoopaLine::Ret(_) | KoopaLine::VoidRet | KoopaLine::Jump(_) | KoopaLine::Br(_, _, _)
             )
         } else {
             false

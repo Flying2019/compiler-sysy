@@ -61,12 +61,73 @@ pub enum BType {
     I32,
     Void,
     Ptr(Box<BType>),
+    Array(usize, Box<BType>),
+}
+
+pub fn func_param_btype(base: BType, dims: Vec<usize>) -> BType {
+    let mut ty = base;
+    for dim in dims.into_iter().rev() {
+        ty = BType::Array(dim, Box::new(ty));
+    }
+    BType::Ptr(Box::new(ty))
 }
 
 #[derive(Debug, Clone)]
 pub enum Type {
     BType(BType),
     Const(BType),
+}
+
+pub fn param_base_btype(ty: Type) -> BType {
+    match ty {
+        Type::BType(btype) | Type::Const(btype) => btype,
+    }
+}
+
+pub fn eval_param_dim(exp: Exp) -> usize {
+    fn eval(exp: &Exp) -> Option<i32> {
+        match exp {
+            Exp::Number(num) => Some(*num),
+            Exp::UnaryExp(op, inner) => {
+                let value = eval(inner)?;
+                Some(match op {
+                    UnaryOp::Pos => value,
+                    UnaryOp::Neg => -value,
+                    UnaryOp::Not => {
+                        if value == 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                })
+            }
+            Exp::BinaryExp(op, lhs, rhs) => {
+                let lhs = eval(lhs)?;
+                let rhs = eval(rhs)?;
+                Some(match op {
+                    BinaryOp::Add => lhs + rhs,
+                    BinaryOp::Sub => lhs - rhs,
+                    BinaryOp::Mul => lhs * rhs,
+                    BinaryOp::Div => lhs / rhs,
+                    BinaryOp::Mod => lhs % rhs,
+                    BinaryOp::Lt => (lhs < rhs) as i32,
+                    BinaryOp::Gt => (lhs > rhs) as i32,
+                    BinaryOp::Le => (lhs <= rhs) as i32,
+                    BinaryOp::Ge => (lhs >= rhs) as i32,
+                    BinaryOp::Eq => (lhs == rhs) as i32,
+                    BinaryOp::Ne => (lhs != rhs) as i32,
+                    BinaryOp::And => ((lhs != 0) && (rhs != 0)) as i32,
+                    BinaryOp::Or => ((lhs != 0) || (rhs != 0)) as i32,
+                })
+            }
+            Exp::Ident(_) | Exp::FuncCall(_, _) | Exp::ArrGet(_, _) => None,
+        }
+    }
+
+    let value = eval(&exp).expect("Array parameter dimensions must be constant expressions");
+    assert!(value >= 0, "Array parameter dimensions must be non-negative");
+    value as usize
 }
 
 #[derive(Debug, Clone)]
