@@ -51,6 +51,13 @@ impl AsmValue {
             AsmValue::Const(c) => c.to_string(),
         }
     }
+
+    pub fn expect_offset(&self) -> (i32, RegName) {
+        match self {
+            AsmValue::Offset(offset, reg) => (*offset, reg.clone()),
+            _ => panic!("expected AsmValue::Offset, found {}", self.to_string()),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -225,6 +232,7 @@ impl AsmLine {
 pub enum RegLocation {
     Reg(RegName),
     Stack(usize),
+    ParamStack(usize),
 }
 
 impl Into<AsmValue> for RegLocation {
@@ -232,6 +240,7 @@ impl Into<AsmValue> for RegLocation {
         match self {
             RegLocation::Reg(reg) => AsmValue::Reg(reg),
             RegLocation::Stack(offset) => AsmValue::Offset((offset * 4) as i32, RegName::Stack),
+            RegLocation::ParamStack(offset) => AsmValue::Offset((offset * 4) as i32, RegName::TempS(0)),
         }
     }
 }
@@ -251,12 +260,10 @@ impl RegisterAllocatorState {
         for i in 3..6 {
             regs.insert(RegName::TempT(i), false);
         }
-        for i in 2..12 {
-            regs.insert(RegName::TempS(i), false);
-        }
         for i in 0..3 {
             temp_regs.insert(RegName::TempT(i), false);
         }
+        temp_regs.insert(RegName::TempT(6), false);
         Self {
             regs,
             temp_regs,
@@ -287,6 +294,7 @@ impl RegisterAllocatorState {
                     *used = false;
                 }
             }
+            RegLocation::ParamStack(_) => {}
         }
     }
 
@@ -350,6 +358,7 @@ impl RegAddress {
         match self.location.clone() {
             RegLocation::Reg(reg) => reg,
             RegLocation::Stack(_) => panic!("Cannot convert stack location to register name"),
+            RegLocation::ParamStack(_) => panic!("Cannot convert param stack location to register name"),
         }
     }
 }

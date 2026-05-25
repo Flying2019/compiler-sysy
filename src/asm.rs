@@ -2,6 +2,7 @@ use crate::riscv::{AsmLine, AsmValue, RegAddress, RegLocation, RegName, Register
 use core::panic;
 use koopa::ir::dfg::DataFlowGraph;
 use koopa::ir::entities::{BasicBlockData, ValueData};
+use koopa::ir::types::TypeKind;
 use koopa::ir::values::{Binary, BinaryOp, Store};
 use koopa::ir::{BasicBlock, Function, Value, ValueKind};
 use koopa::ir::{FunctionData, Program};
@@ -180,8 +181,7 @@ impl AsmContext {
             self.param_value
                 .insert(value, RegLocation::Reg(RegName::Param(id as usize)));
         } else {
-            self.param_value
-                .insert(value, RegLocation::Stack((id - 8) as usize));
+            self.param_value.insert(value, RegLocation::ParamStack((id - 8) as usize));
         }
     }
 
@@ -235,19 +235,7 @@ pub fn program_to_asm(progrma: &Program, bg: &Background) -> Asm {
             match var_data.kind() {
                 ValueKind::GlobalAlloc(glob_alloc) => {
                     let init_value = glob_alloc.init();
-                    let init_data = progrma.borrow_value(init_value);
-                    match init_data.kind() {
-                        ValueKind::ZeroInit(_) => {
-                            result.add_line(AsmLine::DirZero(4));
-                        }
-                        ValueKind::Integer(i) => {
-                            result.add_line(AsmLine::DirWord(i.value()));
-                        }
-                        _ => unimplemented!(
-                            "Unsupported global variable initializer: {:?}",
-                            init_data.kind()
-                        ),
-                    }
+                    emit_global_init(init_value, progrma, &mut result);
                 }
                 _ => unreachable!(),
             }
@@ -262,6 +250,30 @@ pub fn program_to_asm(progrma: &Program, bg: &Background) -> Asm {
         ));
     }
     result
+}
+
+fn alloc_size_words(value: &ValueData) -> usize {
+    match value.ty().kind() {
+        TypeKind::Pointer(base) => base.size() / 4,
+        _ => panic!("alloc/globalalloc should have pointer type, found {:?}", value.ty()),
+    }
+}
+
+fn emit_global_init(value: Value, program: &Program, asm: &mut Asm) {
+    let value_data = program.borrow_value(value);
+    match value_data.kind() {
+        ValueKind::ZeroInit(_) => asm.add_line(AsmLine::DirZero(value_data.ty().size())),
+        ValueKind::Integer(i) => asm.add_line(AsmLine::DirWord(i.value())),
+        ValueKind::Aggregate(aggregate) => {
+            for &elem in aggregate.elems() {
+                emit_global_init(elem, program, asm);
+            }
+        }
+        _ => unimplemented!(
+            "Unsupported global variable initializer: {:?}",
+            value_data.kind()
+        ),
+    }
 }
 
 pub struct TempRecord {
@@ -285,9 +297,12 @@ pub struct FunctionFrame {
     arg_words: usize,
     caller_save_words: usize,
     save_ra: bool,
+    save_fp: bool,
 }
 
 const CALLER_SAVE_WORDS: usize = 7; // t0-t6
+const IMM12_MIN: i32 = -2048;
+const IMM12_MAX: i32 = 2047;
 
 impl FunctionFrame {
     fn from_function(func: &FunctionData, bg: &Background) -> Self {
@@ -299,7 +314,7 @@ impl FunctionFrame {
             for &inst in node.insts().keys() {
                 if matches!(bg.get_value(inst).kind(), ValueKind::Alloc(_)) {
                     local_slots.insert(inst, local_words);
-                    local_words += 1;
+                    local_words += alloc_size_words(bg.get_value(inst));
                 }
             }
         }
@@ -332,6 +347,7 @@ impl FunctionFrame {
             arg_words,
             caller_save_words: if has_call { CALLER_SAVE_WORDS } else { 0 },
             save_ra: has_call,
+            save_fp: func.params().len() > 8,
         }
     }
 
@@ -351,7 +367,10 @@ impl FunctionFrame {
     */
 
     fn reserve_words(&self) -> usize {
-        self.arg_words + self.caller_save_words + usize::from(self.save_ra)
+        self.arg_words
+            + self.caller_save_words
+            + usize::from(self.save_ra)
+            + usize::from(self.save_fp)
     }
 
     fn local_slot(&self, value: Value) -> Option<usize> {
@@ -381,12 +400,64 @@ impl FunctionFrame {
         assert!(self.save_ra);
         self.stack_slot_to_addr(self.arg_words + self.caller_save_words)
     }
+
+    fn fp_to_addr(&self) -> AsmValue {
+        assert!(self.save_fp);
+        self.stack_slot_to_addr(
+            self.arg_words + self.caller_save_words + usize::from(self.save_ra),
+        )
+    }
+}
+
+/// Check if a value can fit in a 12-bit signed immediate
+fn fits_imm12(value: i32) -> bool {
+    (IMM12_MIN..=IMM12_MAX).contains(&value)
+}
+
+/// If the offset is outside the 12-bit signed immediate, use Li to extend.
+fn emit_offset_addr_to_reg(asm: &mut Asm, dest: RegName, base: RegName, offset: i32, scratch: RegName) {
+    if fits_imm12(offset) {
+        asm.add_line(AsmLine::Addi(dest, base, offset));
+    } else {
+        asm.add_line(AsmLine::Li(scratch.clone(), offset));
+        asm.add_line(AsmLine::Add(dest, base, scratch));
+    }
+}
+
+fn emit_load_from_offset(
+    asm: &mut Asm,
+    dest: RegName,
+    base: RegName,
+    offset: i32,
+    scratch: RegName,
+) {
+    if fits_imm12(offset) {
+        asm.add_line(AsmLine::Load(dest, AsmValue::Offset(offset, base)));
+    } else {
+        emit_offset_addr_to_reg(asm, scratch.clone(), base, offset, scratch.clone());
+        asm.add_line(AsmLine::Load(dest, AsmValue::Offset(0, scratch)));
+    }
+}
+
+fn emit_store_to_offset(
+    asm: &mut Asm,
+    base: RegName,
+    offset: i32,
+    src: RegName,
+    scratch: RegName,
+) {
+    if fits_imm12(offset) {
+        asm.add_line(AsmLine::Store(AsmValue::Offset(offset, base), src));
+    } else {
+        emit_offset_addr_to_reg(asm, scratch.clone(), base, offset, scratch.clone());
+        asm.add_line(AsmLine::Store(AsmValue::Offset(0, scratch), src));
+    }
 }
 
 fn write_reg_to_location(
     loc: &RegAddress,
     src: RegName,
-    frame: &FunctionFrame,
+    bg: &Background,
     context: &mut AsmContext,
 ) {
     match loc.location.clone() {
@@ -394,8 +465,17 @@ fn write_reg_to_location(
             context.asm_add_line(AsmLine::Mv(reg, src));
         }
         RegLocation::Stack(slot) => {
-            context.asm_add_line(AsmLine::Store(frame.spill_slot_to_addr(slot), src));
+            let (offset, base) = bg.frame().spill_slot_to_addr(slot).expect_offset();
+            let scratch = bg.ra().register_temp();
+            emit_store_to_offset(
+                context.asm_mut(),
+                base,
+                offset,
+                src,
+                scratch.get_reg_name(),
+            );
         }
+        RegLocation::ParamStack(_) => unreachable!("SSA temporaries should not be stored in param stack slots"),
     }
 }
 
@@ -424,20 +504,30 @@ fn live_caller_saved_regs_across_call(call_inst: Value, context: &AsmContext) ->
 fn save_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut AsmContext) {
     for reg in regs {
         let slot = caller_saved_slot(reg).expect("caller-saved register should have stack slot");
-        context.asm_add_line(AsmLine::Store(
-            bg.frame().caller_save_to_addr(slot),
+        let (offset, base) = bg.frame().caller_save_to_addr(slot).expect_offset();
+        let scratch = bg.ra().register_temp();
+        emit_store_to_offset(
+            context.asm_mut(),
+            base,
+            offset,
             reg.clone(),
-        ));
+            scratch.get_reg_name(),
+        );
     }
 }
 
 fn restore_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut AsmContext) {
     for reg in regs.iter().rev() {
         let slot = caller_saved_slot(reg).expect("caller-saved register should have stack slot");
-        context.asm_add_line(AsmLine::Load(
+        let (offset, base) = bg.frame().caller_save_to_addr(slot).expect_offset();
+        let scratch = bg.ra().register_temp();
+        emit_load_from_offset(
+            context.asm_mut(),
             reg.clone(),
-            bg.frame().caller_save_to_addr(slot),
-        ));
+            base,
+            offset,
+            scratch.get_reg_name(),
+        );
     }
 }
 
@@ -447,8 +537,25 @@ fn new_temp_reg(loc: RegLocation, bg: &Background, context: &mut AsmContext) -> 
     match loc {
         RegLocation::Reg(reg) => context.asm_add_line(AsmLine::Mv(dest_reg.clone(), reg)),
         RegLocation::Stack(slot) => {
-            let addr = bg.frame().spill_slot_to_addr(slot);
-            context.asm_add_line(AsmLine::Load(dest_reg.clone(), addr));
+            let (offset, base) = bg.frame().spill_slot_to_addr(slot).expect_offset();
+            let scratch = bg.ra().register_temp();
+            emit_load_from_offset(
+                context.asm_mut(),
+                dest_reg.clone(),
+                base,
+                offset,
+                scratch.get_reg_name(),
+            );
+        }
+        RegLocation::ParamStack(slot) => {
+            let scratch = bg.ra().register_temp();
+            emit_load_from_offset(
+                context.asm_mut(),
+                dest_reg.clone(),
+                RegName::TempS(0),
+                (slot * 4) as i32,
+                scratch.get_reg_name(),
+            );
         }
     };
     dest_addr
@@ -509,6 +616,34 @@ fn load_operand_temp(src: Value, user: Value, bg: &Background, context: &mut Asm
     }
 }
 
+fn emit_ptr_value(ptr: Value, user: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    if let Some(value_data) = bg.get_glob(ptr) {
+        let name = value_data.name().clone().unwrap();
+        let temp_addr = bg.ra().register_temp();
+        let temp_reg = temp_addr.get_reg_name();
+        context.asm_add_line(AsmLine::La(temp_reg, name_to_symbol(&name)));
+        temp_addr
+    } else if matches!(bg.get_value(ptr).kind(), ValueKind::Alloc(_)) {
+        let slot = bg
+            .frame()
+            .local_slot(ptr)
+            .expect("local alloc should have stack slot");
+        let temp_addr = bg.ra().register_temp();
+        let temp_reg = temp_addr.get_reg_name();
+        let scratch = bg.ra().register_temp();
+        emit_offset_addr_to_reg(
+            context.asm_mut(),
+            temp_reg.clone(),
+            RegName::Stack,
+            (slot * 4) as i32,
+            scratch.get_reg_name(),
+        );
+        temp_addr
+    } else {
+        load_temp_reg(ptr, user, bg, context)
+    }
+}
+
 /// Store the value of a store instruction to its destination, which should be a local allocation. The source value can be an immediate integer or a temporary value.
 fn store_to_asm(store: &Store, bg: &Background, context: &mut AsmContext, user: Value) {
     let dest_ptr = store.dest();
@@ -522,40 +657,18 @@ fn store_to_asm(store: &Store, bg: &Background, context: &mut AsmContext, user: 
         }
         _ => load_temp_reg(src, user, bg, context),
     };
-    if let Some(value_data) = bg.get_glob(dest_ptr) {
-        // Store to a global variable, we need to load its address first
-        let name = value_data.name().clone().unwrap();
-        let temp_glob_addr = bg.ra().register_temp();
-        let temp_glob_reg = temp_glob_addr.get_reg_name();
-        context.asm_add_line(AsmLine::La(temp_glob_reg.clone(), name_to_symbol(&name)));
-        context.asm_add_line(AsmLine::Store(
-            AsmValue::Offset(0, temp_glob_reg.clone()),
-            temp_addr.get_reg_name(),
-        ));
-    } else {
-        let slot = bg
-            .frame()
-            .local_slot(dest_ptr)
-            .expect("store destination should be local alloc");
-        let addr = bg.frame().stack_slot_to_addr(slot);
-        context.asm_add_line(AsmLine::Store(addr, temp_addr.get_reg_name()));
-    }
+    let dest_addr = emit_ptr_value(dest_ptr, user, bg, context);
+    context.asm_add_line(AsmLine::Store(
+        AsmValue::Offset(0, dest_addr.get_reg_name()),
+        temp_addr.get_reg_name(),
+    ));
 }
 
 /// Load the value of a load instruction into its destination register, which can be either a physical register or a spill slot. The source pointer should be a local allocation.
 fn load_to_asm(value: Value, src: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
-    let frame = bg.frame();
     let ra = bg.ra();
-    let temp_src = if let Some(slot) = frame.local_slot(src) {
-        frame.stack_slot_to_addr(slot)
-    } else if let Some(value_data) = bg.get_glob(src) {
-        let name = value_data.name().clone().unwrap();
-        let temp_reg = ra.register_temp();
-        context.asm_add_line(AsmLine::La(temp_reg.get_reg_name(), name_to_symbol(&name)));
-        AsmValue::Offset(0, temp_reg.get_reg_name())
-    } else {
-        panic!("load source should be either local alloc or global variable");
-    };
+    let temp_ptr = emit_ptr_value(src, value, bg, context);
+    let temp_src = AsmValue::Offset(0, temp_ptr.get_reg_name());
     let dest = ra.register(value);
     match dest.location.clone() {
         RegLocation::Reg(reg) => {
@@ -564,9 +677,49 @@ fn load_to_asm(value: Value, src: Value, bg: &Background, context: &mut AsmConte
         RegLocation::Stack(_) => {
             let temp_reg = ra.register_temp();
             context.asm_add_line(AsmLine::Load(temp_reg.get_reg_name(), temp_src));
-            write_reg_to_location(&dest, temp_reg.get_reg_name(), frame, context);
+            write_reg_to_location(&dest, temp_reg.get_reg_name(), bg, context);
         }
+        RegLocation::ParamStack(_) => unreachable!("register allocator does not assign param stack slots"),
     }
+    dest
+}
+
+fn pointer_step_size(value: Value, bg: &Background) -> i32 {
+    match bg.get_value(value).ty().kind() {
+        TypeKind::Pointer(base) => base.size() as i32,
+        _ => panic!("pointer calculation result should have pointer type"),
+    }
+}
+
+fn ptr_offset_to_asm(
+    value: Value,
+    src: Value,
+    index: Value,
+    bg: &Background,
+    context: &mut AsmContext,
+) -> RegAddress {
+    let dest = bg.ra().register(value);
+    let base_ptr = emit_ptr_value(src, value, bg, context);
+    let index_reg = load_operand_temp(index, value, bg, context);
+    let result_reg = match dest.location.clone() {
+        RegLocation::Reg(reg) => reg,
+        RegLocation::Stack(_) => base_ptr.get_reg_name(),
+        RegLocation::ParamStack(_) => unreachable!("register allocator does not assign param stack slots"),
+    };
+    let scale_reg = bg.ra().register_temp();
+    let step = pointer_step_size(value, bg);
+    context.asm_add_line(AsmLine::Li(scale_reg.get_reg_name(), step));
+    context.asm_add_line(AsmLine::Mul(
+        scale_reg.get_reg_name(),
+        index_reg.get_reg_name(),
+        scale_reg.get_reg_name(),
+    ));
+    context.asm_add_line(AsmLine::Add(
+        result_reg.clone(),
+        base_ptr.get_reg_name(),
+        scale_reg.get_reg_name(),
+    ));
+    write_reg_to_location(&dest, result_reg, bg, context);
     dest
 }
 
@@ -582,6 +735,7 @@ fn binary_to_asm(
     let result_reg = match dest.location {
         RegLocation::Reg(ref reg) => reg.clone(),
         RegLocation::Stack(_) => lhs.get_reg_name(),
+        RegLocation::ParamStack(_) => unreachable!("register allocator does not assign param stack slots"),
     };
 
     match binary.op() {
@@ -668,7 +822,7 @@ fn binary_to_asm(
         ),
     }
 
-    write_reg_to_location(&dest, result_reg, bg.frame(), context);
+    write_reg_to_location(&dest, result_reg, bg, context);
     dest
 }
 
@@ -677,18 +831,32 @@ fn load_block_param(param: Value, bg: &Background, context: &mut AsmContext) -> 
     let slot = frame
         .local_slot(param)
         .expect("block parameter should have stack slot");
-    let addr = frame.stack_slot_to_addr(slot);
     let dest = bg.ra().register(param);
     match dest.location.clone() {
         RegLocation::Reg(reg) => {
-            context.asm_add_line(AsmLine::Load(reg, addr));
+            let scratch = bg.ra().register_temp();
+            emit_load_from_offset(
+                context.asm_mut(),
+                reg,
+                RegName::Stack,
+                (slot * 4) as i32,
+                scratch.get_reg_name(),
+            );
         }
         RegLocation::Stack(_) => {
             let temp_addr = bg.ra().register_temp();
             let temp_reg = temp_addr.get_reg_name();
-            context.asm_add_line(AsmLine::Load(temp_reg.clone(), addr));
-            write_reg_to_location(&dest, temp_reg, frame, context);
+            let scratch = bg.ra().register_temp();
+            emit_load_from_offset(
+                context.asm_mut(),
+                temp_reg.clone(),
+                RegName::Stack,
+                (slot * 4) as i32,
+                scratch.get_reg_name(),
+            );
+            write_reg_to_location(&dest, temp_reg, bg, context);
         }
+        RegLocation::ParamStack(_) => unreachable!("register allocator does not assign param stack slots"),
     }
     dest
 }
@@ -714,20 +882,30 @@ fn store_block_args(
             .frame()
             .local_slot(param)
             .expect("block parameter should have stack slot");
-        let addr = bg.frame().stack_slot_to_addr(slot);
         match bg.get_value(arg).kind() {
             ValueKind::Integer(c) => {
                 let temp_addr = bg.ra().register_temp();
                 let temp_reg = temp_addr.get_reg_name();
                 context.asm_add_line(AsmLine::Li(temp_reg.clone(), c.value()));
-                context.asm_add_line(AsmLine::Store(addr, temp_reg));
+                let scratch = bg.ra().register_temp();
+                emit_store_to_offset(
+                    context.asm_mut(),
+                    RegName::Stack,
+                    (slot * 4) as i32,
+                    temp_reg,
+                    scratch.get_reg_name(),
+                );
             }
             _ => {
                 let temp_reg = peek_temp_reg(arg, bg, context);
-                context.asm_add_line(AsmLine::Store(
-                    bg.frame().stack_slot_to_addr(slot),
+                let scratch = bg.ra().register_temp();
+                emit_store_to_offset(
+                    context.asm_mut(),
+                    RegName::Stack,
+                    (slot * 4) as i32,
                     temp_reg.get_reg_name(),
-                ));
+                    scratch.get_reg_name(),
+                );
                 block_args.push(arg);
             }
         }
@@ -788,31 +966,65 @@ fn function_to_asm(func: &FunctionData, bg: &Background, context: &mut AsmContex
         let stack_len = stack_words as i32 * 4;
         // Align stack to 16 bytes for function calls
         let aligned_stack_len = ((stack_len + 15) / 16) * 16;
-        result.add_line(AsmLine::Addi(
+        emit_offset_addr_to_reg(
+            &mut result,
             RegName::Stack,
             RegName::Stack,
             -aligned_stack_len,
-        ));
-        if frame.save_ra {
-            // Save ra if needed
-            result.add_line(AsmLine::Store(frame.ra_to_addr(), RegName::Ra));
-            context.asm_mut().convert_placehold(
-                "return".to_string(),
-                vec![
-                    AsmLine::Load(RegName::Ra, frame.ra_to_addr()),
-                    AsmLine::Addi(RegName::Stack, RegName::Stack, aligned_stack_len),
-                    AsmLine::Ret,
-                ],
+            RegName::TempT(0),
+        );
+        if frame.save_fp {
+            let (offset, base) = frame.fp_to_addr().expect_offset();
+            emit_store_to_offset(
+                &mut result,
+                base,
+                offset,
+                RegName::TempS(0),
+                RegName::TempT(0),
             );
-        } else {
-            context.asm_mut().convert_placehold(
-                "return".to_string(),
-                vec![
-                    AsmLine::Addi(RegName::Stack, RegName::Stack, aligned_stack_len),
-                    AsmLine::Ret,
-                ],
+            emit_offset_addr_to_reg(
+                &mut result,
+                RegName::TempS(0),
+                RegName::Stack,
+                aligned_stack_len,
+                RegName::TempT(0),
             );
         }
+        let mut replacement = Asm::new();
+        if frame.save_fp {
+            let (offset, base) = frame.fp_to_addr().expect_offset();
+            emit_load_from_offset(
+                &mut replacement,
+                RegName::TempS(0),
+                base,
+                offset,
+                RegName::TempT(0),
+            );
+        }
+        if frame.save_ra {
+            // Save ra if needed
+            let (offset, base) = frame.ra_to_addr().expect_offset();
+            emit_store_to_offset(&mut result, base.clone(), offset, RegName::Ra, RegName::TempT(0));
+            emit_load_from_offset(
+                &mut replacement,
+                RegName::Ra,
+                base,
+                offset,
+                RegName::TempT(0),
+            );
+        }
+        emit_offset_addr_to_reg(
+            &mut replacement,
+            RegName::Stack,
+            RegName::Stack,
+            aligned_stack_len,
+            RegName::TempT(0),
+        );
+        replacement.add_line(AsmLine::Ret);
+        context.asm_mut().convert_placehold(
+            "return".to_string(),
+            replacement.content,
+        );
         result.add_asm(context.asm_mut().clone());
     } else {
         context
@@ -847,6 +1059,10 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
             None
         }
         ValueKind::Load(load) => Some(load_to_asm(value, load.src(), bg, context)),
+        ValueKind::GetPtr(ptr) => Some(ptr_offset_to_asm(value, ptr.src(), ptr.index(), bg, context)),
+        ValueKind::GetElemPtr(ptr) => {
+            Some(ptr_offset_to_asm(value, ptr.src(), ptr.index(), bg, context))
+        }
         ValueKind::Integer(_) => {
             panic!("Integer value should not be directly used as an instruction");
         }
@@ -885,10 +1101,15 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
                 if i < 8 {
                     context.asm_add_line(AsmLine::Mv(RegName::Param(i), temp_reg.get_reg_name()));
                 } else {
-                    context.asm_add_line(AsmLine::Store(
-                        frame.arg_to_addr(i - 8),
+                    let (offset, base) = frame.arg_to_addr(i - 8).expect_offset();
+                    let scratch = bg.ra().register_temp();
+                    emit_store_to_offset(
+                        context.asm_mut(),
+                        base,
+                        offset,
                         temp_reg.get_reg_name(),
-                    ));
+                        scratch.get_reg_name(),
+                    );
                 }
             }
             context.asm_add_line(AsmLine::Call(name_to_symbol(func_data.name())));
@@ -897,8 +1118,8 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
                 return None;
             }
             let ret = bg.ra().register(value);
-            write_reg_to_location(&ret, RegName::Ret, frame, context);
             restore_caller_saved_regs(&saved_regs, bg, context);
+            write_reg_to_location(&ret, RegName::Ret, bg, context);
             ret.into()
         }
         _ => panic!("Unsupported instruction: {:?}", inst.kind()),

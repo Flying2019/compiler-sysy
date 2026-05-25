@@ -19,5 +19,6 @@ pub fn regaddress_to_regname(addr: &RegAddress, _asm: &mut Asm) -> RegName {
     match addr.location.clone() {
         RegLocation::Reg(reg) => reg,
         RegLocation::Stack(_) => panic!("Cannot convert stack slot to register"),
+        RegLocation::ParamStack(_) => panic!("Cannot convert param stack slot to register"),
     }
 }
