@@ -49,17 +49,19 @@ FuncParam: FuncParam = {
   <ty: Type> <name: Ident> => FuncParam {
     btype: param_base_btype(ty),
     name,
+    array_dims: None,
   },
   <ty: Type> <name: Ident> "[" "]" <dims: FuncParamDims> => FuncParam {
-    btype: func_param_btype(param_base_btype(ty), dims),
+    btype: param_base_btype(ty),
     name,
+    array_dims: Some(dims),
   },
 };
 
-FuncParamDims: Vec<usize> = {
+FuncParamDims: Vec<Exp> = {
   => Vec::new(),
   "[" <dim: Exp> "]" <rest: FuncParamDims> => {
-    let mut dims = vec![eval_param_dim(dim)];
+    let mut dims = vec![dim];
     dims.extend(rest);
     dims
   }

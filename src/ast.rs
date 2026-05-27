@@ -1,6 +1,5 @@
 use crate::ast_tool::{
-    eval_binary_const, eval_unary_const, gen_binary_koopa_ir, gen_unary_koopa_ir, Background,
-    ValueType,
+    gen_binary_koopa_ir, gen_unary_koopa_ir, Background, ValueType,
 };
 use crate::koopa::{KoopaLine, KoopaLines};
 use crate::lalr::*;
@@ -89,17 +88,17 @@ fn value_type_dims(ty: &ValueType) -> Vec<usize> {
 fn init_slots(init: &InitVal, dims: &[usize]) -> Vec<Option<InitVal>> {
     let total = if dims.is_empty() { 1 } else { product(dims) };
     let mut slots = vec![None; total];
-    fill_init_slots(init, dims, 0, total, &mut slots);
+    fill_init_slots(init, dims, 0, 0, &mut slots);
     slots
 }
 
 fn fill_init_slots(
     init: &InitVal,
     dims: &[usize],
-    start: usize,
-    end: usize,
+    base: usize,
+    cursor: usize,
     slots: &mut [Option<InitVal>],
-) {
+) -> usize {
     fn scalar_init(init: &InitVal) -> Option<InitVal> {
         match init {
             InitVal::Exp(_) => Some(init.clone()),
@@ -109,44 +108,38 @@ fn fill_init_slots(
 
     if dims.is_empty() {
         if let Some(init) = scalar_init(init) {
-            slots[start] = Some(init);
+            slots[cursor] = Some(init);
+            return cursor + 1;
         }
-        return;
+        return cursor;
     }
 
+    let child_len = if dims.len() == 1 { 1 } else { product(&dims[1..]) };
+    let end = base + dims[0] * child_len;
     match init {
         InitVal::Exp(_) => {
-            slots[start] = Some(init.clone());
+            slots[cursor] = Some(init.clone());
+            cursor + 1
         }
         InitVal::Arr(items) => {
-            let child_len = if dims.len() == 1 { 1 } else { product(&dims[1..]) };
-            let mut pos = start;
+            let mut pos = cursor;
             for item in items {
                 if pos >= end {
                     break;
                 }
                 match item {
                     InitVal::Exp(_) => {
-                        slots[pos] = Some(item.clone());
-                        pos += 1;
+                        pos = fill_init_slots(item, &[], pos, pos, slots);
                     }
                     InitVal::Arr(_) => {
-                        if child_len > 1 {
-                            let offset = pos - start;
-                            let rem = offset % child_len;
-                            if rem != 0 {
-                                pos += child_len - rem;
-                            }
-                        }
-                        if pos >= end {
-                            break;
-                        }
-                        let next = (pos + child_len).min(end);
-                        fill_init_slots(item, &dims[1..], pos, next, slots);
-                        pos = next;
+                        let child_base = base + ((pos - base) / child_len) * child_len;
+                        let next = fill_init_slots(item, &dims[1..], child_base, pos, slots);
+                        pos = child_base + child_len;
+                        debug_assert!(next <= pos);
                     }
                 }
             }
+            pos
         }
     }
 }
@@ -385,7 +378,7 @@ impl AstNode for FuncDef {
         let params = self
             .func_params
             .iter()
-            .map(FuncParam::to_koopa_param)
+            .map(|param| param.to_koopa_param(bg))
             .collect::<Vec<_>>()
             .join(", ");
         lines.add_line(KoopaLine::FuncStart(
@@ -396,9 +389,10 @@ impl AstNode for FuncDef {
         lines.add_line(KoopaLine::Label("%entry".to_string()));
         for param in &self.func_params {
             let ptr_name = bg.new_variable(param.name.clone());
-            lines.add_line(KoopaLine::Alloc(ptr_name.clone(), param.to_koopa_type()));
+            let param_ty = param.resolved_btype(bg);
+            lines.add_line(KoopaLine::Alloc(ptr_name.clone(), param_ty.to_koopa_type()));
             lines.add_line(KoopaLine::Store(param.to_koopa_name(), ptr_name.clone()));
-            bg.set_variable_type(ptr_name, ValueType::from_btype(&param.btype));
+            bg.set_variable_type(ptr_name, ValueType::from_btype(&param_ty));
         }
         lines.add_lines(self.block.to_koopa_lines(bg));
         lines.close();
@@ -408,14 +402,25 @@ impl AstNode for FuncDef {
 }
 
 impl FuncParam {
-    fn to_koopa_type(&self) -> String {
-        self.btype.to_koopa_type()
+    fn resolved_btype(&self, bg: &Background) -> BType {
+        if let Some(dims) = &self.array_dims {
+            let dims = dims
+                .iter()
+                .map(|dim| eval_param_dim(dim, &|name| bg.try_get_constant(name.to_string())))
+                .collect::<Vec<_>>();
+            func_param_btype(self.btype.clone(), dims)
+        } else {
+            self.btype.clone()
+        }
+    }
+    fn to_koopa_type(&self, bg: &Background) -> String {
+        self.resolved_btype(bg).to_koopa_type()
     }
     fn to_koopa_name(&self) -> String {
         format!("@arg_{}", self.name)
     }
-    fn to_koopa_param(&self) -> String {
-        format!("{}: {}", self.to_koopa_name(), self.to_koopa_type())
+    fn to_koopa_param(&self, bg: &Background) -> String {
+        format!("{}: {}", self.to_koopa_name(), self.to_koopa_type(bg))
     }
 }
 
@@ -756,21 +761,7 @@ impl AstNode for Exp {
 
 impl Exp {
     pub(crate) fn try_eval_const(&self, bg: &Background) -> Option<i32> {
-        match self {
-            Exp::Number(num) => Some(*num),
-            Exp::UnaryExp(op, exp) => {
-                let value = exp.try_eval_const(bg)?;
-                Some(eval_unary_const(op, value))
-            }
-            Exp::BinaryExp(op, left, right) => {
-                let lhs = left.try_eval_const(bg)?;
-                let rhs = right.try_eval_const(bg)?;
-                Some(eval_binary_const(op, lhs, rhs))
-            }
-            Exp::Ident(name) => bg.try_get_constant(name.clone()),
-            Exp::FuncCall(_, _) => None,
-            Exp::ArrGet(_, _) => None,
-        }
+        eval_const_exp_with(self, &|name| bg.try_get_constant(name.to_string()))
     }
 }
 

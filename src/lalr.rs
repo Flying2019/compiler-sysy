@@ -21,6 +21,7 @@ pub struct FuncDef {
 pub struct FuncParam {
     pub btype: BType,
     pub name: String,
+    pub array_dims: Option<Vec<Exp>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,48 +85,56 @@ pub fn param_base_btype(ty: Type) -> BType {
     }
 }
 
-pub fn eval_param_dim(exp: Exp) -> usize {
-    fn eval(exp: &Exp) -> Option<i32> {
-        match exp {
-            Exp::Number(num) => Some(*num),
-            Exp::UnaryExp(op, inner) => {
-                let value = eval(inner)?;
-                Some(match op {
-                    UnaryOp::Pos => value,
-                    UnaryOp::Neg => -value,
-                    UnaryOp::Not => {
-                        if value == 0 {
-                            1
-                        } else {
-                            0
-                        }
+pub fn eval_const_exp_with<F>(exp: &Exp, lookup: &F) -> Option<i32>
+where
+    F: Fn(&str) -> Option<i32>,
+{
+    match exp {
+        Exp::Number(num) => Some(*num),
+        Exp::UnaryExp(op, inner) => {
+            let value = eval_const_exp_with(inner, lookup)?;
+            Some(match op {
+                UnaryOp::Pos => value,
+                UnaryOp::Neg => -value,
+                UnaryOp::Not => {
+                    if value == 0 {
+                        1
+                    } else {
+                        0
                     }
-                })
-            }
-            Exp::BinaryExp(op, lhs, rhs) => {
-                let lhs = eval(lhs)?;
-                let rhs = eval(rhs)?;
-                Some(match op {
-                    BinaryOp::Add => lhs + rhs,
-                    BinaryOp::Sub => lhs - rhs,
-                    BinaryOp::Mul => lhs * rhs,
-                    BinaryOp::Div => lhs / rhs,
-                    BinaryOp::Mod => lhs % rhs,
-                    BinaryOp::Lt => (lhs < rhs) as i32,
-                    BinaryOp::Gt => (lhs > rhs) as i32,
-                    BinaryOp::Le => (lhs <= rhs) as i32,
-                    BinaryOp::Ge => (lhs >= rhs) as i32,
-                    BinaryOp::Eq => (lhs == rhs) as i32,
-                    BinaryOp::Ne => (lhs != rhs) as i32,
-                    BinaryOp::And => ((lhs != 0) && (rhs != 0)) as i32,
-                    BinaryOp::Or => ((lhs != 0) || (rhs != 0)) as i32,
-                })
-            }
-            Exp::Ident(_) | Exp::FuncCall(_, _) | Exp::ArrGet(_, _) => None,
+                }
+            })
         }
+        Exp::BinaryExp(op, lhs, rhs) => {
+            let lhs = eval_const_exp_with(lhs, lookup)?;
+            let rhs = eval_const_exp_with(rhs, lookup)?;
+            Some(match op {
+                BinaryOp::Add => lhs + rhs,
+                BinaryOp::Sub => lhs - rhs,
+                BinaryOp::Mul => lhs * rhs,
+                BinaryOp::Div => lhs / rhs,
+                BinaryOp::Mod => lhs % rhs,
+                BinaryOp::Lt => (lhs < rhs) as i32,
+                BinaryOp::Gt => (lhs > rhs) as i32,
+                BinaryOp::Le => (lhs <= rhs) as i32,
+                BinaryOp::Ge => (lhs >= rhs) as i32,
+                BinaryOp::Eq => (lhs == rhs) as i32,
+                BinaryOp::Ne => (lhs != rhs) as i32,
+                BinaryOp::And => ((lhs != 0) && (rhs != 0)) as i32,
+                BinaryOp::Or => ((lhs != 0) || (rhs != 0)) as i32,
+            })
+        }
+        Exp::Ident(name) => lookup(name),
+        Exp::FuncCall(_, _) | Exp::ArrGet(_, _) => None,
     }
+}
 
-    let value = eval(&exp).expect("Array parameter dimensions must be constant expressions");
+pub fn eval_param_dim<F>(exp: &Exp, lookup: &F) -> usize
+where
+    F: Fn(&str) -> Option<i32>,
+{
+    let value = eval_const_exp_with(exp, lookup)
+        .expect("Array parameter dimensions must be constant expressions");
     assert!(value >= 0, "Array parameter dimensions must be non-negative");
     value as usize
 }

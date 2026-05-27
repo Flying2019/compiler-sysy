@@ -4,7 +4,7 @@ use crate::koopa::{KoopaLine, KoopaLines};
 use crate::lalr::VarDecl;
 use crate::{
     ast::{AstNode, ReturnValue},
-    lalr::{BType, BinaryOp, CompUnit, Exp, GlobleDef, Type, UnaryOp},
+    lalr::{eval_param_dim, func_param_btype, BType, BinaryOp, CompUnit, Exp, FuncParam, GlobleDef, Type, UnaryOp},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,6 +485,18 @@ fn static_functions() -> Vec<(&'static str, Type, Vec<BType>)> {
     ]
 }
 
+fn resolve_func_param_btype(param: &FuncParam, bg: &Background) -> BType {
+    if let Some(dims) = &param.array_dims {
+        let dims = dims
+            .iter()
+            .map(|dim| eval_param_dim(dim, &|name| bg.try_get_constant(name.to_string())))
+            .collect::<Vec<_>>();
+        func_param_btype(param.btype.clone(), dims)
+    } else {
+        param.btype.clone()
+    }
+}
+
 pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
     for glob_def in comp_unit.glob_defs {
         match glob_def {
@@ -493,7 +505,7 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                 let params: Vec<BType> = func_def
                     .func_params
                     .iter()
-                    .map(|param| param.btype.clone())
+                    .map(|param| resolve_func_param_btype(param, bg))
                     .collect();
                 if bg.global_symbols.global_function.contains_key(&func_name) {
                     panic!("Duplicate function definition: {}", func_name);
@@ -526,7 +538,7 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                             }
                             bg.global_symbols.global_variable.insert(var_name, value_type);
                         }
-                        None => unimplemented!(),
+                        None => panic!("Array size must be a constant expression"),
                     }
                 }
             }
