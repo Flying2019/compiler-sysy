@@ -100,8 +100,17 @@ fn fill_init_slots(
     end: usize,
     slots: &mut [Option<InitVal>],
 ) {
+    fn scalar_init(init: &InitVal) -> Option<InitVal> {
+        match init {
+            InitVal::Exp(_) => Some(init.clone()),
+            InitVal::Arr(items) => items.first().and_then(scalar_init),
+        }
+    }
+
     if dims.is_empty() {
-        slots[start] = Some(init.clone());
+        if let Some(init) = scalar_init(init) {
+            slots[start] = Some(init);
+        }
         return;
     }
 

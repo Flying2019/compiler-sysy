@@ -300,7 +300,9 @@ pub struct FunctionFrame {
     save_fp: bool,
 }
 
-const CALLER_SAVE_WORDS: usize = 7; // t0-t6
+// Lowering scratch registers are bounded to t0-t3. SSA values spill to stack,
+// so only these caller-saved temporaries ever need save slots across calls.
+const CALLER_SAVE_WORDS: usize = 4; // t0-t3
 const IMM12_MIN: i32 = -2048;
 const IMM12_MAX: i32 = 2047;
 
@@ -460,6 +462,7 @@ fn write_reg_to_location(
     bg: &Background,
     context: &mut AsmContext,
 ) {
+    // Scratch budget: 1 temporary register.
     match loc.location.clone() {
         RegLocation::Reg(reg) => {
             context.asm_add_line(AsmLine::Mv(reg, src));
@@ -502,6 +505,7 @@ fn live_caller_saved_regs_across_call(call_inst: Value, context: &AsmContext) ->
 }
 
 fn save_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut AsmContext) {
+    // Scratch budget: 1 temporary register per iteration.
     for reg in regs {
         let slot = caller_saved_slot(reg).expect("caller-saved register should have stack slot");
         let (offset, base) = bg.frame().caller_save_to_addr(slot).expect_offset();
@@ -517,6 +521,7 @@ fn save_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut AsmCo
 }
 
 fn restore_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut AsmContext) {
+    // Scratch budget: 1 temporary register per iteration.
     for reg in regs.iter().rev() {
         let slot = caller_saved_slot(reg).expect("caller-saved register should have stack slot");
         let (offset, base) = bg.frame().caller_save_to_addr(slot).expect_offset();
@@ -532,6 +537,8 @@ fn restore_caller_saved_regs(regs: &[RegName], bg: &Background, context: &mut As
 }
 
 fn new_temp_reg(loc: RegLocation, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    // Scratch budget: 2 temporary registers.
+    // One is the returned register, and loading from stack may need one helper scratch.
     let dest_addr = bg.ra().register_temp();
     let dest_reg: RegName = dest_addr.get_reg_name();
     match loc {
@@ -562,6 +569,7 @@ fn new_temp_reg(loc: RegLocation, bg: &Background, context: &mut AsmContext) -> 
 }
 
 fn load_temp_reg(src: Value, dest: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    // Scratch budget: 2 temporary registers via new_temp_reg.
     let (loc, is_last_use) = {
         if let Some(loc) = context.get_param(&src) {
             (loc.clone(), false)
@@ -583,6 +591,7 @@ fn load_temp_reg(src: Value, dest: Value, bg: &Background, context: &mut AsmCont
 }
 
 fn peek_temp_reg(src: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    // Scratch budget: 2 temporary registers via new_temp_reg.
     if let Some(loc) = context.get_param(&src) {
         new_temp_reg(loc.clone(), bg, context)
     } else {
@@ -604,8 +613,16 @@ fn release_temp_if_unused(value: Value, context: &mut AsmContext) -> Option<RegA
     }
 }
 
+fn mark_temp_used_by(value: Value, user: Value, context: &mut AsmContext) {
+    if let Some(record) = context.get_temp_value_mut(&value) {
+        record.used_by.remove(&user);
+    }
+}
+
 /// Load an operand into a register, returning the register and the temporary values it holds (if any).
 fn load_operand_temp(src: Value, user: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    // Scratch budget: 2 temporary registers.
+    // Integer immediates take 1, non-immediates defer to load_temp_reg.
     match bg.get_value(src).kind() {
         ValueKind::Integer(c) => {
             let temp_reg = bg.ra().register_temp();
@@ -617,6 +634,8 @@ fn load_operand_temp(src: Value, user: Value, bg: &Background, context: &mut Asm
 }
 
 fn emit_ptr_value(ptr: Value, user: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    // Scratch budget: 2 temporary registers.
+    // Loading a local alloc address may need one returned register plus one offset scratch.
     if let Some(value_data) = bg.get_glob(ptr) {
         let name = value_data.name().clone().unwrap();
         let temp_addr = bg.ra().register_temp();
@@ -646,6 +665,8 @@ fn emit_ptr_value(ptr: Value, user: Value, bg: &Background, context: &mut AsmCon
 
 /// Store the value of a store instruction to its destination, which should be a local allocation. The source value can be an immediate integer or a temporary value.
 fn store_to_asm(store: &Store, bg: &Background, context: &mut AsmContext, user: Value) {
+    // Scratch budget: 3 temporary registers.
+    // Source materialization keeps 1 live register while pointer lowering may use up to 2 more.
     let dest_ptr = store.dest();
     let src = store.value();
     let temp_addr = match bg.get_value(src).kind() {
@@ -666,6 +687,8 @@ fn store_to_asm(store: &Store, bg: &Background, context: &mut AsmContext, user: 
 
 /// Load the value of a load instruction into its destination register, which can be either a physical register or a spill slot. The source pointer should be a local allocation.
 fn load_to_asm(value: Value, src: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    // Scratch budget: 3 temporary registers.
+    // Pointer lowering can use 2, and spilling the loaded result may need 1 extra temporary.
     let ra = bg.ra();
     let temp_ptr = emit_ptr_value(src, value, bg, context);
     let temp_src = AsmValue::Offset(0, temp_ptr.get_reg_name());
@@ -698,6 +721,8 @@ fn ptr_offset_to_asm(
     bg: &Background,
     context: &mut AsmContext,
 ) -> RegAddress {
+    // Scratch budget: 3 temporary registers.
+    // Base pointer, index value, and the scale register can be live together.
     let dest = bg.ra().register(value);
     let base_ptr = emit_ptr_value(src, value, bg, context);
     let index_reg = load_operand_temp(index, value, bg, context);
@@ -729,6 +754,7 @@ fn binary_to_asm(
     bg: &Background,
     context: &mut AsmContext,
 ) -> RegAddress {
+    // Scratch budget: 2 temporary registers for lhs/rhs.
     let dest = bg.ra().register(value);
     let lhs = load_operand_temp(binary.lhs(), value, bg, context);
     let rhs = load_operand_temp(binary.rhs(), value, bg, context);
@@ -827,6 +853,9 @@ fn binary_to_asm(
 }
 
 fn load_block_param(param: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+    // Scratch budget: 3 temporary registers.
+    // Loading into a spilled SSA slot keeps the loaded value live while write_reg_to_location
+    // uses one more helper scratch.
     let frame = bg.frame();
     let slot = frame
         .local_slot(param)
@@ -867,6 +896,8 @@ fn store_block_args(
     bg: &Background,
     context: &mut AsmContext,
 ) -> Vec<Value> {
+    // Scratch budget: 2 temporary registers per argument.
+    // One holds the value to store and one extends large stack offsets when needed.
     let params = bg.get_bb_data(target).params();
     if params.len() != args.len() {
         panic!(
@@ -913,11 +944,12 @@ fn store_block_args(
     block_args
 }
 
-fn release_block_args(block_args: Vec<Value>, context: &mut AsmContext) -> Vec<RegAddress> {
+fn release_block_args(block_args: Vec<Value>, user: Value, context: &mut AsmContext) -> Vec<RegAddress> {
     let mut released = Vec::new();
     let mut seen = HashSet::new();
     for arg in block_args {
         if seen.insert(arg) {
+            mark_temp_used_by(arg, user, context);
             if let Some(loc) = release_temp_if_unused(arg, context) {
                 released.push(loc);
             }
@@ -1076,7 +1108,7 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
                 context,
             ));
             let cond = load_operand_temp(br.cond(), value, bg, context);
-            let _released_block_args = release_block_args(block_args, context);
+            let _released_block_args = release_block_args(block_args, value, context);
             let then_id = context.get_branch_id(br.true_bb());
             let else_id = context.get_branch_id(br.false_bb());
             context.asm_add_line(AsmLine::Beqz(cond.get_reg_name(), else_id));
@@ -1085,7 +1117,7 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
         }
         ValueKind::Jump(jump) => {
             let block_args = store_block_args(jump.target(), jump.args(), bg, context);
-            let _released_block_args = release_block_args(block_args, context);
+            let _released_block_args = release_block_args(block_args, value, context);
             let target_id = context.get_branch_id(jump.target());
             context.asm_add_line(AsmLine::Jump(target_id));
             None

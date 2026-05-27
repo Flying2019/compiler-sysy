@@ -4,6 +4,8 @@ use std::rc::Rc;
 
 use koopa::ir::Value;
 
+const TEMP_REG_BUDGET: usize = 4;
+
 #[derive(Eq, PartialOrd, PartialEq, Clone, Debug)]
 pub enum RegName {
     Ret,
@@ -255,15 +257,14 @@ struct RegisterAllocatorState {
 
 impl RegisterAllocatorState {
     fn new() -> Self {
-        let mut regs = BTreeMap::new();
+        let regs = BTreeMap::new();
         let mut temp_regs = BTreeMap::new();
-        for i in 3..6 {
-            regs.insert(RegName::TempT(i), false);
-        }
-        for i in 0..3 {
+        // Scratch registers are budgeted statically in asm.rs helper comments.
+        // SSA values spill to stack once the non-scratch pool is exhausted,
+        // so these t registers are reserved for lowering internals only.
+        for i in 0..TEMP_REG_BUDGET {
             temp_regs.insert(RegName::TempT(i), false);
         }
-        temp_regs.insert(RegName::TempT(6), false);
         Self {
             regs,
             temp_regs,
@@ -407,6 +408,9 @@ impl RegisterAllocator {
             return RegAddress::new(Rc::clone(&self.state), Some(value), location, true);
         }
 
+        // Long-lived SSA values spill to the frame once the non-scratch pool is full.
+        // This keeps the dedicated scratch budget below TEMP_REG_BUDGET even in deeply
+        // nested lowering paths.
         let stack_index = state.alloc_stack_slot();
         let location = RegLocation::Stack(stack_index);
         state.mapping.insert(value, location.clone());
@@ -427,6 +431,8 @@ impl RegisterAllocator {
             let location = RegLocation::Reg(reg);
             return RegAddress::new(Rc::clone(&self.state), None, location, true);
         }
+        // All lowering helpers in asm.rs are budgeted to fit within TEMP_REG_BUDGET.
+        // Hitting this means a helper exceeded its documented scratch bound.
         unreachable!("No free temporary register available");
     }
 
