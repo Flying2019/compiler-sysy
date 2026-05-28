@@ -7,6 +7,19 @@ pub struct CompUnit {
 pub enum GlobleDef {
     FuncDef(FuncDef),
     GlobleDecl(Type, Vec<SingleDecl>), // @global = decl type, init
+    StructDef(StructDef),
+}
+
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<StructField>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructField {
+    pub ty: Type,
+    pub decls: Vec<SingleDecl>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +74,7 @@ pub enum InitVal {
 pub enum BType {
     I32,
     Void,
+    Struct(String),
     Ptr(Box<BType>),
     Array(usize, Box<BType>),
 }
@@ -103,6 +117,7 @@ where
                         0
                     }
                 }
+                UnaryOp::Addr | UnaryOp::Deref => unreachable!(),
             })
         }
         Exp::BinaryExp(op, lhs, rhs) => {
@@ -125,7 +140,7 @@ where
             })
         }
         Exp::Ident(name) => lookup(name),
-        Exp::FuncCall(_, _) | Exp::ArrGet(_, _) => None,
+        Exp::FuncCall(_, _) | Exp::ArrGet(_, _) | Exp::Field(_, _) | Exp::PtrField(_, _) => None,
     }
 }
 
@@ -146,6 +161,8 @@ pub enum Exp {
     BinaryExp(BinaryOp, Box<Exp>, Box<Exp>),
     FuncCall(String, Vec<Exp>),
     ArrGet(Box<Exp>, Box<Exp>),
+    Field(Box<Exp>, String),
+    PtrField(Box<Exp>, String),
     Ident(String),
 }
 
@@ -154,6 +171,8 @@ pub enum UnaryOp {
     Pos,
     Neg,
     Not,
+    Addr,
+    Deref,
 }
 
 #[derive(Debug, Clone)]

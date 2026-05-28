@@ -27,8 +27,26 @@ pub CompUnit: CompUnit = {
 }
 
 GlobleDef: GlobleDef = {
+  <StructDef> => GlobleDef::StructDef(<>),
   <FuncDef> => GlobleDef::FuncDef(<>),
   <Type> <MultipleDecl> ";" => GlobleDef::GlobleDecl(<>),
+}
+
+StructDef: StructDef = {
+  "struct" <name: Ident> "{" <fields: StructFields> "}" ";" => StructDef { name, fields },
+}
+
+StructFields: Vec<StructField> = {
+  => Vec::new(),
+  <field: StructField> <rest: StructFields> => {
+    let mut fields = vec![field];
+    fields.extend(rest);
+    fields
+  }
+}
+
+StructField: StructField = {
+  <ty: Type> <decls: MultipleDecl> ";" => StructField { ty, decls },
 }
 
 FuncDef: FuncDef = {
@@ -150,8 +168,14 @@ FuncArgs: Vec<Exp> = {
 }
 
 BType: BType = {
+  <base: BTypeBase> => base,
+  <base: BType> "*" => BType::Ptr(Box::new(base)),
+}
+
+BTypeBase: BType = {
   "int" => BType::I32,
   "void" => BType::Void,
+  "struct" <ident: Ident> => BType::Struct(ident),
 }
 
 Type: Type = {
@@ -166,6 +190,8 @@ Exp: Exp = {
 ArrayExp: Exp = {
   <Ident> => Exp::Ident(<>),
   <arr: ArrayExp> "[" <pos: Exp> "]" => Exp::ArrGet(Box::new(arr), Box::new(pos)),
+  <arr: ArrayExp> "." <field: Ident> => Exp::Field(Box::new(arr), field),
+  <arr: ArrayExp> "->" <field: Ident> => Exp::PtrField(Box::new(arr), field),
 }
 
 PrimaryExp: Exp = {
@@ -195,6 +221,8 @@ UnaryOp: UnaryOp = {
   "+" => UnaryOp::Pos,
   "-" => UnaryOp::Neg,
   "!" => UnaryOp::Not,
+  "&" => UnaryOp::Addr,
+  "*" => UnaryOp::Deref,
 }
 
 MulOp: BinaryOp = {

@@ -76,7 +76,7 @@ fn value_type_from_decl(var: &VarDecl, bg: &Background) -> ValueType {
 
 fn value_type_dims(ty: &ValueType) -> Vec<usize> {
     match ty {
-        ValueType::Int | ValueType::Pointer(_) => Vec::new(),
+        ValueType::Int | ValueType::Struct(_) | ValueType::Pointer(_) => Vec::new(),
         ValueType::Array(len, inner) => {
             let mut dims = vec![*len];
             dims.extend(value_type_dims(inner));
@@ -209,7 +209,8 @@ fn gen_array_elem_ptr(
                 ptr = next_ptr;
                 current_ty = (*inner_ty).clone();
             }
-            ValueType::Int => panic!("Cannot index into int"),
+            ValueType::Int => panic!("Int value cannot be indexed"),
+            ValueType::Struct(_) => panic!("Struct value cannot be indexed"),
         }
     }
     ReturnValue::new(Some(ptr), ir)
@@ -257,7 +258,11 @@ fn gen_lvalue(exp: &Exp, bg: &mut Background) -> LValue {
                         content: base.content,
                     }
                 }
+                ValueType::Struct(_) => panic!("Struct value cannot be indexed"),
             }
+        }
+        Exp::Field(_, _) | Exp::PtrField(_, _) => {
+            panic!("Struct member access is parsed but not lowered yet")
         }
         _ => panic!("Expression {:?} is not an lvalue", exp),
     }
@@ -271,12 +276,7 @@ impl AstNode for CompUnit {
         let mut lines = KoopaLines::new();
         for func in bg.get_static_functions_decl() {
             let name = func.0;
-            let params = func
-                .2
-                .iter()
-                .map(|b| b.to_koopa_type())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let params = func.2.iter().map(|b| b.to_koopa_type()).collect::<Vec<_>>().join(", ");
             let ret = func.1;
             lines.add_line(KoopaLine::FuncDecl(name, params, ret.to_koopa_type()));
         }
@@ -291,6 +291,7 @@ impl AstNode for GlobleDef {
     fn to_koopa_lines(&self, bg: &mut Background) -> KoopaLines {
         match self {
             GlobleDef::FuncDef(func_def) => func_def.to_koopa_lines(bg),
+            GlobleDef::StructDef(_) => KoopaLines::new(),
             GlobleDef::GlobleDecl(typ, decls) => {
                 let mut lines = KoopaLines::new();
                 for decl in decls {
@@ -333,6 +334,9 @@ impl AstNode for GlobleDef {
                                     init_value,
                                 ));
                             }
+                        }
+                        ValueType::Struct(_) => {
+                            unreachable!("Struct globals are not lowered yet")
                         }
                         array_ty @ ValueType::Array(_, _) => {
                             let dims = value_type_dims(&array_ty);
@@ -429,6 +433,7 @@ impl BType {
         match self {
             BType::I32 => "i32".to_string(),
             BType::Void => "void".to_string(),
+            BType::Struct(name) => unimplemented!("Struct type lowering is not implemented yet: {}", name),
             BType::Ptr(b) => format!("*{}", b.to_koopa_type()),
             BType::Array(len, b) => format!("[{}, {}]", b.to_koopa_type(), len),
         }
@@ -518,6 +523,9 @@ impl AstNode for Stmt {
                                     ));
                                 }
                             }
+                        }
+                        ValueType::Struct(_) => {
+                            unreachable!("Struct locals are not lowered yet")
                         }
                         array_ty @ ValueType::Array(_, _) => {
                             let dims = value_type_dims(&array_ty);
@@ -675,6 +683,7 @@ impl AstNode for Exp {
                             content.add_line(KoopaLine::Load(loaded_name.clone(), ptr_name));
                             ReturnValue::new(Some(loaded_name), content)
                         }
+                        ValueType::Struct(_) => ReturnValue::new(Some(ptr_name), KoopaLines::new()),
                         ValueType::Array(_, _) => {
                             let elem_ptr = bg.next_temp();
                             let mut content = KoopaLines::new();
@@ -753,7 +762,11 @@ impl AstNode for Exp {
                         content.add_line(KoopaLine::Load(loaded.clone(), lvalue.ptr));
                         ReturnValue::new(Some(loaded), content)
                     }
+                    ValueType::Struct(_) => ReturnValue::new(Some(lvalue.ptr), lvalue.content),
                 }
+            }
+            Exp::Field(_, _) | Exp::PtrField(_, _) => {
+                panic!("Struct member access is parsed but not lowered yet")
             }
         }
     }

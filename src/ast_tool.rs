@@ -10,6 +10,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueType {
     Int,
+    Struct(String),
     Pointer(Box<ValueType>),
     Array(usize, Box<ValueType>),
 }
@@ -18,6 +19,7 @@ impl ValueType {
     pub fn from_btype(btype: &BType) -> Self {
         match btype {
             BType::I32 => ValueType::Int,
+            BType::Struct(name) => ValueType::Struct(name.clone()),
             BType::Ptr(inner) => ValueType::Pointer(Box::new(ValueType::from_btype(inner))),
             BType::Array(len, inner) => ValueType::Array(*len, Box::new(ValueType::from_btype(inner))),
             BType::Void => panic!("Void is not a storable value type"),
@@ -35,6 +37,7 @@ impl ValueType {
     pub fn to_koopa_type(&self) -> String {
         match self {
             ValueType::Int => "i32".to_string(),
+            ValueType::Struct(name) => unimplemented!("Struct type lowering is not implemented yet: {}", name),
             ValueType::Pointer(inner) => format!("*{}", inner.to_koopa_type()),
             ValueType::Array(len, inner) => format!("[{}, {}]", inner.to_koopa_type(), len),
         }
@@ -284,6 +287,7 @@ pub fn gen_unary_koopa_ir(op: &UnaryOp, src: String, background: &mut Background
         UnaryOp::Pos => KoopaLine::Binary(dst.clone(), "add".to_string(), "0".to_string(), src),
         UnaryOp::Neg => KoopaLine::Binary(dst.clone(), "sub".to_string(), "0".to_string(), src),
         UnaryOp::Not => KoopaLine::Binary(dst.clone(), "eq".to_string(), src, "0".to_string()),
+        UnaryOp::Addr | UnaryOp::Deref => unimplemented!("Unary operator {:?} is not lowered yet", op),
     };
     ReturnValue {
         value: Some(dst),
@@ -392,6 +396,7 @@ pub fn eval_unary_const(op: &UnaryOp, value: i32) -> i32 {
                 0
             }
         }
+        UnaryOp::Addr | UnaryOp::Deref => unimplemented!("Unary operator {:?} is not a constant expression", op),
     }
 }
 
@@ -542,6 +547,7 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                     }
                 }
             }
+            GlobleDef::StructDef(_) => {}
         }
     }
 
