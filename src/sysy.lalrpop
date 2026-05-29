@@ -195,6 +195,7 @@ ArrayExp: Exp = {
 }
 
 PrimaryExp: Exp = {
+  "new" <ty: BTypeBase> => Exp::New(ty),
   <ArrayExp> => <>,
   <ident: Ident> "(" ")" => Exp::FuncCall(ident, Vec::new()),
   <Ident> "(" <FuncArgs> ")" => Exp::FuncCall(<>),

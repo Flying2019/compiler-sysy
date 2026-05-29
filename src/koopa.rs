@@ -1,15 +1,81 @@
-pub type Type = String;
 pub type Label = String;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KoopaType {
+    I32,
+    Void,
+    Struct(String),
+    Ptr(Box<KoopaType>),
+    Array(Box<KoopaType>, usize),
+}
+
+impl KoopaType {
+    pub fn ptr(base: KoopaType) -> Self {
+        Self::Ptr(Box::new(base))
+    }
+
+    pub fn array(base: KoopaType, len: usize) -> Self {
+        Self::Array(Box::new(base), len)
+    }
+
+    pub fn display_wrapped(&self) -> String {
+        match self {
+            KoopaType::I32 => "i32".to_string(),
+            KoopaType::Void => "void".to_string(),
+            KoopaType::Struct(name) => format!("struct @{}", name),
+            KoopaType::Ptr(inner) => format!("*{}", inner.display_wrapped()),
+            KoopaType::Array(inner, len) => format!("[{}, {}]", inner.display_wrapped(), len),
+        }
+    }
+
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KoopaParam {
+    pub name: String,
+    pub ty: KoopaType,
+}
+
+impl KoopaParam {
+    pub fn new(name: String, ty: KoopaType) -> Self {
+        Self { name, ty }
+    }
+
+    fn display_wrapped(&self) -> String {
+        format!("{}: {}", self.name, self.ty.display_wrapped())
+    }
+
+    fn wrapped_type(&self) -> String {
+        self.ty.display_wrapped()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KoopaField {
+    pub name: String,
+    pub ty: KoopaType,
+}
+
+impl KoopaField {
+    pub fn new(name: String, ty: KoopaType) -> Self {
+        Self { name, ty }
+    }
+
+    fn display_wrapped(&self) -> String {
+        format!("{} {}", self.ty.display_wrapped(), self.name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KoopaLine {
-    FuncDecl(String, String, Type), // @func(args): type
-    FuncStart(String, String, Type),
+    StructDecl(String, Vec<KoopaField>),
+    FuncDecl(String, Vec<KoopaParam>, KoopaType),
+    FuncStart(String, Vec<KoopaParam>, KoopaType),
     FuncEnd,
     Label(Label),
-    ArgLabel(Label, Label, Type),      // %br(%a: type)
-    GlobalAlloc(String, Type, String), // global = alloc type, init
-    Alloc(String, Type),
+    ArgLabel(Label, Label, KoopaType),         // %br(%a: type)
+    GlobalAlloc(String, KoopaType, String),    // global = alloc type, init
+    Alloc(String, KoopaType),
     Store(String, String),
     Load(String, String),
     GetPtr(String, String, String),
@@ -17,39 +83,59 @@ pub enum KoopaLine {
     Binary(String, String, String, String),
     Br(String, Label, Label),
     Jump(Label),
-    ArgJump(Label, String),       // jump %bb(%arg)
-    Call(String, String, String), // %dest = call @func(%arg)
-    VoidCall(String, String),     // call @func(%arg)
+    ArgJump(Label, String),                    // jump %bb(%arg)
+    Call(String, String, String),              // %dest = call @func(%arg)
+    VoidCall(String, String),                  // call @func(%arg)
     Ret(String),
     VoidRet,
 }
 
 impl KoopaLine {
-    pub fn to_string(&self) -> String {
+    pub fn to_wrapped_string(&self) -> String {
         match self {
+            KoopaLine::StructDecl(name, fields) => {
+                let fields = fields
+                    .iter()
+                    .map(KoopaField::display_wrapped)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("type @{} = {{ {} }}", name, fields)
+            }
             KoopaLine::FuncDecl(name, args, ret_type) => {
-                if matches!(ret_type.as_str(), "void") {
+                let args = args
+                    .iter()
+                    .map(KoopaParam::wrapped_type)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if matches!(ret_type, KoopaType::Void) {
                     format!("decl @{}({})", name, args)
                 } else {
-                    format!("decl @{}({}): {}", name, args, ret_type)
+                    format!("decl @{}({}): {}", name, args, ret_type.display_wrapped())
                 }
             }
             KoopaLine::FuncStart(name, args, ret_type) => {
-                if matches!(ret_type.as_str(), "void") {
+                let args = args
+                    .iter()
+                    .map(KoopaParam::display_wrapped)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if matches!(ret_type, KoopaType::Void) {
                     format!("fun @{}({}) {{", name, args)
                 } else {
-                    format!("fun @{}({}): {} {{", name, args, ret_type)
+                    format!("fun @{}({}): {} {{", name, args, ret_type.display_wrapped())
                 }
             }
             KoopaLine::FuncEnd => "}\n".to_string(),
             KoopaLine::Label(label) => format!("{}:", label),
             KoopaLine::ArgLabel(label, arg_name, arg_type) => {
-                format!("\n{}({}: {}):", label, arg_name, arg_type)
+                format!("\n{}({}: {}):", label, arg_name, arg_type.display_wrapped())
             }
             KoopaLine::GlobalAlloc(name, ty, init) => {
-                format!("global {} = alloc {}, {}\n", name, ty, init)
+                format!("global {} = alloc {}, {}\n", name, ty.display_wrapped(), init)
             }
-            KoopaLine::Alloc(ptr_name, ptr_type) => format!("\t{} = alloc {}", ptr_name, ptr_type),
+            KoopaLine::Alloc(ptr_name, ptr_type) => {
+                format!("\t{} = alloc {}", ptr_name, ptr_type.display_wrapped())
+            }
             KoopaLine::Store(value, ptr) => format!("\tstore {}, {}", value, ptr),
             KoopaLine::Load(dest, ptr) => format!("\t{} = load {}", dest, ptr),
             KoopaLine::GetPtr(dest, ptr, idx) => format!("\t{} = getptr {}, {}", dest, ptr, idx),
@@ -125,10 +211,14 @@ impl KoopaLines {
         self.lines.append(&mut other.lines);
     }
 
-    pub fn to_string(&self) -> String {
+    pub fn lines(&self) -> &[KoopaLine] {
+        &self.lines
+    }
+
+    pub fn to_wrapped_string(&self) -> String {
         self.lines
             .iter()
-            .map(|line| line.to_string())
+            .map(KoopaLine::to_wrapped_string)
             .collect::<Vec<_>>()
             .join("\n")
     }

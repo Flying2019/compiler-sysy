@@ -140,7 +140,7 @@ where
             })
         }
         Exp::Ident(name) => lookup(name),
-        Exp::FuncCall(_, _) | Exp::ArrGet(_, _) | Exp::Field(_, _) | Exp::PtrField(_, _) => None,
+        Exp::New(_) | Exp::FuncCall(_, _) | Exp::ArrGet(_, _) | Exp::Field(_, _) | Exp::PtrField(_, _) => None,
     }
 }
 
@@ -159,6 +159,7 @@ pub enum Exp {
     Number(i32),
     UnaryExp(UnaryOp, Box<Exp>),
     BinaryExp(BinaryOp, Box<Exp>, Box<Exp>),
+    New(BType),
     FuncCall(String, Vec<Exp>),
     ArrGet(Box<Exp>, Box<Exp>),
     Field(Box<Exp>, String),

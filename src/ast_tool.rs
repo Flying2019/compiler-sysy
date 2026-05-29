@@ -1,11 +1,20 @@
 use std::collections::HashMap;
 
-use crate::koopa::{KoopaLine, KoopaLines};
+use crate::koopa::{KoopaLine, KoopaLines, KoopaType};
 use crate::lalr::VarDecl;
 use crate::{
     ast::{AstNode, ReturnValue},
-    lalr::{eval_param_dim, func_param_btype, BType, BinaryOp, CompUnit, Exp, FuncParam, GlobleDef, Type, UnaryOp},
+    lalr::{eval_param_dim, func_param_btype, BType, BinaryOp, CompUnit, Exp, FuncParam, GlobleDef, StructDef, Type, UnaryOp},
 };
+
+const WORD_SIZE: usize = 4;
+
+fn align_up(value: usize, align: usize) -> usize {
+    if align == 0 {
+        return value;
+    }
+    (value + align - 1) / align * align
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueType {
@@ -26,6 +35,26 @@ impl ValueType {
         }
     }
 
+    pub fn align(&self, bg: &Background) -> usize {
+        match self {
+            ValueType::Int | ValueType::Pointer(_) => WORD_SIZE,
+            ValueType::Array(_, inner) => inner.align(bg),
+            ValueType::Struct(name) => bg.get_struct_layout(name).align,
+        }
+    }
+
+    pub fn size(&self, bg: &Background) -> usize {
+        match self {
+            ValueType::Int | ValueType::Pointer(_) => WORD_SIZE,
+            ValueType::Array(len, inner) => inner.size(bg) * len,
+            ValueType::Struct(name) => bg.get_struct_layout(name).size,
+        }
+    }
+
+    pub fn slot_count(&self, bg: &Background) -> usize {
+        align_up(self.size(bg), WORD_SIZE) / WORD_SIZE
+    }
+
     pub fn from_dims(dims: &[usize]) -> Self {
         let mut ty = ValueType::Int;
         for len in dims.iter().rev() {
@@ -34,14 +63,29 @@ impl ValueType {
         ty
     }
 
-    pub fn to_koopa_type(&self) -> String {
+    pub fn to_koopa_type(&self, _bg: &Background) -> KoopaType {
         match self {
-            ValueType::Int => "i32".to_string(),
-            ValueType::Struct(name) => unimplemented!("Struct type lowering is not implemented yet: {}", name),
-            ValueType::Pointer(inner) => format!("*{}", inner.to_koopa_type()),
-            ValueType::Array(len, inner) => format!("[{}, {}]", inner.to_koopa_type(), len),
+            ValueType::Int => KoopaType::I32,
+            ValueType::Struct(name) => KoopaType::Struct(name.clone()),
+            ValueType::Pointer(inner) => KoopaType::ptr(inner.to_koopa_type(_bg)),
+            ValueType::Array(len, inner) => KoopaType::array(inner.to_koopa_type(_bg), *len),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct StructFieldLayout {
+    pub name: String,
+    pub ty: ValueType,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructLayout {
+    pub name: String,
+    pub fields: Vec<StructFieldLayout>,
+    pub size: usize,
+    pub align: usize,
 }
 
 #[derive(Debug)]
@@ -134,6 +178,8 @@ impl GlobalSymbols {
 #[derive(Debug)]
 pub struct Background {
     global_symbols: GlobalSymbols,
+    struct_defs: HashMap<String, StructDef>,
+    struct_layouts: HashMap<String, StructLayout>,
     temp_counter: usize,
     branch_counter: usize,
     constant_map: HashMap<String, i32>,
@@ -148,6 +194,8 @@ impl Background {
     pub fn new() -> Self {
         Self {
             global_symbols: GlobalSymbols::new(),
+            struct_defs: HashMap::new(),
+            struct_layouts: HashMap::new(),
             temp_counter: 0,
             branch_counter: 0,
             constant_map: HashMap::new(),
@@ -163,6 +211,82 @@ impl Background {
         self.next_bb = None;
         self.loop_next = None;
         self.loop_entry = None;
+    }
+
+    pub fn register_struct_def(&mut self, def: StructDef) {
+        if self.struct_defs.contains_key(&def.name) {
+            panic!("Duplicate struct definition: {}", def.name);
+        }
+        self.struct_defs.insert(def.name.clone(), def);
+    }
+
+    pub fn get_struct_layout(&self, name: &str) -> &StructLayout {
+        self.struct_layouts
+            .get(name)
+            .unwrap_or_else(|| panic!("Struct layout not resolved yet: {}", name))
+    }
+
+    pub fn get_struct_field(&self, struct_name: &str, field_name: &str) -> &StructFieldLayout {
+        self.get_struct_layout(struct_name)
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+            .unwrap_or_else(|| panic!("Struct {} has no field named {}", struct_name, field_name))
+    }
+
+    pub fn resolve_struct_layouts(&mut self) {
+        let names = self.struct_defs.keys().cloned().collect::<Vec<_>>();
+        let mut visiting = Vec::new();
+        for name in names {
+            self.ensure_struct_layout(&name, &mut visiting);
+        }
+    }
+
+    fn ensure_struct_layout(&mut self, name: &str, visiting: &mut Vec<String>) -> StructLayout {
+        if let Some(layout) = self.struct_layouts.get(name) {
+            return layout.clone();
+        }
+        if visiting.iter().any(|item| item == name) {
+            panic!("Cyclic struct definition detected: {}", name);
+        }
+        visiting.push(name.to_string());
+        let def = self
+            .struct_defs
+            .get(name)
+            .unwrap_or_else(|| panic!("Unknown struct type: {}", name))
+            .clone();
+
+        let mut fields = Vec::new();
+        let mut offset = 0usize;
+        let mut align = WORD_SIZE;
+        for field in def.fields {
+            for decl in field.decls {
+                let field_ty = resolve_decl_value_type(&field.ty, &decl.var, self);
+                let field_name = flatten_var_decl(&decl.var, self)
+                    .map(|(name, _)| name)
+                    .unwrap_or_else(|| panic!("Array size must be a constant expression"));
+                let field_align = field_ty.align(self);
+                let field_size = field_ty.size(self);
+                align = align.max(field_align);
+                offset = align_up(offset, field_align);
+                fields.push(StructFieldLayout {
+                    name: field_name,
+                    ty: field_ty,
+                    offset,
+                });
+                offset += field_size;
+            }
+        }
+        let size = align_up(offset, align);
+        visiting.pop();
+        let layout = StructLayout {
+            name: name.to_string(),
+            fields,
+            size,
+            align,
+        };
+        self.struct_layouts.insert(name.to_string(), layout.clone());
+        layout
     }
 
     pub fn get_global_variable(&self, name: String) -> Option<&ValueType> {
@@ -287,7 +411,9 @@ pub fn gen_unary_koopa_ir(op: &UnaryOp, src: String, background: &mut Background
         UnaryOp::Pos => KoopaLine::Binary(dst.clone(), "add".to_string(), "0".to_string(), src),
         UnaryOp::Neg => KoopaLine::Binary(dst.clone(), "sub".to_string(), "0".to_string(), src),
         UnaryOp::Not => KoopaLine::Binary(dst.clone(), "eq".to_string(), src, "0".to_string()),
-        UnaryOp::Addr | UnaryOp::Deref => unimplemented!("Unary operator {:?} is not lowered yet", op),
+        UnaryOp::Addr | UnaryOp::Deref => {
+            panic!("Unary operator {:?} should be handled in Exp::UnaryExp.to_koopa(), not in gen_unary_koopa_ir()", op)
+        }
     };
     ReturnValue {
         value: Some(dst),
@@ -348,7 +474,7 @@ pub fn gen_binary_koopa_ir(
                 ir.add_line(KoopaLine::ArgJump(br_end.clone(), 1.to_string()));
             }
             // End block
-            ir.add_line(KoopaLine::ArgLabel(br_end, dst.clone(), "i32".to_string()));
+            ir.add_line(KoopaLine::ArgLabel(br_end, dst.clone(), KoopaType::I32));
             ReturnValue {
                 value: Some(dst),
                 content: ir,
@@ -396,7 +522,9 @@ pub fn eval_unary_const(op: &UnaryOp, value: i32) -> i32 {
                 0
             }
         }
-        UnaryOp::Addr | UnaryOp::Deref => unimplemented!("Unary operator {:?} is not a constant expression", op),
+        UnaryOp::Addr | UnaryOp::Deref => {
+            unimplemented!("Unary operator {:?} is not a constant expression", op)
+        }
     }
 }
 
@@ -502,7 +630,31 @@ fn resolve_func_param_btype(param: &FuncParam, bg: &Background) -> BType {
     }
 }
 
+pub fn resolve_decl_value_type(base: &Type, var: &VarDecl, bg: &Background) -> ValueType {
+    let base_ty = match base {
+        Type::BType(btype) | Type::Const(btype) => ValueType::from_btype(btype),
+    };
+    fn inner_decl(var: &VarDecl, base_ty: ValueType, bg: &Background) -> Option<ValueType> {
+        match var {
+            VarDecl::Ident(_) => Some(base_ty),
+            VarDecl::Array(inner, len) => {
+                let len = len.try_eval_const(bg)? as usize;
+                let inner_ty = inner_decl(inner, base_ty, bg)?;
+                Some(ValueType::Array(len, Box::new(inner_ty)))
+            }
+        }
+    }
+    inner_decl(var, base_ty, bg).expect("Array size must be a constant expression")
+}
+
 pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
+    for glob_def in &comp_unit.glob_defs {
+        if let GlobleDef::StructDef(def) = glob_def {
+            bg.register_struct_def(def.clone());
+        }
+    }
+    bg.resolve_struct_layouts();
+
     for glob_def in comp_unit.glob_defs {
         match glob_def {
             GlobleDef::FuncDef(func_def) => {
@@ -531,20 +683,21 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                         }
                     }
                     let var = decl.var.clone();
-                    match var_decl_value_type(&var, bg) {
-                        Some((var_name, value_type)) => {
-                            let is_scalar_const = matches!(ty, Type::Const(_))
-                                && matches!(value_type, ValueType::Int);
-                            if is_scalar_const {
-                                continue;
-                            }
-                            if bg.global_symbols.global_variable.contains_key(&var_name) {
-                                panic!("Duplicate global variable definition: {}", var_name);
-                            }
-                            bg.global_symbols.global_variable.insert(var_name, value_type);
-                        }
-                        None => panic!("Array size must be a constant expression"),
+                    let value_type = resolve_decl_value_type(&ty, &var, bg);
+                    let var_name = match var.clone() {
+                        VarDecl::Ident(name) => name,
+                        VarDecl::Array(_, _) => flatten_var_decl(&var, bg)
+                            .map(|(name, _)| name)
+                            .expect("Array size must be a constant expression"),
+                    };
+                    let is_scalar_const = matches!(ty, Type::Const(_)) && matches!(value_type, ValueType::Int);
+                    if is_scalar_const {
+                        continue;
                     }
+                    if bg.global_symbols.global_variable.contains_key(&var_name) {
+                        panic!("Duplicate global variable definition: {}", var_name);
+                    }
+                    bg.global_symbols.global_variable.insert(var_name, value_type);
                 }
             }
             GlobleDef::StructDef(_) => {}
@@ -558,16 +711,6 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
         bg.global_symbols
             .static_function
             .insert(func_name, (func_type, params));
-    }
-}
-
-fn var_decl_value_type(var: &VarDecl, bg: &Background) -> Option<(String, ValueType)> {
-    match var {
-        VarDecl::Ident(name) => Some((name.clone(), ValueType::Int)),
-        VarDecl::Array(_, _) => {
-            let (name, dims) = flatten_var_decl(var, bg)?;
-            Some((name, ValueType::from_dims(&dims)))
-        }
     }
 }
 
