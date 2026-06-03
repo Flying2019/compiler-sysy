@@ -87,7 +87,12 @@ fn value_type_from_decl(typ: &Type, var: &VarDecl, bg: &Background) -> ValueType
     resolve_decl_value_type(typ, var, bg)
 }
 
-fn canonicalize_storage_ptr(ptr: String, ty: &ValueType, bg: &mut Background, content: &mut KoopaLines) -> String {
+fn canonicalize_storage_ptr(
+    ptr: String,
+    ty: &ValueType,
+    bg: &mut Background,
+    content: &mut KoopaLines,
+) -> String {
     match ty {
         ValueType::Int | ValueType::Pointer(_) => ptr,
         ValueType::Struct(_) => {
@@ -97,7 +102,11 @@ fn canonicalize_storage_ptr(ptr: String, ty: &ValueType, bg: &mut Background, co
         }
         ValueType::Array(_, inner) => {
             let elem_ptr = bg.next_temp();
-            content.add_line(KoopaLine::GetElemPtr(elem_ptr.clone(), ptr, "0".to_string()));
+            content.add_line(KoopaLine::GetElemPtr(
+                elem_ptr.clone(),
+                ptr,
+                "0".to_string(),
+            ));
             canonicalize_storage_ptr(elem_ptr, inner, bg, content)
         }
     }
@@ -105,7 +114,8 @@ fn canonicalize_storage_ptr(ptr: String, ty: &ValueType, bg: &mut Background, co
 
 fn struct_slot_ptr(lvalue: &mut LValue, bg: &mut Background) -> String {
     if matches!(lvalue.ty, ValueType::Struct(_)) && lvalue.is_storage_ptr {
-        let canon = canonicalize_storage_ptr(lvalue.ptr.clone(), &lvalue.ty, bg, &mut lvalue.content);
+        let canon =
+            canonicalize_storage_ptr(lvalue.ptr.clone(), &lvalue.ty, bg, &mut lvalue.content);
         lvalue.is_storage_ptr = false;
         lvalue.ptr = canon.clone();
         canon
@@ -114,29 +124,12 @@ fn struct_slot_ptr(lvalue: &mut LValue, bg: &mut Background) -> String {
     }
 }
 
-fn scale_index(
-    index_value: String,
-    factor: usize,
-    bg: &mut Background,
-    content: &mut KoopaLines,
-) -> String {
-    if factor == 1 {
-        return index_value;
-    }
-    let scaled = bg.next_temp();
-    content.add_line(KoopaLine::Binary(
-        scaled.clone(),
-        "mul".to_string(),
-        index_value,
-        factor.to_string(),
-    ));
-    scaled
-}
-
 fn infer_exp_type(exp: &Exp, bg: &Background) -> ValueType {
     match exp {
         Exp::Number(_) => ValueType::Int,
-        Exp::UnaryExp(UnaryOp::Addr, inner) => ValueType::Pointer(Box::new(infer_exp_type(inner, bg))),
+        Exp::UnaryExp(UnaryOp::Addr, inner) => {
+            ValueType::Pointer(Box::new(infer_exp_type(inner, bg)))
+        }
         Exp::UnaryExp(UnaryOp::Deref, inner) => match infer_exp_type(inner, bg) {
             ValueType::Pointer(inner_ty) => (*inner_ty).clone(),
             other => panic!("Cannot dereference non-pointer type {:?}", other),
@@ -153,12 +146,16 @@ fn infer_exp_type(exp: &Exp, bg: &Background) -> ValueType {
             other => panic!("Cannot index into type {:?}", other),
         },
         Exp::Field(base, field_name) => match infer_exp_type(base, bg) {
-            ValueType::Struct(struct_name) => bg.get_struct_field(&struct_name, field_name).ty.clone(),
+            ValueType::Struct(struct_name) => {
+                bg.get_struct_field(&struct_name, field_name).ty.clone()
+            }
             other => panic!("Cannot access field on non-struct type {:?}", other),
         },
         Exp::PtrField(base, field_name) => match infer_exp_type(base, bg) {
             ValueType::Pointer(inner) => match *inner {
-                ValueType::Struct(struct_name) => bg.get_struct_field(&struct_name, field_name).ty.clone(),
+                ValueType::Struct(struct_name) => {
+                    bg.get_struct_field(&struct_name, field_name).ty.clone()
+                }
                 other => panic!("Cannot access field through pointer to {:?}", other),
             },
             other => panic!("Cannot access field through non-pointer type {:?}", other),
@@ -200,7 +197,11 @@ fn fill_init_slots(
         return cursor;
     }
 
-    let child_len = if dims.len() == 1 { 1 } else { product(&dims[1..]) };
+    let child_len = if dims.len() == 1 {
+        1
+    } else {
+        product(&dims[1..])
+    };
     let end = base + dims[0] * child_len;
     match init {
         InitVal::Exp(_) => {
@@ -358,20 +359,16 @@ fn gen_lvalue(exp: &Exp, bg: &mut Background) -> LValue {
                 ValueType::Struct(struct_name) => {
                     let field_layout = bg.get_struct_field(&struct_name, field_name);
                     let field_ty = field_layout.ty.clone();
-                    let byte_offset = field_layout.offset;
 
                     // Canonicalize storage pointer (alloc returns pointer-to-storage),
                     // then compute slot offset (4-byte words) and get field address.
                     let canon_ptr = struct_slot_ptr(&mut base, bg);
 
-                    // Convert byte offset to slot index (4-byte words)
-                    let slot_offset = byte_offset / 4;
-
                     let field_ptr = bg.next_temp();
-                    base.content.add_line(KoopaLine::GetPtr(
+                    base.content.add_line(KoopaLine::StructFieldPtr(
                         field_ptr.clone(),
                         canon_ptr,
-                        slot_offset.to_string(),
+                        field_name.clone(),
                     ));
 
                     LValue {
@@ -393,20 +390,15 @@ fn gen_lvalue(exp: &Exp, bg: &mut Background) -> LValue {
                     ValueType::Struct(struct_name) => {
                         let field_layout = bg.get_struct_field(&struct_name, field_name);
                         let field_ty = field_layout.ty.clone();
-                        let byte_offset = field_layout.offset;
 
                         let mut content = base_ret.content;
                         let canon_ptr = base_ret.value.unwrap();
 
-                        // Convert byte offset to slot index (4-byte words)
-                        let slot_offset = byte_offset / 4;
-
-                        // Use getptr to compute field address
                         let field_ptr = bg.next_temp();
-                        content.add_line(KoopaLine::GetPtr(
+                        content.add_line(KoopaLine::StructFieldPtr(
                             field_ptr.clone(),
                             canon_ptr,
-                            slot_offset.to_string(),
+                            field_name.clone(),
                         ));
 
                         LValue {
@@ -416,7 +408,10 @@ fn gen_lvalue(exp: &Exp, bg: &mut Background) -> LValue {
                             content,
                         }
                     }
-                    other => panic!("Cannot access field through pointer to non-struct type {:?}", other),
+                    other => panic!(
+                        "Cannot access field through pointer to non-struct type {:?}",
+                        other
+                    ),
                 },
                 other => panic!("Cannot access field through non-pointer type {:?}", other),
             }
@@ -436,7 +431,8 @@ impl AstNode for CompUnit {
                 let mut fields = Vec::new();
                 for field in &def.fields {
                     for decl in &field.decls {
-                        let field_ty = value_type_from_decl(&field.ty, &decl.var, bg).to_koopa_type(bg);
+                        let field_ty =
+                            value_type_from_decl(&field.ty, &decl.var, bg).to_koopa_type(bg);
                         let (field_name, _) = flatten_var_decl(&decl.var, bg);
                         fields.push(KoopaField::new(field_name, field_ty));
                     }
@@ -558,7 +554,9 @@ impl AstNode for GlobleDef {
                             bg.set_variable_type(new_name.clone(), pointer_ty.clone());
                             let init_value = if let Some(init) = &decl.init {
                                 init.try_eval_const(bg)
-                                    .expect("Global pointer initializer must be a constant expression")
+                                    .expect(
+                                        "Global pointer initializer must be a constant expression",
+                                    )
                                     .to_string()
                             } else {
                                 "zeroinit".to_string()
@@ -597,7 +595,10 @@ impl AstNode for FuncDef {
         for param in &self.func_params {
             let ptr_name = bg.new_variable(param.name.clone());
             let param_ty = param.resolved_btype(bg);
-            lines.add_line(KoopaLine::Alloc(ptr_name.clone(), param_ty.to_koopa_type(bg)));
+            lines.add_line(KoopaLine::Alloc(
+                ptr_name.clone(),
+                param_ty.to_koopa_type(bg),
+            ));
             lines.add_line(KoopaLine::Store(param.to_koopa_name(), ptr_name.clone()));
             bg.set_variable_type(ptr_name, ValueType::from_btype(&param_ty));
         }
@@ -735,7 +736,10 @@ impl AstNode for Stmt {
                             let ptr_name = bg.new_variable(var_name);
                             let struct_ty = ValueType::Struct(struct_name.clone());
                             bg.set_variable_type(ptr_name.clone(), struct_ty.clone());
-                            content.add_line(KoopaLine::Alloc(ptr_name.clone(), struct_ty.to_koopa_type(bg)));
+                            content.add_line(KoopaLine::Alloc(
+                                ptr_name.clone(),
+                                struct_ty.to_koopa_type(bg),
+                            ));
                             // For now, struct initialization is not supported; default to zero-init
                             if let Some(_init) = &decl.init {
                                 panic!("Struct initialization is not yet implemented");
@@ -746,16 +750,28 @@ impl AstNode for Stmt {
                             let (var_name, _) = flatten_var_decl(&decl.var, bg);
                             let ptr_name = bg.new_variable(var_name);
                             bg.set_variable_type(ptr_name.clone(), array_ty.clone());
-                            content.add_line(KoopaLine::Alloc(ptr_name.clone(), array_ty.to_koopa_type(bg)));
+                            content.add_line(KoopaLine::Alloc(
+                                ptr_name.clone(),
+                                array_ty.to_koopa_type(bg),
+                            ));
                             if let Some(init) = &decl.init {
-                                for (flat_idx, slot) in init_slots(init, &dims).into_iter().enumerate() {
+                                for (flat_idx, slot) in
+                                    init_slots(init, &dims).into_iter().enumerate()
+                                {
                                     let value_ret = match slot {
                                         Some(init) => init.to_koopa(bg),
-                                        None => ReturnValue::new(Some("0".to_string()), KoopaLines::new()),
+                                        None => ReturnValue::new(
+                                            Some("0".to_string()),
+                                            KoopaLines::new(),
+                                        ),
                                     };
                                     let indices = flat_index_to_indices(flat_idx, &dims);
-                                    let ptr_ret =
-                                        gen_array_elem_ptr(bg, ptr_name.clone(), &array_ty, &indices);
+                                    let ptr_ret = gen_array_elem_ptr(
+                                        bg,
+                                        ptr_name.clone(),
+                                        &array_ty,
+                                        &indices,
+                                    );
                                     content.add_lines(value_ret.content);
                                     content.add_lines(ptr_ret.content);
                                     content.add_line(KoopaLine::Store(
@@ -769,23 +785,33 @@ impl AstNode for Stmt {
                             let (var_name, _) = flatten_var_decl(&decl.var, bg);
                             let ptr_name = bg.new_variable(var_name);
                             bg.set_variable_type(ptr_name.clone(), pointer_ty.clone());
-                            content.add_line(KoopaLine::Alloc(ptr_name.clone(), pointer_ty.to_koopa_type(bg)));
+                            content.add_line(KoopaLine::Alloc(
+                                ptr_name.clone(),
+                                pointer_ty.to_koopa_type(bg),
+                            ));
                             if let Some(init) = &decl.init {
                                 let init_ret = init.to_koopa(bg);
                                 content.add_lines(init_ret.content);
-                                content.add_line(KoopaLine::Store(init_ret.value.unwrap(), ptr_name));
+                                content
+                                    .add_line(KoopaLine::Store(init_ret.value.unwrap(), ptr_name));
                             }
                         }
                     }
                 }
                 content
             }
-            Stmt::If(_, _)
-            | Stmt::IfElse(_, _, _)
-            | Stmt::Return(_)
-            | Stmt::While(_, _)
-            | Stmt::Continue
-            | Stmt::Break => {
+            Stmt::Return(num) => match num {
+                Some(num) => {
+                    let ret = num.to_koopa(bg);
+                    let mut ir = ret.content;
+                    ir.add_line(KoopaLine::Ret(ret.value.unwrap()));
+                    ir
+                }
+                None => KoopaLines::with_line(KoopaLine::VoidRet),
+            },
+            Stmt::Break => KoopaLines::with_line(KoopaLine::Jump(bg.get_loop_next().unwrap())),
+            Stmt::Continue => KoopaLines::with_line(KoopaLine::Jump(bg.get_loop_entry().unwrap())),
+            Stmt::If(_, _) | Stmt::IfElse(_, _, _) | Stmt::While(_, _) => {
                 // These methods require a closed basic block.
                 let mut ir = KoopaLines::new();
                 bg.new_next_bb_if_none();
@@ -858,20 +884,6 @@ impl AstNode for Stmt {
                         bg.set_next_bb(old_next_bb);
                         bg.set_loop(old_next, old_entry);
                     }
-                    Stmt::Return(num) => match num {
-                        Some(num) => {
-                            let ret = num.to_koopa(bg);
-                            ir.add_lines(ret.content);
-                            ir.add_line(KoopaLine::Ret(ret.value.unwrap()));
-                        }
-                        None => ir.add_line(KoopaLine::VoidRet),
-                    },
-                    Stmt::Break => {
-                        ir.add_line(KoopaLine::Jump(bg.get_loop_next().unwrap()));
-                    }
-                    Stmt::Continue => {
-                        ir.add_line(KoopaLine::Jump(bg.get_loop_entry().unwrap()));
-                    }
                     _ => unreachable!(),
                 }
                 ir
@@ -924,20 +936,13 @@ impl AstNode for Exp {
             }
             Exp::BinaryExp(op, left, right) => gen_binary_koopa_ir(op, left, right, bg),
             Exp::New(ty) => {
-                let alloc_name = bg.next_temp();
+                let ptr = bg.next_temp();
                 let mut content = KoopaLines::new();
-                content.add_line(KoopaLine::Alloc(
-                    alloc_name.clone(),
+                content.add_line(KoopaLine::HeapAlloc(
+                    ptr.clone(),
                     ValueType::from_btype(ty).to_koopa_type(bg),
                 ));
-                match ty {
-                    BType::Struct(_) => {
-                        let ptr = bg.next_temp();
-                        content.add_line(KoopaLine::GetElemPtr(ptr.clone(), alloc_name, "0".to_string()));
-                        ReturnValue::new(Some(ptr), content)
-                    }
-                    _ => ReturnValue::new(Some(alloc_name), content),
-                }
+                ReturnValue::new(Some(ptr), content)
             }
             Exp::Ident(name) => {
                 if let Some(const_value) = bg.try_get_constant(name.clone()) {
@@ -1004,7 +1009,7 @@ impl AstNode for Exp {
                     },
                     _ => unimplemented!("Function type {:?} not supported yet", func_type),
                 }
-            },
+            }
             Exp::ArrGet(_, _) => {
                 let lvalue = gen_lvalue(self, bg);
                 match lvalue.ty {
@@ -1075,7 +1080,7 @@ impl InitVal {
     fn try_eval_const(&self, bg: &Background) -> Option<i32> {
         match self {
             InitVal::Arr(_) => None,
-            InitVal::Exp(exp) => exp.try_eval_const(bg)
+            InitVal::Exp(exp) => exp.try_eval_const(bg),
         }
     }
 }
@@ -1084,7 +1089,7 @@ impl AstNode for InitVal {
     fn to_koopa(&self, bg: &mut Background) -> ReturnValue {
         match self {
             InitVal::Arr(_) => panic!("Array initializer cannot be lowered as a scalar value"),
-            InitVal::Exp(exp) => exp.to_koopa(bg)
+            InitVal::Exp(exp) => exp.to_koopa(bg),
         }
     }
 }

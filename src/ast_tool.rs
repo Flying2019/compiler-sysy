@@ -4,7 +4,10 @@ use crate::koopa::{KoopaLine, KoopaLines, KoopaType};
 use crate::lalr::VarDecl;
 use crate::{
     ast::{AstNode, ReturnValue},
-    lalr::{eval_param_dim, func_param_btype, BType, BinaryOp, CompUnit, Exp, FuncParam, GlobleDef, StructDef, Type, UnaryOp},
+    lalr::{
+        eval_param_dim, func_param_btype, BType, BinaryOp, CompUnit, Exp, FuncParam, GlobleDef,
+        StructDef, Type, UnaryOp,
+    },
 };
 
 const WORD_SIZE: usize = 4;
@@ -30,7 +33,9 @@ impl ValueType {
             BType::I32 => ValueType::Int,
             BType::Struct(name) => ValueType::Struct(name.clone()),
             BType::Ptr(inner) => ValueType::Pointer(Box::new(ValueType::from_btype(inner))),
-            BType::Array(len, inner) => ValueType::Array(*len, Box::new(ValueType::from_btype(inner))),
+            BType::Array(len, inner) => {
+                ValueType::Array(*len, Box::new(ValueType::from_btype(inner)))
+            }
             BType::Void => panic!("Void is not a storable value type"),
         }
     }
@@ -690,14 +695,17 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                             .map(|(name, _)| name)
                             .expect("Array size must be a constant expression"),
                     };
-                    let is_scalar_const = matches!(ty, Type::Const(_)) && matches!(value_type, ValueType::Int);
+                    let is_scalar_const =
+                        matches!(ty, Type::Const(_)) && matches!(value_type, ValueType::Int);
                     if is_scalar_const {
                         continue;
                     }
                     if bg.global_symbols.global_variable.contains_key(&var_name) {
                         panic!("Duplicate global variable definition: {}", var_name);
                     }
-                    bg.global_symbols.global_variable.insert(var_name, value_type);
+                    bg.global_symbols
+                        .global_variable
+                        .insert(var_name, value_type);
                 }
             }
             GlobleDef::StructDef(_) => {}

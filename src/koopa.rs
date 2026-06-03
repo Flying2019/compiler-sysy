@@ -27,7 +27,6 @@ impl KoopaType {
             KoopaType::Array(inner, len) => format!("[{}, {}]", inner.display_wrapped(), len),
         }
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,19 +72,21 @@ pub enum KoopaLine {
     FuncStart(String, Vec<KoopaParam>, KoopaType),
     FuncEnd,
     Label(Label),
-    ArgLabel(Label, Label, KoopaType),         // %br(%a: type)
-    GlobalAlloc(String, KoopaType, String),    // global = alloc type, init
+    ArgLabel(Label, Label, KoopaType),      // %br(%a: type)
+    GlobalAlloc(String, KoopaType, String), // global = alloc type, init
     Alloc(String, KoopaType),
+    HeapAlloc(String, KoopaType),
     Store(String, String),
     Load(String, String),
+    StructFieldPtr(String, String, String),
     GetPtr(String, String, String),
     GetElemPtr(String, String, String),
     Binary(String, String, String, String),
     Br(String, Label, Label),
     Jump(Label),
-    ArgJump(Label, String),                    // jump %bb(%arg)
-    Call(String, String, String),              // %dest = call @func(%arg)
-    VoidCall(String, String),                  // call @func(%arg)
+    ArgJump(Label, String),       // jump %bb(%arg)
+    Call(String, String, String), // %dest = call @func(%arg)
+    VoidCall(String, String),     // call @func(%arg)
     Ret(String),
     VoidRet,
 }
@@ -131,13 +132,24 @@ impl KoopaLine {
                 format!("\n{}({}: {}):", label, arg_name, arg_type.display_wrapped())
             }
             KoopaLine::GlobalAlloc(name, ty, init) => {
-                format!("global {} = alloc {}, {}\n", name, ty.display_wrapped(), init)
+                format!(
+                    "global {} = alloc {}, {}\n",
+                    name,
+                    ty.display_wrapped(),
+                    init
+                )
             }
             KoopaLine::Alloc(ptr_name, ptr_type) => {
                 format!("\t{} = alloc {}", ptr_name, ptr_type.display_wrapped())
             }
+            KoopaLine::HeapAlloc(ptr_name, ptr_type) => {
+                format!("\t{} = new {}", ptr_name, ptr_type.display_wrapped())
+            }
             KoopaLine::Store(value, ptr) => format!("\tstore {}, {}", value, ptr),
             KoopaLine::Load(dest, ptr) => format!("\t{} = load {}", dest, ptr),
+            KoopaLine::StructFieldPtr(dest, ptr, field) => {
+                format!("\t{} = structfieldptr {}, {}", dest, ptr, field)
+            }
             KoopaLine::GetPtr(dest, ptr, idx) => format!("\t{} = getptr {}, {}", dest, ptr, idx),
             KoopaLine::GetElemPtr(dest, ptr, idx) => {
                 format!("\t{} = getelemptr {}, {}", dest, ptr, idx)
@@ -176,7 +188,10 @@ impl KoopaLines {
         if let Some(last_line) = self.lines.last() {
             matches!(
                 last_line,
-                KoopaLine::Ret(_) | KoopaLine::VoidRet | KoopaLine::Jump(_) | KoopaLine::Br(_, _, _)
+                KoopaLine::Ret(_)
+                    | KoopaLine::VoidRet
+                    | KoopaLine::Jump(_)
+                    | KoopaLine::Br(_, _, _)
             )
         } else {
             false

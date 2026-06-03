@@ -53,9 +53,9 @@ pub enum Stmt {
 }
 
 #[derive(Debug, Clone)]
-pub enum VarDecl{
+pub enum VarDecl {
     Ident(String),
-    Array(Box<VarDecl>, Exp)
+    Array(Box<VarDecl>, Exp),
 }
 
 #[derive(Debug, Clone)]
@@ -67,7 +67,7 @@ pub struct SingleDecl {
 #[derive(Debug, Clone)]
 pub enum InitVal {
     Exp(Exp),
-    Arr(Vec<InitVal>)
+    Arr(Vec<InitVal>),
 }
 
 #[derive(Debug, Clone)]
@@ -140,7 +140,11 @@ where
             })
         }
         Exp::Ident(name) => lookup(name),
-        Exp::New(_) | Exp::FuncCall(_, _) | Exp::ArrGet(_, _) | Exp::Field(_, _) | Exp::PtrField(_, _) => None,
+        Exp::New(_)
+        | Exp::FuncCall(_, _)
+        | Exp::ArrGet(_, _)
+        | Exp::Field(_, _)
+        | Exp::PtrField(_, _) => None,
     }
 }
 
@@ -150,7 +154,10 @@ where
 {
     let value = eval_const_exp_with(exp, lookup)
         .expect("Array parameter dimensions must be constant expressions");
-    assert!(value >= 0, "Array parameter dimensions must be non-negative");
+    assert!(
+        value >= 0,
+        "Array parameter dimensions must be non-negative"
+    );
     value as usize
 }
 

@@ -1,21 +1,63 @@
 // lalrpop 里的约定
 grammar;
 use compile_sysy::lalr::*;
+use compile_sysy::lexer::{LexError, Tok};
 
-match {
-  r"\s*" => {},
-  r"//[^\n\r]*[\n\r]*" => {},
-  r"/\*([^*]|\*[^/])*\*/" => {},
-  _
+extern {
+  type Location = usize;
+  type Error = LexError;
+  enum Tok {
+    "Ident" => Tok::Ident(<String>),
+    "TypeIdent" => Tok::TypeIdent(<String>),
+    "IntConst" => Tok::IntConst(<i32>),
+    "int" => Tok::Int,
+    "void" => Tok::Void,
+    "const" => Tok::Const,
+    "struct" => Tok::Struct,
+    "if" => Tok::If,
+    "else" => Tok::Else,
+    "while" => Tok::While,
+    "continue" => Tok::Continue,
+    "break" => Tok::Break,
+    "return" => Tok::Return,
+    "new" => Tok::New,
+    "+" => Tok::Plus,
+    "-" => Tok::Minus,
+    "*" => Tok::Star,
+    "/" => Tok::Slash,
+    "%" => Tok::Percent,
+    "!" => Tok::Bang,
+    "&" => Tok::Amp,
+    "&&" => Tok::AmpAmp,
+    "||" => Tok::PipePipe,
+    "=" => Tok::Assign,
+    "==" => Tok::EqEq,
+    "!=" => Tok::Ne,
+    "<" => Tok::Lt,
+    "<=" => Tok::Le,
+    ">" => Tok::Gt,
+    ">=" => Tok::Ge,
+    "(" => Tok::LParen,
+    ")" => Tok::RParen,
+    "{" => Tok::LBrace,
+    "}" => Tok::RBrace,
+    "[" => Tok::LBracket,
+    "]" => Tok::RBracket,
+    "," => Tok::Comma,
+    ";" => Tok::Semicolon,
+    "." => Tok::Dot,
+    "->" => Tok::Arrow,
+  }
 }
 
-Ident: String = r"[_a-zA-Z][_a-zA-Z0-9]*" => <>.to_string();
-
-IntConst: i32 = {
-  r"[1-9][0-9]*" => i32::from_str_radix(<>, 10).unwrap(),
-  r"0[0-7]*" => i32::from_str_radix(<>, 8).unwrap(),
-  r"0[xX][0-9a-fA-F]+" => i32::from_str_radix(&<>[2..], 16).unwrap(),
+Ident: String = "Ident" => <>;
+TypeIdent: String = "TypeIdent" => <>;
+StructName: String = {
+  <Ident> => <>,
+  <TypeIdent> => <>,
 }
+
+IntConst: i32 = "IntConst" => <>;
 
 pub CompUnit: CompUnit = {
   <glob_def: GlobleDef> => CompUnit { glob_defs: vec![<>] },
@@ -33,7 +75,8 @@ GlobleDef: GlobleDef = {
 }
 
 StructDef: StructDef = {
-  "struct" <name: Ident> "{" <fields: StructFields> "}" ";" => StructDef { name, fields },
+  "struct" <name: StructName> "{" <fields: StructFields> "}" ";" => StructDef { name, fields },
+  <name: Ident> "{" <fields: StructFields> "}" ";" => StructDef { name, fields },
 }
 
 StructFields: Vec<StructField> = {
@@ -175,7 +218,8 @@ BType: BType = {
 BTypeBase: BType = {
   "int" => BType::I32,
   "void" => BType::Void,
-  "struct" <ident: Ident> => BType::Struct(ident),
+  "struct" <ident: StructName> => BType::Struct(ident),
+  <ident: TypeIdent> => BType::Struct(ident),
 }
 
 Type: Type = {

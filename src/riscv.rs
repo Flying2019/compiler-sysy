@@ -242,7 +242,9 @@ impl Into<AsmValue> for RegLocation {
         match self {
             RegLocation::Reg(reg) => AsmValue::Reg(reg),
             RegLocation::Stack(offset) => AsmValue::Offset((offset * 4) as i32, RegName::Stack),
-            RegLocation::ParamStack(offset) => AsmValue::Offset((offset * 4) as i32, RegName::TempS(0)),
+            RegLocation::ParamStack(offset) => {
+                AsmValue::Offset((offset * 4) as i32, RegName::TempS(0))
+            }
         }
     }
 }
@@ -359,7 +361,9 @@ impl RegAddress {
         match self.location.clone() {
             RegLocation::Reg(reg) => reg,
             RegLocation::Stack(_) => panic!("Cannot convert stack location to register name"),
-            RegLocation::ParamStack(_) => panic!("Cannot convert param stack location to register name"),
+            RegLocation::ParamStack(_) => {
+                panic!("Cannot convert param stack location to register name")
+            }
         }
     }
 }

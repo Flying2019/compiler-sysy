@@ -35,6 +35,15 @@ fn default_ret_value(ty: &KoopaType) -> Option<&'static str> {
     }
 }
 
+fn value_size(ty: &KoopaType, bg: &Background) -> usize {
+    match ty {
+        KoopaType::I32 | KoopaType::Ptr(_) => 4,
+        KoopaType::Void => 0,
+        KoopaType::Struct(name) => bg.get_struct_layout(name).size,
+        KoopaType::Array(inner, len) => value_size(inner, bg) * len,
+    }
+}
+
 fn field_storage_name(obj: &str, field_name: &str) -> String {
     let prefix = if obj.starts_with('%') { "%" } else { "@" };
     let mut base = String::new();
@@ -57,6 +66,7 @@ enum ValueInfo {
     StructBase(StructBaseInfo),
     FieldStorage {
         field_ty: ValueType,
+        stored_symbol: Option<String>,
     },
     PointerStorage {
         stored_symbol: Option<String>,
@@ -121,12 +131,24 @@ impl<'a> LowerState<'a> {
                     field_storage_name(name, &field.name),
                     lower_type(&field.ty.to_koopa_type(self.bg), self.bg)
                 ));
+                self.values.insert(
+                    field_storage_name(name, &field.name),
+                    ValueInfo::FieldStorage {
+                        field_ty: field.ty.clone(),
+                        stored_symbol: None,
+                    },
+                );
             }
         }
         lines
     }
 
-    fn lower_struct_global_alloc(&mut self, name: &str, struct_name: &str, init: &str) -> Vec<String> {
+    fn lower_struct_global_alloc(
+        &mut self,
+        name: &str,
+        struct_name: &str,
+        init: &str,
+    ) -> Vec<String> {
         let mut lines = vec![format!(
             "global {} = alloc {}, {}\n",
             name,
@@ -147,6 +169,47 @@ impl<'a> LowerState<'a> {
                     field_storage_name(name, &field.name),
                     lower_type(&field.ty.to_koopa_type(self.bg), self.bg)
                 ));
+                self.values.insert(
+                    field_storage_name(name, &field.name),
+                    ValueInfo::FieldStorage {
+                        field_ty: field.ty.clone(),
+                        stored_symbol: None,
+                    },
+                );
+            }
+        }
+        lines
+    }
+
+    fn lower_heap_alloc(&mut self, name: &str, ty: &KoopaType) -> Vec<String> {
+        let mut lines = vec![format!(
+            "\t{} = call @malloc({})",
+            name,
+            value_size(ty, self.bg)
+        )];
+        if let KoopaType::Struct(struct_name) = ty {
+            self.values.insert(
+                name.to_string(),
+                ValueInfo::StructBase(StructBaseInfo {
+                    struct_name: struct_name.to_string(),
+                    object_symbol: Some(name.to_string()),
+                }),
+            );
+            for field in &self.bg.get_struct_layout(struct_name).fields {
+                if matches!(field.ty, ValueType::Pointer(_)) {
+                    lines.push(format!(
+                        "\t{} = alloc {}",
+                        field_storage_name(name, &field.name),
+                        lower_type(&field.ty.to_koopa_type(self.bg), self.bg)
+                    ));
+                    self.values.insert(
+                        field_storage_name(name, &field.name),
+                        ValueInfo::FieldStorage {
+                            field_ty: field.ty.clone(),
+                            stored_symbol: None,
+                        },
+                    );
+                }
             }
         }
         lines
@@ -240,8 +303,13 @@ impl<'a> LowerState<'a> {
                     lower_type(&KoopaType::Ptr(inner.clone()), self.bg)
                 )])
             }
-            KoopaLine::Alloc(ptr_name, ptr_type) => {
-                Ok(vec![format!("\t{} = alloc {}", ptr_name, lower_type(ptr_type, self.bg))])
+            KoopaLine::Alloc(ptr_name, ptr_type) => Ok(vec![format!(
+                "\t{} = alloc {}",
+                ptr_name,
+                lower_type(ptr_type, self.bg)
+            )]),
+            KoopaLine::HeapAlloc(ptr_name, ptr_type) => {
+                Ok(self.lower_heap_alloc(ptr_name, ptr_type))
             }
             KoopaLine::Store(value, ptr) => {
                 let value = self.resolve_symbol(value);
@@ -254,35 +322,111 @@ impl<'a> LowerState<'a> {
                         },
                     );
                 }
+                if let Some(ValueInfo::FieldStorage { field_ty, .. }) =
+                    self.values.get(&ptr).cloned()
+                {
+                    self.values.insert(
+                        ptr.clone(),
+                        ValueInfo::FieldStorage {
+                            field_ty,
+                            stored_symbol: Some(value.clone()),
+                        },
+                    );
+                }
                 Ok(vec![format!("\tstore {}, {}", value, ptr)])
             }
             KoopaLine::Load(dest, ptr) => {
                 let ptr = self.resolve_symbol(ptr);
-                if let Some(ValueInfo::PointerStorage { stored_symbol: Some(symbol) }) = self.value_info(&ptr) {
+                if let Some(ValueInfo::PointerStorage {
+                    stored_symbol: Some(symbol),
+                }) = self.value_info(&ptr)
+                {
                     if let Some(ValueInfo::StructBase(info)) = self.value_info(&symbol) {
-                        self.values.insert(dest.clone(), ValueInfo::StructBase(info));
+                        self.values
+                            .insert(dest.clone(), ValueInfo::StructBase(info));
                     }
                 }
-                if let Some(ValueInfo::FieldStorage { field_ty, .. }) = self.value_info(&ptr) {
+                if let Some(ValueInfo::FieldStorage {
+                    field_ty,
+                    stored_symbol,
+                }) = self.value_info(&ptr)
+                {
+                    if let Some(symbol) = stored_symbol {
+                        if let Some(ValueInfo::StructBase(info)) = self.value_info(&symbol) {
+                            self.values
+                                .insert(dest.clone(), ValueInfo::StructBase(info));
+                        }
+                    }
                     if let ValueType::Pointer(inner) = field_ty {
                         if let ValueType::Struct(struct_name) = *inner {
-                            self.values.insert(
-                                dest.clone(),
+                            self.values.entry(dest.clone()).or_insert_with(|| {
                                 ValueInfo::StructBase(StructBaseInfo {
                                     struct_name,
                                     object_symbol: None,
-                                }),
-                            );
+                                })
+                            });
                         }
                     }
                 }
                 Ok(vec![format!("\t{} = load {}", dest, ptr)])
             }
+            KoopaLine::StructFieldPtr(dest, ptr, field_name) => {
+                let ptr = self.resolve_symbol(ptr);
+                if let Some(ValueInfo::StructBase(info)) = self.value_info(&ptr) {
+                    let field = self
+                        .bg
+                        .get_struct_layout(&info.struct_name)
+                        .fields
+                        .iter()
+                        .find(|field| field.name == *field_name)
+                        .ok_or_else(|| {
+                            format!(
+                                "struct {} has no field named {}",
+                                info.struct_name, field_name
+                            )
+                        })?;
+                    if matches!(field.ty, ValueType::Pointer(_)) {
+                        if let Some(owner) = info.object_symbol {
+                            let storage = field_storage_name(&owner, field_name);
+                            self.values
+                                .insert(dest.clone(), ValueInfo::Alias(storage.clone()));
+                            self.values
+                                .entry(storage)
+                                .or_insert_with(|| ValueInfo::FieldStorage {
+                                    field_ty: field.ty.clone(),
+                                    stored_symbol: None,
+                                });
+                            return Ok(Vec::new());
+                        }
+                        return Err(format!(
+                            "unsupported lowering: pointer field access on non-materialized struct pointer {}",
+                            ptr
+                        ));
+                    }
+
+                    let slot = field.offset / 4;
+                    if let ValueType::Struct(inner_struct) = &field.ty {
+                        self.values.insert(
+                            dest.clone(),
+                            ValueInfo::StructBase(StructBaseInfo {
+                                struct_name: inner_struct.clone(),
+                                object_symbol: None,
+                            }),
+                        );
+                    }
+                    return Ok(vec![format!("\t{} = getptr {}, {}", dest, ptr, slot)]);
+                }
+                Err(format!(
+                    "unsupported lowering: field access on unknown struct base {}",
+                    ptr
+                ))
+            }
             KoopaLine::GetElemPtr(dest, ptr, idx) => {
                 let ptr = self.resolve_symbol(ptr);
                 if idx == "0" {
                     if let Some(ValueInfo::StructBase(info)) = self.value_info(&ptr) {
-                        self.values.insert(dest.clone(), ValueInfo::StructBase(info));
+                        self.values
+                            .insert(dest.clone(), ValueInfo::StructBase(info));
                     }
                 }
                 Ok(vec![format!("\t{} = getelemptr {}, {}", dest, ptr, idx)])
@@ -293,7 +437,9 @@ impl<'a> LowerState<'a> {
                     return Ok(vec![format!("\t{} = getptr {}, {}", dest, ptr, idx)]);
                 };
                 if let Some(ValueInfo::StructBase(info)) = self.value_info(&ptr) {
-                    if let Some((field_name, field_ty)) = self.field_at_slot(&info.struct_name, slot) {
+                    if let Some((field_name, field_ty)) =
+                        self.field_at_slot(&info.struct_name, slot)
+                    {
                         if matches!(field_ty, ValueType::Pointer(_)) {
                             if let Some(owner) = info.object_symbol {
                                 let storage = field_storage_name(&owner, &field_name);
@@ -302,6 +448,7 @@ impl<'a> LowerState<'a> {
                                     field_storage_name(&owner, &field_name),
                                     ValueInfo::FieldStorage {
                                         field_ty,
+                                        stored_symbol: None,
                                     },
                                 );
                                 return Ok(Vec::new());
@@ -338,7 +485,9 @@ impl<'a> LowerState<'a> {
                 let arg = self.resolve_symbol(arg);
                 Ok(vec![format!("\tjump {}({})", target, arg)])
             }
-            KoopaLine::Call(dest, func, arg) => Ok(vec![format!("\t{} = call @{}({})", dest, func, arg)]),
+            KoopaLine::Call(dest, func, arg) => {
+                Ok(vec![format!("\t{} = call @{}({})", dest, func, arg)])
+            }
             KoopaLine::VoidCall(func, arg) => Ok(vec![format!("\tcall @{}({})", func, arg)]),
             KoopaLine::Ret(value) => {
                 let value = self.resolve_symbol(value);
@@ -359,6 +508,18 @@ impl<'a> LowerState<'a> {
 pub fn lower_lines(lines: &KoopaLines, bg: &Background) -> String {
     let mut state = LowerState::new(bg);
     let mut lowered = Vec::new();
+    let needs_malloc = lines
+        .lines()
+        .iter()
+        .any(|line| matches!(line, KoopaLine::HeapAlloc(_, _)));
+    if needs_malloc
+        && !lines
+            .lines()
+            .iter()
+            .any(|line| matches!(line, KoopaLine::FuncDecl(name, _, _) if name == "malloc"))
+    {
+        lowered.push("decl @malloc(i32): *i32".to_string());
+    }
     for line in lines.lines() {
         match state.lower_line(line) {
             Ok(mut chunk) => lowered.append(&mut chunk),

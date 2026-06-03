@@ -181,7 +181,8 @@ impl AsmContext {
             self.param_value
                 .insert(value, RegLocation::Reg(RegName::Param(id as usize)));
         } else {
-            self.param_value.insert(value, RegLocation::ParamStack((id - 8) as usize));
+            self.param_value
+                .insert(value, RegLocation::ParamStack((id - 8) as usize));
         }
     }
 
@@ -255,7 +256,10 @@ pub fn program_to_asm(progrma: &Program, bg: &Background) -> Asm {
 fn alloc_size_words(value: &ValueData) -> usize {
     match value.ty().kind() {
         TypeKind::Pointer(base) => base.size() / 4,
-        _ => panic!("alloc/globalalloc should have pointer type, found {:?}", value.ty()),
+        _ => panic!(
+            "alloc/globalalloc should have pointer type, found {:?}",
+            value.ty()
+        ),
     }
 }
 
@@ -405,9 +409,7 @@ impl FunctionFrame {
 
     fn fp_to_addr(&self) -> AsmValue {
         assert!(self.save_fp);
-        self.stack_slot_to_addr(
-            self.arg_words + self.caller_save_words + usize::from(self.save_ra),
-        )
+        self.stack_slot_to_addr(self.arg_words + self.caller_save_words + usize::from(self.save_ra))
     }
 }
 
@@ -417,7 +419,13 @@ fn fits_imm12(value: i32) -> bool {
 }
 
 /// If the offset is outside the 12-bit signed immediate, use Li to extend.
-fn emit_offset_addr_to_reg(asm: &mut Asm, dest: RegName, base: RegName, offset: i32, scratch: RegName) {
+fn emit_offset_addr_to_reg(
+    asm: &mut Asm,
+    dest: RegName,
+    base: RegName,
+    offset: i32,
+    scratch: RegName,
+) {
     if fits_imm12(offset) {
         asm.add_line(AsmLine::Addi(dest, base, offset));
     } else {
@@ -441,13 +449,7 @@ fn emit_load_from_offset(
     }
 }
 
-fn emit_store_to_offset(
-    asm: &mut Asm,
-    base: RegName,
-    offset: i32,
-    src: RegName,
-    scratch: RegName,
-) {
+fn emit_store_to_offset(asm: &mut Asm, base: RegName, offset: i32, src: RegName, scratch: RegName) {
     if fits_imm12(offset) {
         asm.add_line(AsmLine::Store(AsmValue::Offset(offset, base), src));
     } else {
@@ -470,15 +472,11 @@ fn write_reg_to_location(
         RegLocation::Stack(slot) => {
             let (offset, base) = bg.frame().spill_slot_to_addr(slot).expect_offset();
             let scratch = bg.ra().register_temp();
-            emit_store_to_offset(
-                context.asm_mut(),
-                base,
-                offset,
-                src,
-                scratch.get_reg_name(),
-            );
+            emit_store_to_offset(context.asm_mut(), base, offset, src, scratch.get_reg_name());
         }
-        RegLocation::ParamStack(_) => unreachable!("SSA temporaries should not be stored in param stack slots"),
+        RegLocation::ParamStack(_) => {
+            unreachable!("SSA temporaries should not be stored in param stack slots")
+        }
     }
 }
 
@@ -620,7 +618,12 @@ fn mark_temp_used_by(value: Value, user: Value, context: &mut AsmContext) {
 }
 
 /// Load an operand into a register, returning the register and the temporary values it holds (if any).
-fn load_operand_temp(src: Value, user: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+fn load_operand_temp(
+    src: Value,
+    user: Value,
+    bg: &Background,
+    context: &mut AsmContext,
+) -> RegAddress {
     // Scratch budget: 2 temporary registers.
     // Integer immediates take 1, non-immediates defer to load_temp_reg.
     match bg.get_value(src).kind() {
@@ -633,7 +636,12 @@ fn load_operand_temp(src: Value, user: Value, bg: &Background, context: &mut Asm
     }
 }
 
-fn emit_ptr_value(ptr: Value, user: Value, bg: &Background, context: &mut AsmContext) -> RegAddress {
+fn emit_ptr_value(
+    ptr: Value,
+    user: Value,
+    bg: &Background,
+    context: &mut AsmContext,
+) -> RegAddress {
     // Scratch budget: 2 temporary registers.
     // Loading a local alloc address may need one returned register plus one offset scratch.
     if let Some(value_data) = bg.get_glob(ptr) {
@@ -702,7 +710,9 @@ fn load_to_asm(value: Value, src: Value, bg: &Background, context: &mut AsmConte
             context.asm_add_line(AsmLine::Load(temp_reg.get_reg_name(), temp_src));
             write_reg_to_location(&dest, temp_reg.get_reg_name(), bg, context);
         }
-        RegLocation::ParamStack(_) => unreachable!("register allocator does not assign param stack slots"),
+        RegLocation::ParamStack(_) => {
+            unreachable!("register allocator does not assign param stack slots")
+        }
     }
     dest
 }
@@ -729,7 +739,9 @@ fn ptr_offset_to_asm(
     let result_reg = match dest.location.clone() {
         RegLocation::Reg(reg) => reg,
         RegLocation::Stack(_) => base_ptr.get_reg_name(),
-        RegLocation::ParamStack(_) => unreachable!("register allocator does not assign param stack slots"),
+        RegLocation::ParamStack(_) => {
+            unreachable!("register allocator does not assign param stack slots")
+        }
     };
     let scale_reg = bg.ra().register_temp();
     let step = pointer_step_size(value, bg);
@@ -761,7 +773,9 @@ fn binary_to_asm(
     let result_reg = match dest.location {
         RegLocation::Reg(ref reg) => reg.clone(),
         RegLocation::Stack(_) => lhs.get_reg_name(),
-        RegLocation::ParamStack(_) => unreachable!("register allocator does not assign param stack slots"),
+        RegLocation::ParamStack(_) => {
+            unreachable!("register allocator does not assign param stack slots")
+        }
     };
 
     match binary.op() {
@@ -885,7 +899,9 @@ fn load_block_param(param: Value, bg: &Background, context: &mut AsmContext) -> 
             );
             write_reg_to_location(&dest, temp_reg, bg, context);
         }
-        RegLocation::ParamStack(_) => unreachable!("register allocator does not assign param stack slots"),
+        RegLocation::ParamStack(_) => {
+            unreachable!("register allocator does not assign param stack slots")
+        }
     }
     dest
 }
@@ -944,7 +960,11 @@ fn store_block_args(
     block_args
 }
 
-fn release_block_args(block_args: Vec<Value>, user: Value, context: &mut AsmContext) -> Vec<RegAddress> {
+fn release_block_args(
+    block_args: Vec<Value>,
+    user: Value,
+    context: &mut AsmContext,
+) -> Vec<RegAddress> {
     let mut released = Vec::new();
     let mut seen = HashSet::new();
     for arg in block_args {
@@ -1036,7 +1056,13 @@ fn function_to_asm(func: &FunctionData, bg: &Background, context: &mut AsmContex
         if frame.save_ra {
             // Save ra if needed
             let (offset, base) = frame.ra_to_addr().expect_offset();
-            emit_store_to_offset(&mut result, base.clone(), offset, RegName::Ra, RegName::TempT(0));
+            emit_store_to_offset(
+                &mut result,
+                base.clone(),
+                offset,
+                RegName::Ra,
+                RegName::TempT(0),
+            );
             emit_load_from_offset(
                 &mut replacement,
                 RegName::Ra,
@@ -1053,10 +1079,9 @@ fn function_to_asm(func: &FunctionData, bg: &Background, context: &mut AsmContex
             RegName::TempT(0),
         );
         replacement.add_line(AsmLine::Ret);
-        context.asm_mut().convert_placehold(
-            "return".to_string(),
-            replacement.content,
-        );
+        context
+            .asm_mut()
+            .convert_placehold("return".to_string(), replacement.content);
         result.add_asm(context.asm_mut().clone());
     } else {
         context
@@ -1091,10 +1116,20 @@ fn inst_to_asm(value: Value, bg: &Background, context: &mut AsmContext) -> Optio
             None
         }
         ValueKind::Load(load) => Some(load_to_asm(value, load.src(), bg, context)),
-        ValueKind::GetPtr(ptr) => Some(ptr_offset_to_asm(value, ptr.src(), ptr.index(), bg, context)),
-        ValueKind::GetElemPtr(ptr) => {
-            Some(ptr_offset_to_asm(value, ptr.src(), ptr.index(), bg, context))
-        }
+        ValueKind::GetPtr(ptr) => Some(ptr_offset_to_asm(
+            value,
+            ptr.src(),
+            ptr.index(),
+            bg,
+            context,
+        )),
+        ValueKind::GetElemPtr(ptr) => Some(ptr_offset_to_asm(
+            value,
+            ptr.src(),
+            ptr.index(),
+            bg,
+            context,
+        )),
         ValueKind::Integer(_) => {
             panic!("Integer value should not be directly used as an instruction");
         }
