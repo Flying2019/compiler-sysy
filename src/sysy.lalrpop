@@ -21,6 +21,12 @@ extern {
     "break" => Tok::Break,
     "return" => Tok::Return,
     "new" => Tok::New,
+    "async" => Tok::Async,
+    "await" => Tok::Await,
+    "Promise" => Tok::Promise,
+    "sleep" => Tok::Sleep,
+    "addSyncFunc" => Tok::AddSyncFunc,
+    "wait" => Tok::Wait,
     "+" => Tok::Plus,
     "-" => Tok::Minus,
     "*" => Tok::Star,
@@ -93,7 +99,8 @@ StructField: StructField = {
 }
 
 FuncDef: FuncDef = {
-  <func_type: Type> <ident: Ident> "(" <func_params: FuncParams> ")" <block: Block> => FuncDef { <> }
+  <func_type: Type> <ident: Ident> "(" <func_params: FuncParams> ")" <block: Block> => FuncDef { is_async: false, func_type, ident, func_params, block },
+  "async" <func_type: Type> <ident: Ident> "(" <func_params: FuncParams> ")" <block: Block> => FuncDef { is_async: true, func_type, ident, func_params, block },
 }
 
 FuncParams: Vec<FuncParam> = {
@@ -159,6 +166,8 @@ NonIfStmt: Stmt = {
   "while" "(" <exp: Exp> ")" <stmt: NonIfStmt> => Stmt::While(exp, Box::new(stmt)),
   "continue" ";" => Stmt::Continue,
   "break" ";" => Stmt::Break,
+  "addSyncFunc" "(" <exp: Exp> ")" ";" => Stmt::AddSyncFunc(exp),
+  "wait" "(" ")" ";" => Stmt::Wait,
   <Block> => Stmt::Block(<>),
   <ArrayExp> "=" <Exp> ";" => Stmt::Assign(<>),
   "return" <Exp> ";" => Stmt::Return(Some(<>)),
@@ -219,6 +228,7 @@ BTypeBase: BType = {
   "int" => BType::I32,
   "void" => BType::Void,
   "struct" <ident: StructName> => BType::Struct(ident),
+  "Promise" "<" <inner: BType> ">" => BType::Promise(Box::new(inner)),
   <ident: TypeIdent> => BType::Struct(ident),
 }
 
@@ -240,6 +250,8 @@ ArrayExp: Exp = {
 
 PrimaryExp: Exp = {
   "new" <ty: BTypeBase> => Exp::New(ty),
+  "await" <exp: UnaryExp> => Exp::Await(Box::new(exp)),
+  "sleep" "(" <duration: Exp> ")" => Exp::Sleep(Box::new(duration)),
   <ArrayExp> => <>,
   <ident: Ident> "(" ")" => Exp::FuncCall(ident, Vec::new()),
   <Ident> "(" <FuncArgs> ")" => Exp::FuncCall(<>),

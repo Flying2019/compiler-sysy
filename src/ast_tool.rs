@@ -32,6 +32,9 @@ impl ValueType {
         match btype {
             BType::I32 => ValueType::Int,
             BType::Struct(name) => ValueType::Struct(name.clone()),
+            // Compatibility async lowering treats Promise<T> as a synchronous T value.
+            // The real Promise frame lowering will replace this once the async runtime lands.
+            BType::Promise(inner) => ValueType::from_btype(inner),
             BType::Ptr(inner) => ValueType::Pointer(Box::new(ValueType::from_btype(inner))),
             BType::Array(len, inner) => {
                 ValueType::Array(*len, Box::new(ValueType::from_btype(inner)))

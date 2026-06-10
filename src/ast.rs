@@ -137,6 +137,8 @@ fn infer_exp_type(exp: &Exp, bg: &Background) -> ValueType {
         Exp::UnaryExp(_, inner) => infer_exp_type(inner, bg),
         Exp::BinaryExp(_, _, _) => ValueType::Int,
         Exp::New(ty) => ValueType::Pointer(Box::new(ValueType::from_btype(ty))),
+        Exp::Await(inner) => infer_exp_type(inner, bg),
+        Exp::Sleep(_) => ValueType::Int,
         Exp::FuncCall(name, _) => match bg.get_function(name.clone()).cloned().unwrap().0 {
             Type::BType(b) | Type::Const(b) => ValueType::from_btype(&b),
         },
@@ -643,6 +645,8 @@ impl BType {
             }
             BType::Ptr(b) => KoopaType::ptr(b.to_koopa_type(bg)),
             BType::Array(len, b) => KoopaType::array(b.to_koopa_type(bg), *len),
+            // Compatibility async lowering represents Promise<T> as T.
+            BType::Promise(inner) => inner.to_koopa_type(bg),
         }
     }
 }
@@ -811,6 +815,8 @@ impl AstNode for Stmt {
             },
             Stmt::Break => KoopaLines::with_line(KoopaLine::Jump(bg.get_loop_next().unwrap())),
             Stmt::Continue => KoopaLines::with_line(KoopaLine::Jump(bg.get_loop_entry().unwrap())),
+            Stmt::AddSyncFunc(exp) => exp.to_koopa(bg).content,
+            Stmt::Wait => KoopaLines::new(),
             Stmt::If(_, _) | Stmt::IfElse(_, _, _) | Stmt::While(_, _) => {
                 // These methods require a closed basic block.
                 let mut ir = KoopaLines::new();
@@ -943,6 +949,16 @@ impl AstNode for Exp {
                     ValueType::from_btype(ty).to_koopa_type(bg),
                 ));
                 ReturnValue::new(Some(ptr), content)
+            }
+            Exp::Await(exp) => exp.to_koopa(bg),
+            Exp::Sleep(duration) => {
+                let content = duration.to_koopa(bg).content;
+                // Compatibility async lowering has no real clock yet; sleep is a no-op value.
+                ReturnValue::new(Some("0".to_string()), {
+                    let mut lines = KoopaLines::new();
+                    lines.add_lines(content);
+                    lines
+                })
             }
             Exp::Ident(name) => {
                 if let Some(const_value) = bg.try_get_constant(name.clone()) {

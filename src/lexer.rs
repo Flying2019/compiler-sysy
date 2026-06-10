@@ -24,6 +24,12 @@ pub enum Tok {
     Break,
     Return,
     New,
+    Async,
+    Await,
+    Promise,
+    Sleep,
+    AddSyncFunc,
+    Wait,
     Plus,
     Minus,
     Star,
@@ -218,6 +224,12 @@ impl Iterator for Lexer<'_> {
                 "break" => self.token(Tok::Break),
                 "return" => self.token(Tok::Return),
                 "new" => self.token(Tok::New),
+                "async" => self.token(Tok::Async),
+                "await" => self.token(Tok::Await),
+                "Promise" => self.token(Tok::Promise),
+                "sleep" => self.token(Tok::Sleep),
+                "addSyncFunc" => self.token(Tok::AddSyncFunc),
+                "wait" => self.token(Tok::Wait),
                 _ => {
                     if self.expect_struct_name {
                         self.expect_struct_name = false;

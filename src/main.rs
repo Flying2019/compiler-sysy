@@ -53,6 +53,9 @@ fn str_to_ast(input: &str) -> CompUnit {
 }
 
 fn ast_to_koopa_lines(ast: &CompUnit) -> (KoopaLines, Background) {
+    if let Err(err) = ast.validate_async_syntax() {
+        panic!("{}", err);
+    }
     let mut bg = ast_tool::Background::new();
     scan_global_symbol(ast.clone(), &mut bg);
     let lines = ast.to_koopa_lines(&mut bg);
