@@ -25,7 +25,6 @@ extern {
     "await" => Tok::Await,
     "Promise" => Tok::Promise,
     "sleep" => Tok::Sleep,
-    "addSyncFunc" => Tok::AddSyncFunc,
     "wait" => Tok::Wait,
     "+" => Tok::Plus,
     "-" => Tok::Minus,
@@ -166,8 +165,6 @@ NonIfStmt: Stmt = {
   "while" "(" <exp: Exp> ")" <stmt: NonIfStmt> => Stmt::While(exp, Box::new(stmt)),
   "continue" ";" => Stmt::Continue,
   "break" ";" => Stmt::Break,
-  "addSyncFunc" "(" <exp: Exp> ")" ";" => Stmt::AddSyncFunc(exp),
-  "wait" "(" ")" ";" => Stmt::Wait,
   <Block> => Stmt::Block(<>),
   <ArrayExp> "=" <Exp> ";" => Stmt::Assign(<>),
   "return" <Exp> ";" => Stmt::Return(Some(<>)),
@@ -245,6 +242,7 @@ ArrayExp: Exp = {
   <Ident> => Exp::Ident(<>),
   <arr: ArrayExp> "[" <pos: Exp> "]" => Exp::ArrGet(Box::new(arr), Box::new(pos)),
   <arr: ArrayExp> "." <field: Ident> => Exp::Field(Box::new(arr), field),
+  <promise: ArrayExp> "." "wait" "(" ")" => Exp::PromiseWait(Box::new(promise)),
   <arr: ArrayExp> "->" <field: Ident> => Exp::PtrField(Box::new(arr), field),
 }
 

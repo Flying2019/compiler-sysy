@@ -139,6 +139,7 @@ fn infer_exp_type(exp: &Exp, bg: &Background) -> ValueType {
         Exp::New(ty) => ValueType::Pointer(Box::new(ValueType::from_btype(ty))),
         Exp::Await(inner) => infer_exp_type(inner, bg),
         Exp::Sleep(_) => ValueType::Int,
+        Exp::PromiseWait(inner) => infer_exp_type(inner, bg),
         Exp::FuncCall(name, _) => match bg.get_function(name.clone()).cloned().unwrap().0 {
             Type::BType(b) | Type::Const(b) => ValueType::from_btype(&b),
         },
@@ -442,6 +443,21 @@ impl AstNode for CompUnit {
                 lines.add_line(KoopaLine::StructDecl(def.name.clone(), fields));
             }
         }
+        for glob_def in &self.glob_defs {
+            if let GlobleDef::FuncDef(func) = glob_def {
+                if func.is_async {
+                    let promise_name = if func.ident == "main" {
+                        "__sysy_async_main"
+                    } else {
+                        &func.ident
+                    };
+                    lines.add_line(KoopaLine::PromiseDecl(
+                        promise_name.to_string(),
+                        func.func_type.to_koopa_type(bg),
+                    ));
+                }
+            }
+        }
         for func in bg.get_static_functions_decl() {
             let name = func.0;
             let params = func
@@ -454,10 +470,43 @@ impl AstNode for CompUnit {
             lines.add_line(KoopaLine::FuncDecl(name, params, ret.to_koopa_type(bg)));
         }
         for glob_def in &self.glob_defs {
-            lines.add_lines(glob_def.to_koopa_lines(bg));
+            match glob_def {
+                GlobleDef::FuncDef(func) if func.is_async && func.ident == "main" => {
+                    let mut hidden = func.clone();
+                    hidden.ident = "__sysy_async_main".to_string();
+                    lines.add_lines(hidden.to_koopa_lines(bg));
+                    lines.add_lines(async_main_driver_lines(bg, &hidden.func_type));
+                }
+                _ => lines.add_lines(glob_def.to_koopa_lines(bg)),
+            }
         }
         lines
     }
+}
+
+fn async_main_driver_lines(bg: &mut Background, ret_type: &Type) -> KoopaLines {
+    let mut lines = KoopaLines::new();
+    lines.add_line(KoopaLine::FuncStart(
+        "main".to_string(),
+        Vec::new(),
+        KoopaType::I32,
+    ));
+    lines.add_line(KoopaLine::Label("%entry".to_string()));
+    let promise = bg.next_temp();
+    lines.add_line(KoopaLine::AsyncCall(
+        promise.clone(),
+        "__sysy_async_main".to_string(),
+        String::new(),
+    ));
+    lines.add_line(KoopaLine::PromiseWait(promise.clone()));
+    match ret_type {
+        Type::BType(BType::Void) | Type::Const(BType::Void) => {
+            lines.add_line(KoopaLine::Ret("0".to_string()));
+        }
+        _ => lines.add_line(KoopaLine::Ret(promise)),
+    }
+    lines.add_line(KoopaLine::FuncEnd);
+    lines
 }
 
 impl AstNode for GlobleDef {
@@ -588,11 +637,12 @@ impl AstNode for FuncDef {
             .iter()
             .map(|param| param.to_koopa_param(bg))
             .collect::<Vec<_>>();
-        lines.add_line(KoopaLine::FuncStart(
-            self.ident.clone(),
-            params,
-            self.func_type.to_koopa_type(bg),
-        ));
+        let start_line = if self.is_async {
+            KoopaLine::AsyncFuncStart(self.ident.clone(), params, self.func_type.to_koopa_type(bg))
+        } else {
+            KoopaLine::FuncStart(self.ident.clone(), params, self.func_type.to_koopa_type(bg))
+        };
+        lines.add_line(start_line);
         lines.add_line(KoopaLine::Label("%entry".to_string()));
         for param in &self.func_params {
             let ptr_name = bg.new_variable(param.name.clone());
@@ -645,8 +695,7 @@ impl BType {
             }
             BType::Ptr(b) => KoopaType::ptr(b.to_koopa_type(bg)),
             BType::Array(len, b) => KoopaType::array(b.to_koopa_type(bg), *len),
-            // Compatibility async lowering represents Promise<T> as T.
-            BType::Promise(inner) => inner.to_koopa_type(bg),
+            BType::Promise(inner) => KoopaType::Promise(Box::new(inner.to_koopa_type(bg))),
         }
     }
 }
@@ -815,8 +864,12 @@ impl AstNode for Stmt {
             },
             Stmt::Break => KoopaLines::with_line(KoopaLine::Jump(bg.get_loop_next().unwrap())),
             Stmt::Continue => KoopaLines::with_line(KoopaLine::Jump(bg.get_loop_entry().unwrap())),
-            Stmt::AddSyncFunc(exp) => exp.to_koopa(bg).content,
-            Stmt::Wait => KoopaLines::new(),
+            Stmt::PromiseWait(exp) => {
+                let exp_ret = exp.to_koopa(bg);
+                let mut content = exp_ret.content;
+                content.add_line(KoopaLine::PromiseWait(exp_ret.value.unwrap()));
+                content
+            }
             Stmt::If(_, _) | Stmt::IfElse(_, _, _) | Stmt::While(_, _) => {
                 // These methods require a closed basic block.
                 let mut ir = KoopaLines::new();
@@ -950,15 +1003,29 @@ impl AstNode for Exp {
                 ));
                 ReturnValue::new(Some(ptr), content)
             }
-            Exp::Await(exp) => exp.to_koopa(bg),
+            Exp::Await(exp) => {
+                let exp_ret = exp.to_koopa(bg);
+                let promise = exp_ret.value.unwrap();
+                let awaited = bg.next_temp();
+                let callback = format!("__await_cont_{}", awaited.trim_start_matches('%'));
+                let mut content = exp_ret.content;
+                content.add_line(KoopaLine::CallbackWrap(awaited.clone(), promise, callback));
+                ReturnValue::new(Some(awaited), content)
+            }
             Exp::Sleep(duration) => {
-                let content = duration.to_koopa(bg).content;
-                // Compatibility async lowering has no real clock yet; sleep is a no-op value.
-                ReturnValue::new(Some("0".to_string()), {
-                    let mut lines = KoopaLines::new();
-                    lines.add_lines(content);
-                    lines
-                })
+                let duration_ret = duration.to_koopa(bg);
+                let duration = duration_ret.value.unwrap();
+                let promise = bg.next_temp();
+                let mut content = duration_ret.content;
+                content.add_line(KoopaLine::Sleep(promise.clone(), duration));
+                ReturnValue::new(Some(promise), content)
+            }
+            Exp::PromiseWait(exp) => {
+                let exp_ret = exp.to_koopa(bg);
+                let promise = exp_ret.value.unwrap();
+                let mut content = exp_ret.content;
+                content.add_line(KoopaLine::PromiseWait(promise.clone()));
+                ReturnValue::new(Some(promise), content)
             }
             Exp::Ident(name) => {
                 if let Some(const_value) = bg.try_get_constant(name.clone()) {
@@ -1013,7 +1080,15 @@ impl AstNode for Exp {
                         }
                         BType::I32 => {
                             let ret_value = bg.next_temp();
-                            ir.add_line(KoopaLine::Call(ret_value.clone(), name.clone(), args));
+                            if bg.is_async_function(name) {
+                                ir.add_line(KoopaLine::AsyncCall(
+                                    ret_value.clone(),
+                                    name.clone(),
+                                    args,
+                                ));
+                            } else {
+                                ir.add_line(KoopaLine::Call(ret_value.clone(), name.clone(), args));
+                            }
                             ReturnValue {
                                 value: Some(ret_value),
                                 content: ir,

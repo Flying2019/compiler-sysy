@@ -3,10 +3,98 @@ use std::collections::HashMap;
 use crate::ast_tool::{Background, ValueType};
 use crate::koopa::{KoopaLine, KoopaLines, KoopaParam, KoopaType};
 
+fn strip_async_type(ty: &KoopaType) -> KoopaType {
+    match ty {
+        KoopaType::Promise(inner) => strip_async_type(inner),
+        KoopaType::Ptr(inner) => KoopaType::Ptr(Box::new(strip_async_type(inner))),
+        KoopaType::Array(inner, len) => KoopaType::Array(Box::new(strip_async_type(inner)), *len),
+        KoopaType::I32 => KoopaType::I32,
+        KoopaType::Void => KoopaType::Void,
+        KoopaType::Struct(name) => KoopaType::Struct(name.clone()),
+    }
+}
+
+fn strip_async_param(param: &KoopaParam) -> KoopaParam {
+    KoopaParam::new(param.name.clone(), strip_async_type(&param.ty))
+}
+
+pub fn lower_async_sugar_lines(lines: &KoopaLines) -> KoopaLines {
+    let mut lowered = KoopaLines::new();
+    for line in lines.lines() {
+        match line {
+            KoopaLine::PromiseDecl(_, _) => {}
+            KoopaLine::FuncDecl(name, params, ret_ty) => {
+                lowered.add_line(KoopaLine::FuncDecl(
+                    name.clone(),
+                    params.iter().map(strip_async_param).collect(),
+                    strip_async_type(ret_ty),
+                ));
+            }
+            KoopaLine::FuncStart(name, params, ret_ty) => {
+                lowered.add_line(KoopaLine::FuncStart(
+                    name.clone(),
+                    params.iter().map(strip_async_param).collect(),
+                    strip_async_type(ret_ty),
+                ));
+            }
+            KoopaLine::AsyncFuncStart(name, params, ret_ty) => {
+                lowered.add_line(KoopaLine::FuncStart(
+                    name.clone(),
+                    params.iter().map(strip_async_param).collect(),
+                    strip_async_type(ret_ty),
+                ));
+            }
+            KoopaLine::ArgLabel(label, arg_name, arg_type) => {
+                lowered.add_line(KoopaLine::ArgLabel(
+                    label.clone(),
+                    arg_name.clone(),
+                    strip_async_type(arg_type),
+                ));
+            }
+            KoopaLine::GlobalAlloc(name, ty, init) => {
+                lowered.add_line(KoopaLine::GlobalAlloc(
+                    name.clone(),
+                    strip_async_type(ty),
+                    init.clone(),
+                ));
+            }
+            KoopaLine::Alloc(name, ty) => {
+                lowered.add_line(KoopaLine::Alloc(name.clone(), strip_async_type(ty)));
+            }
+            KoopaLine::HeapAlloc(name, ty) => {
+                lowered.add_line(KoopaLine::HeapAlloc(name.clone(), strip_async_type(ty)));
+            }
+            KoopaLine::AsyncCall(dest, func, args) => {
+                lowered.add_line(KoopaLine::Call(dest.clone(), func.clone(), args.clone()));
+            }
+            KoopaLine::CallbackWrap(dest, promise, _) => {
+                lowered.add_line(KoopaLine::Binary(
+                    dest.clone(),
+                    "add".to_string(),
+                    "0".to_string(),
+                    promise.clone(),
+                ));
+            }
+            KoopaLine::Sleep(dest, _) => {
+                lowered.add_line(KoopaLine::Binary(
+                    dest.clone(),
+                    "add".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                ));
+            }
+            KoopaLine::PromiseWait(_) => {}
+            other => lowered.add_line(other.clone()),
+        }
+    }
+    lowered
+}
+
 fn lower_type(ty: &KoopaType, bg: &Background) -> String {
     match ty {
         KoopaType::I32 => "i32".to_string(),
         KoopaType::Void => "void".to_string(),
+        KoopaType::Promise(inner) => lower_type(inner, bg),
         KoopaType::Struct(name) => {
             let slots = bg.get_struct_layout(name).size / 4;
             format!("[i32, {}]", slots)
@@ -31,6 +119,7 @@ fn default_ret_value(ty: &KoopaType) -> Option<&'static str> {
     match ty {
         KoopaType::Void => None,
         KoopaType::I32 | KoopaType::Ptr(_) => Some("0"),
+        KoopaType::Promise(inner) => default_ret_value(inner),
         KoopaType::Struct(_) | KoopaType::Array(_, _) => Some("zeroinit"),
     }
 }
@@ -39,6 +128,7 @@ fn value_size(ty: &KoopaType, bg: &Background) -> usize {
     match ty {
         KoopaType::I32 | KoopaType::Ptr(_) => 4,
         KoopaType::Void => 0,
+        KoopaType::Promise(inner) => value_size(inner, bg),
         KoopaType::Struct(name) => bg.get_struct_layout(name).size,
         KoopaType::Array(inner, len) => value_size(inner, bg) * len,
     }
@@ -217,7 +307,7 @@ impl<'a> LowerState<'a> {
 
     fn lower_line(&mut self, line: &KoopaLine) -> Result<Vec<String>, String> {
         match line {
-            KoopaLine::StructDecl(_, _) => Ok(Vec::new()),
+            KoopaLine::StructDecl(_, _) | KoopaLine::PromiseDecl(_, _) => Ok(Vec::new()),
             KoopaLine::FuncDecl(name, args, ret_type) => {
                 let args = args
                     .iter()
@@ -236,6 +326,24 @@ impl<'a> LowerState<'a> {
                 }
             }
             KoopaLine::FuncStart(name, args, ret_type) => {
+                self.current_ret_type = Some(ret_type.clone());
+                let args = args
+                    .iter()
+                    .map(|p| lower_def_param(p, self.bg))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if matches!(ret_type, KoopaType::Void) {
+                    Ok(vec![format!("fun @{}({}) {{", name, args)])
+                } else {
+                    Ok(vec![format!(
+                        "fun @{}({}): {} {{",
+                        name,
+                        args,
+                        lower_type(ret_type, self.bg)
+                    )])
+                }
+            }
+            KoopaLine::AsyncFuncStart(name, args, ret_type) => {
                 self.current_ret_type = Some(ret_type.clone());
                 let args = args
                     .iter()
@@ -476,6 +584,15 @@ impl<'a> LowerState<'a> {
                 let rhs = self.resolve_symbol(rhs);
                 Ok(vec![format!("\t{} = {} {}, {}", dest, op, lhs, rhs)])
             }
+            KoopaLine::AsyncCall(dest, func, arg) => {
+                Ok(vec![format!("\t{} = call @{}({})", dest, func, arg)])
+            }
+            KoopaLine::CallbackWrap(dest, promise, _) => {
+                let promise = self.resolve_symbol(promise);
+                Ok(vec![format!("\t{} = add 0, {}", dest, promise)])
+            }
+            KoopaLine::Sleep(dest, _duration) => Ok(vec![format!("\t{} = add 0, 0", dest)]),
+            KoopaLine::PromiseWait(_) => Ok(Vec::new()),
             KoopaLine::Br(cond, then_bb, else_bb) => {
                 let cond = self.resolve_symbol(cond);
                 Ok(vec![format!("\tbr {}, {}, {}", cond, then_bb, else_bb)])

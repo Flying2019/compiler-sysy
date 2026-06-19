@@ -171,6 +171,7 @@ struct GlobalSymbols {
     global_variable: HashMap<String, ValueType>,
     global_function: HashMap<String, (Type, Vec<BType>)>, // function name -> (return type, parameter types)
     static_function: HashMap<String, (Type, Vec<BType>)>, // function name -> (return type, parameter types)
+    async_function: HashMap<String, bool>,
 }
 
 impl GlobalSymbols {
@@ -179,6 +180,7 @@ impl GlobalSymbols {
             global_variable: HashMap::new(),
             global_function: HashMap::new(),
             static_function: HashMap::new(),
+            async_function: HashMap::new(),
         }
     }
 }
@@ -307,6 +309,14 @@ impl Background {
         } else {
             self.global_symbols.static_function.get(&name)
         }
+    }
+
+    pub fn is_async_function(&self, name: &str) -> bool {
+        self.global_symbols
+            .async_function
+            .get(name)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub fn get_static_functions_decl(&self) -> Vec<(String, Type, Vec<BType>)> {
@@ -678,6 +688,9 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                 bg.global_symbols
                     .global_function
                     .insert(func_name, (func_def.func_type, params));
+                bg.global_symbols
+                    .async_function
+                    .insert(func_def.ident, func_def.is_async);
             }
             GlobleDef::GlobleDecl(ty, decls) => {
                 for decl in decls {

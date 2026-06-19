@@ -4,6 +4,7 @@ pub type Label = String;
 pub enum KoopaType {
     I32,
     Void,
+    Promise(Box<KoopaType>),
     Struct(String),
     Ptr(Box<KoopaType>),
     Array(Box<KoopaType>, usize),
@@ -22,6 +23,7 @@ impl KoopaType {
         match self {
             KoopaType::I32 => "i32".to_string(),
             KoopaType::Void => "void".to_string(),
+            KoopaType::Promise(inner) => format!("promise<{}>", inner.display_wrapped()),
             KoopaType::Struct(name) => format!("struct @{}", name),
             KoopaType::Ptr(inner) => format!("*{}", inner.display_wrapped()),
             KoopaType::Array(inner, len) => format!("[{}, {}]", inner.display_wrapped(), len),
@@ -68,8 +70,10 @@ impl KoopaField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KoopaLine {
     StructDecl(String, Vec<KoopaField>),
+    PromiseDecl(String, KoopaType),
     FuncDecl(String, Vec<KoopaParam>, KoopaType),
     FuncStart(String, Vec<KoopaParam>, KoopaType),
+    AsyncFuncStart(String, Vec<KoopaParam>, KoopaType),
     FuncEnd,
     Label(Label),
     ArgLabel(Label, Label, KoopaType),      // %br(%a: type)
@@ -82,6 +86,10 @@ pub enum KoopaLine {
     GetPtr(String, String, String),
     GetElemPtr(String, String, String),
     Binary(String, String, String, String),
+    AsyncCall(String, String, String),
+    CallbackWrap(String, String, String),
+    Sleep(String, String),
+    PromiseWait(String),
     Br(String, Label, Label),
     Jump(Label),
     ArgJump(Label, String),       // jump %bb(%arg)
@@ -101,6 +109,14 @@ impl KoopaLine {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("type @{} = {{ {} }}", name, fields)
+            }
+            KoopaLine::PromiseDecl(name, ret_type) => {
+                format!(
+                    "promisetype @{}.promise = {{ result: {}, callback: @{}.callback }}",
+                    name,
+                    ret_type.display_wrapped(),
+                    name
+                )
             }
             KoopaLine::FuncDecl(name, args, ret_type) => {
                 let args = args
@@ -125,6 +141,19 @@ impl KoopaLine {
                 } else {
                     format!("fun @{}({}): {} {{", name, args, ret_type.display_wrapped())
                 }
+            }
+            KoopaLine::AsyncFuncStart(name, args, ret_type) => {
+                let args = args
+                    .iter()
+                    .map(KoopaParam::display_wrapped)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "async fun @{}({}): promise<{}> callback_hole %callback_hole {{",
+                    name,
+                    args,
+                    ret_type.display_wrapped()
+                )
             }
             KoopaLine::FuncEnd => "}\n".to_string(),
             KoopaLine::Label(label) => format!("{}:", label),
@@ -157,6 +186,17 @@ impl KoopaLine {
             KoopaLine::Binary(dest, op, lhs, rhs) => {
                 format!("\t{} = {} {}, {}", dest, op, lhs, rhs)
             }
+            KoopaLine::AsyncCall(dest, func, arg) => {
+                format!("\t{} = asyncnew @{}({})", dest, func, arg)
+            }
+            KoopaLine::CallbackWrap(dest, promise, callback) => {
+                format!(
+                    "\t@{} = callback.wrap {} -> {}\n\tcallback.hole.fill %callback_hole, @{}",
+                    callback, promise, dest, callback
+                )
+            }
+            KoopaLine::Sleep(dest, duration) => format!("\t{} = sleep {}", dest, duration),
+            KoopaLine::PromiseWait(promise) => format!("\tpromise.wait {} stateful", promise),
             KoopaLine::Br(cond, then_bb, else_bb) => {
                 format!("\tbr {}, {}, {}", cond, then_bb, else_bb)
             }

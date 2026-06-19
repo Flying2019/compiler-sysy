@@ -50,11 +50,17 @@ impl Asm {
     }
 
     pub fn to_string(&self) -> String {
-        self.content
+        let rendered = self
+            .content
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        if rendered.is_empty() {
+            rendered
+        } else {
+            format!("{}\n", rendered)
+        }
     }
 }
 

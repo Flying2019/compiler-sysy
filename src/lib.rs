@@ -6,4 +6,5 @@ pub mod koopa;
 pub mod lalr;
 pub mod lexer;
 pub mod lower;
+pub mod llvm_ir;
 pub mod riscv;
