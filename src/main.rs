@@ -5,7 +5,7 @@ use compile_sysy::ast_tool::{scan_global_symbol, Background};
 use compile_sysy::koopa::KoopaLines;
 use compile_sysy::lalr::CompUnit;
 use compile_sysy::lexer::Lexer;
-use compile_sysy::llvm_ir::{compile_llvm_to_riscv_asm, compile_to_llvm};
+use compile_sysy::llvm_ir::{compile_llvm_to_riscv_asm, compile_to_llvm, compile_to_llvm_with_target};
 use lalrpop_util::lalrpop_mod;
 use std::env;
 use std::io::Result;
@@ -28,6 +28,9 @@ struct Args {
 
     #[arg(short, long)]
     output: PathBuf,
+
+    #[arg(long, default_value = "riscv32-unknown-unknown-elf")]
+    target: String,
 }
 
 lalrpop_mod!(sysy);
@@ -78,7 +81,8 @@ fn main() -> Result<()> {
         Mode::Llvm => {
             let input = read_to_string(args.input)?;
             let ast = str_to_ast(&input);
-            let llvm_ir = compile_to_llvm(&ast);
+            let target = resolve_llvm_target(&args.target);
+            let llvm_ir = compile_to_llvm_with_target(&ast, &target);
             std::fs::write(args.output, llvm_ir)?;
         }
         Mode::Riscv => {
@@ -89,4 +93,21 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_llvm_target(target: &str) -> String {
+    match target {
+        "host" => host_llvm_target(),
+        other => other.to_string(),
+    }
+}
+
+fn host_llvm_target() -> String {
+    match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("x86_64", "linux") => "x86_64-unknown-linux-gnu".to_string(),
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu".to_string(),
+        ("x86_64", "macos") => "x86_64-apple-darwin".to_string(),
+        ("aarch64", "macos") => "arm64-apple-macosx".to_string(),
+        _ => "riscv32-unknown-unknown-elf".to_string(),
+    }
 }
