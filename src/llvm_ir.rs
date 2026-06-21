@@ -114,6 +114,20 @@ struct LValue {
     ty: LlvmType,
 }
 
+#[derive(Debug, Clone)]
+struct FrameField {
+    offset: usize,
+    ty: LlvmType,
+}
+
+#[derive(Debug, Clone)]
+struct AwaitPointInfo {
+    state: i32,
+    child_field: String,
+    result_target: Option<String>,
+    resume_index: usize,
+}
+
 #[derive(Debug, Default)]
 struct ModuleCtx {
     structs: HashMap<String, StructDef>,
@@ -130,9 +144,17 @@ struct FunctionCtx<'a> {
     lines: Vec<String>,
     tmp_counter: usize,
     label_counter: usize,
+    current_label: String,
     current_terminated: bool,
+    loop_stack: Vec<LoopLabels>,
     is_async: bool,
     promise_ptr: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LoopLabels {
+    break_label: String,
+    continue_label: String,
 }
 
 pub fn compile_to_llvm(ast: &CompUnit) -> String {
@@ -159,8 +181,8 @@ pub fn compile_to_llvm(ast: &CompUnit) -> String {
         out.push('\n');
     }
 
-    out.push_str("%promise.i32 = type { i32, i32 }\n");
-    out.push_str("%promise.void = type { i32 }\n\n");
+    out.push_str("%promise.i32 = type { i32, i32, ptr, ptr, ptr, ptr, ptr }\n");
+    out.push_str("%promise.void = type { i32, i32, ptr, ptr, ptr, ptr, ptr }\n\n");
     out.push_str("declare ptr @malloc(i32)\n");
     out.push_str("declare void @free(ptr)\n");
     out.push_str("declare i32 @getint()\n");
@@ -368,7 +390,9 @@ impl<'a> FunctionCtx<'a> {
             lines: Vec::new(),
             tmp_counter: 0,
             label_counter: 0,
+            current_label: "entry".to_string(),
             current_terminated: false,
+            loop_stack: Vec::new(),
             is_async,
             promise_ptr: None,
         }
@@ -411,6 +435,7 @@ impl<'a> FunctionCtx<'a> {
 
     fn emit_label(&mut self, label: &str) {
         self.lines.push(format!("{}:", label));
+        self.current_label = label.to_string();
         self.current_terminated = false;
     }
 
@@ -522,21 +547,43 @@ impl<'a> FunctionCtx<'a> {
             other => panic!("Promise.wait for {:?} is not supported", other),
         }
     }
+
+    fn promise_read(&mut self, promise: Value) -> Value {
+        let value_ty = promise.ty.promise_value();
+        match value_ty {
+            LlvmType::I32 => {
+                let out = self.tmp();
+                self.emit(format!(
+                    "  {} = call i32 @__sysy_promise_result_i32(ptr {})",
+                    out, promise.name
+                ));
+                Value {
+                    name: out,
+                    ty: LlvmType::I32,
+                }
+            }
+            LlvmType::Void => Value {
+                name: "0".to_string(),
+                ty: LlvmType::Void,
+            },
+            other => panic!("Promise result for {:?} is not supported", other),
+        }
+    }
 }
 
 fn emit_function(module: &ModuleCtx, func: &FuncDef) -> String {
+    if func.is_async {
+        return emit_async_function(module, func);
+    }
+
     let original_ret = type_to_llvm(&func.func_type);
-    let llvm_ret = if func.is_async {
-        LlvmType::Promise(Box::new(original_ret.clone()))
-    } else {
-        original_ret.clone()
-    };
+    let llvm_ret = original_ret.clone();
     let params = func
         .func_params
         .iter()
         .map(|param| (param.name.clone(), LlvmType::from_btype(&param_resolved_btype(param, module))))
         .collect::<Vec<_>>();
-    let mut ctx = FunctionCtx::new(module, original_ret.clone(), func.is_async);
+    let mut ctx = FunctionCtx::new(module, original_ret.clone(), false);
     let param_sig = params
         .iter()
         .enumerate()
@@ -552,10 +599,6 @@ fn emit_function(module: &ModuleCtx, func: &FuncDef) -> String {
         param_sig
     );
     ctx.emit_label("entry");
-    if func.is_async {
-        let promise = ctx.promise_new(&original_ret);
-        ctx.promise_ptr = Some(promise.name);
-    }
     for (idx, (name, ty)) in params.iter().enumerate() {
         let ptr = ctx.alloca(ty);
         ctx.emit(format!("  store {} %arg{}, ptr {}", ty.llvm(), idx, ptr));
@@ -569,16 +612,7 @@ fn emit_function(module: &ModuleCtx, func: &FuncDef) -> String {
     }
     emit_stmts(&mut ctx, &func.block);
     if !ctx.current_terminated {
-        if func.is_async {
-            let promise = ctx.promise_ptr.clone().unwrap();
-            if original_ret.is_void() {
-                ctx.promise_resolve(&promise, None);
-            } else {
-                let value = ctx.default_value(&original_ret);
-                ctx.promise_resolve(&promise, Some(&value));
-            }
-            ctx.terminate(format!("  ret ptr {}", promise));
-        } else if original_ret.is_void() {
+        if original_ret.is_void() {
             ctx.terminate("  ret void".to_string());
         } else {
             let value = ctx.default_value(&original_ret);
@@ -592,12 +626,494 @@ fn emit_function(module: &ModuleCtx, func: &FuncDef) -> String {
     out
 }
 
+fn async_frame_layout(
+    module: &ModuleCtx,
+    params: &[(String, LlvmType)],
+    stmts: &[Stmt],
+) -> (HashMap<String, FrameField>, usize) {
+    let mut fields = HashMap::new();
+    let mut offset = 0usize;
+    add_frame_field(
+        &mut fields,
+        &mut offset,
+        "__promise".to_string(),
+        LlvmType::Promise(Box::new(LlvmType::Void)),
+    );
+    add_frame_field(&mut fields, &mut offset, "__state".to_string(), LlvmType::I32);
+    for (name, ty) in params {
+        add_frame_field(&mut fields, &mut offset, name.clone(), ty.clone());
+    }
+    collect_async_decl_fields(module, stmts, &mut fields, &mut offset);
+    let await_count = count_await_stmts(stmts);
+    for idx in 0..await_count {
+        add_frame_field(
+            &mut fields,
+            &mut offset,
+            format!("__await{}", idx),
+            LlvmType::Promise(Box::new(LlvmType::I32)),
+        );
+    }
+    add_frame_field(&mut fields, &mut offset, "__return".to_string(), LlvmType::I32);
+    (fields, align_up(offset, 4))
+}
+
+fn add_frame_field(
+    fields: &mut HashMap<String, FrameField>,
+    offset: &mut usize,
+    name: String,
+    ty: LlvmType,
+) {
+    if fields.contains_key(&name) {
+        return;
+    }
+    *offset = align_up(*offset, 4);
+    fields.insert(
+        name,
+        FrameField {
+            offset: *offset,
+            ty: ty.clone(),
+        },
+    );
+    *offset += ty.size(&HashMap::new()).max(4);
+}
+
+fn collect_async_decl_fields(
+    module: &ModuleCtx,
+    stmts: &[Stmt],
+    fields: &mut HashMap<String, FrameField>,
+    offset: &mut usize,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Decl(ty, decls) => {
+                for decl in decls {
+                    add_frame_field(
+                        fields,
+                        offset,
+                        var_decl_name(&decl.var),
+                        decl_type(ty, &decl.var, module),
+                    );
+                }
+            }
+            Stmt::Block(stmts) => collect_async_decl_fields(module, stmts, fields, offset),
+            Stmt::If(_, then_stmt) => {
+                collect_async_decl_fields(module, std::slice::from_ref(then_stmt), fields, offset)
+            }
+            Stmt::IfElse(_, then_stmt, else_stmt) => {
+                collect_async_decl_fields(module, std::slice::from_ref(then_stmt), fields, offset);
+                collect_async_decl_fields(module, std::slice::from_ref(else_stmt), fields, offset);
+            }
+            Stmt::While(_, body) => {
+                collect_async_decl_fields(module, std::slice::from_ref(body), fields, offset)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn count_await_stmts(stmts: &[Stmt]) -> usize {
+    stmts.iter().filter(|stmt| stmt_has_top_level_await(stmt)).count()
+}
+
+fn stmt_has_top_level_await(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::Decl(_, decls)
+            if decls.iter().any(|decl| matches!(decl.init, Some(InitVal::Exp(Exp::Await(_)))))
+    ) || matches!(stmt, Stmt::Assign(_, Exp::Await(_)))
+        || matches!(stmt, Stmt::Exp(Exp::Await(_)))
+        || matches!(stmt, Stmt::Return(Some(Exp::Await(_))))
+}
+
+fn collect_await_points(module: &ModuleCtx, stmts: &[Stmt]) -> Vec<AwaitPointInfo> {
+    let mut points = Vec::new();
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if !stmt_has_top_level_await(stmt) {
+            continue;
+        }
+        let result_target = match stmt {
+            Stmt::Decl(_, decls) => decls.iter().find_map(|decl| {
+                if matches!(decl.init, Some(InitVal::Exp(Exp::Await(_)))) {
+                    Some(var_decl_name(&decl.var))
+                } else {
+                    None
+                }
+            }),
+            Stmt::Assign(Exp::Ident(name), Exp::Await(_)) => Some(name.clone()),
+            Stmt::Return(Some(Exp::Await(_))) => Some("__return".to_string()),
+            _ => None,
+        };
+        let _ = module;
+        points.push(AwaitPointInfo {
+            state: (points.len() + 1) as i32,
+            child_field: format!("__await{}", points.len()),
+            result_target,
+            resume_index: idx + 1,
+        });
+    }
+    points
+}
+
+fn async_field_ptr(ctx: &mut FunctionCtx<'_>, frame: &str, field: &FrameField) -> String {
+    let ptr = ctx.tmp();
+    ctx.emit(format!(
+        "  {} = getelementptr i8, ptr {}, i32 {}",
+        ptr, frame, field.offset
+    ));
+    ptr
+}
+
+fn async_load_field(ctx: &mut FunctionCtx<'_>, frame: &str, field: &FrameField) -> Value {
+    let ptr = async_field_ptr(ctx, frame, field);
+    ctx.load(&ptr, &field.ty)
+}
+
+fn async_store_field(ctx: &mut FunctionCtx<'_>, frame: &str, field: &FrameField, value: &Value) {
+    let ptr = async_field_ptr(ctx, frame, field);
+    ctx.emit(format!(
+        "  store {} {}, ptr {}",
+        value.ty.llvm(),
+        value.name,
+        ptr
+    ));
+}
+
+fn async_store_i32(ctx: &mut FunctionCtx<'_>, frame: &str, field: &FrameField, value: &str) {
+    let ptr = async_field_ptr(ctx, frame, field);
+    ctx.emit(format!("  store i32 {}, ptr {}", value, ptr));
+}
+
+fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
+    let ret_ty = type_to_llvm(&func.func_type);
+    let params = func
+        .func_params
+        .iter()
+        .map(|param| {
+            (
+                param.name.clone(),
+                LlvmType::from_btype(&param_resolved_btype(param, module)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (fields, frame_size) = async_frame_layout(module, &params, &func.block);
+    let safe_name = sanitize_ident(&func.ident);
+    let step_name = format!("__sysy_async_step_{}", safe_name);
+
+    let mut out = String::new();
+    let param_sig = params
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, ty))| format!("{} %arg{}", ty.llvm(), idx))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(out, "define ptr @{}({}) {{", safe_name, param_sig);
+    let mut entry = FunctionCtx::new(module, LlvmType::Promise(Box::new(ret_ty.clone())), false);
+    entry.emit_label("entry");
+    let promise = entry.promise_new(&ret_ty);
+    let frame = entry.tmp();
+    entry.emit(format!("  {} = call ptr @malloc(i32 {})", frame, frame_size));
+    async_store_field(&mut entry, &frame, fields.get("__promise").unwrap(), &promise);
+    async_store_i32(&mut entry, &frame, fields.get("__state").unwrap(), "0");
+    for (idx, (name, ty)) in params.iter().enumerate() {
+        let value = Value {
+            name: format!("%arg{}", idx),
+            ty: ty.clone(),
+        };
+        async_store_field(&mut entry, &frame, fields.get(name).unwrap(), &value);
+    }
+    entry.emit(format!(
+        "  call void @__sysy_pending_add(ptr {}, ptr @{}, ptr {})",
+        promise.name, step_name, frame
+    ));
+    entry.emit(format!("  call void @{}(ptr {})", step_name, frame));
+    entry.terminate(format!("  ret ptr {}", promise.name));
+    for line in entry.lines {
+        let _ = writeln!(out, "{}", line);
+    }
+    out.push_str("}\n\n");
+
+    let _ = writeln!(out, "define void @{}(ptr %frame) {{", step_name);
+    let mut ctx = FunctionCtx::new(module, LlvmType::Void, true);
+    ctx.emit_label("entry");
+    let promise = async_load_field(&mut ctx, "%frame", fields.get("__promise").unwrap());
+    ctx.promise_ptr = Some(promise.name.clone());
+    for (name, field) in fields.iter() {
+        if name.starts_with("__") {
+            continue;
+        }
+        let ptr = async_field_ptr(&mut ctx, "%frame", field);
+        ctx.insert_var(
+            name.clone(),
+            VarInfo {
+                ptr,
+                ty: field.ty.clone(),
+            },
+        );
+    }
+
+    let awaits = collect_await_points(module, &func.block);
+    let state_field = fields.get("__state").unwrap();
+    let state_val = async_load_field(&mut ctx, "%frame", state_field);
+    let state_labels = awaits
+        .iter()
+        .map(|await_info| format!("i32 {}, label %async.state.{}", await_info.state, await_info.state))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if state_labels.is_empty() {
+        ctx.terminate("  br label %async.state.0".to_string());
+    } else {
+        ctx.terminate(format!(
+            "  switch i32 {}, label %async.state.0 [ {} ]",
+            state_val.name, state_labels
+        ));
+    }
+
+    ctx.emit_label("async.state.0");
+    let mut emitter = AsyncBodyEmitter {
+        fields: &fields,
+        awaits: &awaits,
+        next_await: 0,
+        step_name: step_name.clone(),
+    };
+    emitter.emit_stmts(&mut ctx, &func.block);
+    if !ctx.current_terminated {
+        let promise = ctx.promise_ptr.clone().unwrap();
+        if ret_ty.is_void() {
+            ctx.promise_resolve(&promise, None);
+        } else {
+            let value = ctx.default_value(&ret_ty);
+            ctx.promise_resolve(&promise, Some(&value));
+        }
+        ctx.terminate("  ret void".to_string());
+    }
+
+    for await_info in &awaits {
+        ctx.emit_label(&format!("async.state.{}", await_info.state));
+        let child = async_load_field(&mut ctx, "%frame", fields.get(&await_info.child_field).unwrap());
+        let ready = ctx.tmp();
+        ctx.emit(format!(
+            "  {} = call i32 @__sysy_promise_is_ready(ptr {})",
+            ready, child.name
+        ));
+        let ready_bool = ctx.tmp();
+        ctx.emit(format!("  {} = icmp ne i32 {}, 0", ready_bool, ready));
+        let resume_label = ctx.label("async.resume");
+        ctx.terminate(format!(
+            "  br i1 {}, label %{}, label %async.suspend",
+            ready_bool, resume_label
+        ));
+        ctx.emit_label(&resume_label);
+        if let Some(target) = &await_info.result_target {
+            let value = ctx.promise_read(child);
+            if target == "__return" {
+                let promise = ctx.promise_ptr.clone().unwrap();
+                if value.ty.is_void() {
+                    ctx.promise_resolve(&promise, None);
+                } else {
+                    ctx.promise_resolve(&promise, Some(&value));
+                }
+                ctx.terminate("  ret void".to_string());
+                continue;
+            } else {
+                let target_field = fields.get(target).unwrap_or_else(|| {
+                    panic!("async await target {} is not stored in the frame", target)
+                });
+                async_store_field(&mut ctx, "%frame", target_field, &value);
+            }
+        }
+        async_store_i32(&mut ctx, "%frame", state_field, "0");
+        let continue_label = format!("async.continue.{}", await_info.state);
+        ctx.terminate(format!("  br label %{}", continue_label));
+        ctx.emit_label(&continue_label);
+        emitter.emit_from_state(&mut ctx, await_info.state, &func.block);
+        if !ctx.current_terminated {
+            let promise = ctx.promise_ptr.clone().unwrap();
+            if ret_ty.is_void() {
+                ctx.promise_resolve(&promise, None);
+            } else {
+                let value = ctx.default_value(&ret_ty);
+                ctx.promise_resolve(&promise, Some(&value));
+            }
+            ctx.terminate("  ret void".to_string());
+        }
+    }
+
+    ctx.emit_label("async.suspend");
+    ctx.terminate("  ret void".to_string());
+    for line in ctx.lines {
+        let _ = writeln!(out, "{}", line);
+    }
+    out.push_str("}\n\n");
+    out
+}
+
+struct AsyncBodyEmitter<'a> {
+    fields: &'a HashMap<String, FrameField>,
+    awaits: &'a [AwaitPointInfo],
+    next_await: usize,
+    step_name: String,
+}
+
+impl<'a> AsyncBodyEmitter<'a> {
+    fn emit_stmts(&mut self, ctx: &mut FunctionCtx<'_>, stmts: &[Stmt]) {
+        for stmt in stmts {
+            if ctx.current_terminated {
+                return;
+            }
+            self.emit_stmt(ctx, stmt);
+        }
+    }
+
+    fn emit_from_state(&mut self, ctx: &mut FunctionCtx<'_>, state: i32, stmts: &[Stmt]) {
+        let await_idx = self
+            .awaits
+            .iter()
+            .position(|await_info| await_info.state == state)
+            .unwrap_or_else(|| panic!("unknown async state {}", state));
+        self.next_await = await_idx + 1;
+        self.emit_stmts(ctx, &stmts[self.awaits[await_idx].resume_index..]);
+    }
+
+    fn emit_stmt(&mut self, ctx: &mut FunctionCtx<'_>, stmt: &Stmt) {
+        match stmt {
+            Stmt::Decl(ty, decls) => {
+                for decl in decls {
+                    let name = var_decl_name(&decl.var);
+                    if let Some(init) = &decl.init {
+                        match init {
+                            InitVal::Exp(Exp::Await(inner)) => {
+                                self.emit_await(ctx, inner, Some(name));
+                                return;
+                            }
+                            _ => {
+                                let field = self.fields.get(&name).unwrap();
+                                let value = match init {
+                                    InitVal::Exp(exp) => emit_exp(ctx, exp),
+                                    InitVal::Arr(_) => {
+                                        let init_ty = decl_type(ty, &decl.var, ctx.module);
+                                        let init_ptr = async_field_ptr(ctx, "%frame", field);
+                                        init_store(ctx, init, &init_ty, &init_ptr);
+                                        continue;
+                                    }
+                                };
+                                async_store_field(ctx, "%frame", field, &value);
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::Assign(lhs, Exp::Await(inner)) => {
+                if let Exp::Ident(name) = lhs {
+                    self.emit_await(ctx, inner, Some(name.clone()));
+                } else {
+                    panic!("await assignment is only supported for simple identifiers");
+                }
+            }
+            Stmt::Assign(lhs, rhs) => {
+                let value = emit_exp(ctx, rhs);
+                let lvalue = emit_lvalue(ctx, lhs);
+                ctx.store(&value, &lvalue.ptr);
+            }
+            Stmt::Exp(Exp::Await(inner)) => self.emit_await(ctx, inner, None),
+            Stmt::Exp(exp) => {
+                let _ = emit_exp(ctx, exp);
+            }
+            Stmt::Return(Some(Exp::Await(inner))) => self.emit_await(ctx, inner, Some("__return".to_string())),
+            Stmt::Return(Some(exp)) => {
+                let value = emit_exp(ctx, exp);
+                let promise = ctx.promise_ptr.clone().unwrap();
+                if value.ty.is_void() {
+                    ctx.promise_resolve(&promise, None);
+                } else {
+                    ctx.promise_resolve(&promise, Some(&value));
+                }
+                ctx.terminate("  ret void".to_string());
+            }
+            Stmt::Return(None) => {
+                let promise = ctx.promise_ptr.clone().unwrap();
+                ctx.promise_resolve(&promise, None);
+                ctx.terminate("  ret void".to_string());
+            }
+            Stmt::Block(stmts) => self.emit_stmts(ctx, stmts),
+            Stmt::If(_, _) | Stmt::IfElse(_, _, _) | Stmt::While(_, _) => emit_stmt(ctx, stmt),
+            Stmt::PromiseWait(exp) => {
+                let promise = emit_exp(ctx, exp);
+                let _ = ctx.promise_wait(promise);
+            }
+            Stmt::Break | Stmt::Continue | Stmt::Empty => emit_stmt(ctx, stmt),
+        }
+    }
+
+    fn emit_await(&mut self, ctx: &mut FunctionCtx<'_>, inner: &Exp, target: Option<String>) {
+        let await_info = self
+            .awaits
+            .get(self.next_await)
+            .unwrap_or_else(|| panic!("missing async await point {}", self.next_await))
+            .clone();
+        self.next_await += 1;
+        let child = emit_exp(ctx, inner);
+        async_store_field(
+            ctx,
+            "%frame",
+            self.fields.get(&await_info.child_field).unwrap(),
+            &child,
+        );
+        async_store_i32(
+            ctx,
+            "%frame",
+            self.fields.get("__state").unwrap(),
+            &await_info.state.to_string(),
+        );
+        ctx.emit(format!(
+            "  call void @__sysy_promise_set_callback(ptr {}, ptr @{}, ptr %frame)",
+            child.name, self.step_name
+        ));
+        let ready = ctx.tmp();
+        ctx.emit(format!(
+            "  {} = call i32 @__sysy_promise_is_ready(ptr {})",
+            ready, child.name
+        ));
+        let ready_bool = ctx.tmp();
+        ctx.emit(format!("  {} = icmp ne i32 {}, 0", ready_bool, ready));
+        let ready_label = ctx.label("async.await.ready");
+        ctx.terminate(format!(
+            "  br i1 {}, label %{}, label %async.suspend",
+            ready_bool, ready_label
+        ));
+        ctx.emit_label(&ready_label);
+        if let Some(target_name) = target.or(await_info.result_target) {
+            let value = ctx.promise_read(child);
+            if target_name == "__return" {
+                let promise = ctx.promise_ptr.clone().unwrap();
+                if value.ty.is_void() {
+                    ctx.promise_resolve(&promise, None);
+                } else {
+                    ctx.promise_resolve(&promise, Some(&value));
+                }
+                ctx.terminate("  ret void".to_string());
+            } else if !value.ty.is_void() {
+                async_store_field(
+                    ctx,
+                    "%frame",
+                    self.fields.get(&target_name).unwrap(),
+                    &value,
+                );
+            }
+        }
+    }
+}
+
 fn emit_async_main_driver(module: &ModuleCtx, _hidden: &FuncDef) -> String {
     let mut ctx = FunctionCtx::new(module, LlvmType::I32, false);
     let mut out = String::new();
     out.push_str("define i32 @main() {\n");
     ctx.emit_label("entry");
-    let call = call_function(&mut ctx, "__sysy_async_main", &[]);
+    let promise = ctx.tmp();
+    ctx.emit(format!("  {} = call ptr @__sysy_async_main()", promise));
+    let call = Value {
+        name: promise,
+        ty: LlvmType::Promise(Box::new(type_to_llvm(&_hidden.func_type))),
+    };
     let waited = ctx.promise_wait(call);
     if matches!(waited.ty, LlvmType::Void) {
         ctx.terminate("  ret i32 0".to_string());
@@ -746,14 +1262,30 @@ fn emit_stmt(ctx: &mut FunctionCtx<'_>, stmt: &Stmt) {
             ctx.emit_label(&cond_label);
             emit_cond_br(ctx, cond, &body_label, &end_label);
             ctx.emit_label(&body_label);
+            ctx.loop_stack.push(LoopLabels {
+                break_label: end_label.clone(),
+                continue_label: cond_label.clone(),
+            });
             emit_stmt(ctx, body);
+            ctx.loop_stack.pop();
             if !ctx.current_terminated {
                 ctx.terminate(format!("  br label %{}", cond_label));
             }
             ctx.emit_label(&end_label);
         }
-        Stmt::Break | Stmt::Continue => {
-            panic!("break/continue are not supported by the LLVM backend yet")
+        Stmt::Break => {
+            let labels = ctx
+                .loop_stack
+                .last()
+                .unwrap_or_else(|| panic!("break used outside a loop"));
+            ctx.terminate(format!("  br label %{}", labels.break_label));
+        }
+        Stmt::Continue => {
+            let labels = ctx
+                .loop_stack
+                .last()
+                .unwrap_or_else(|| panic!("continue used outside a loop"));
+            ctx.terminate(format!("  br label %{}", labels.continue_label));
         }
         Stmt::Empty => {}
     }
@@ -880,6 +1412,10 @@ fn emit_exp(ctx: &mut FunctionCtx<'_>, exp: &Exp) -> Value {
 }
 
 fn emit_binary(ctx: &mut FunctionCtx<'_>, op: &BinaryOp, lhs: &Exp, rhs: &Exp) -> Value {
+    if matches!(op, BinaryOp::And | BinaryOp::Or) {
+        return emit_short_circuit(ctx, op, lhs, rhs);
+    }
+
     let l = emit_exp(ctx, lhs);
     let r = emit_exp(ctx, rhs);
     let out = ctx.tmp();
@@ -889,24 +1425,7 @@ fn emit_binary(ctx: &mut FunctionCtx<'_>, op: &BinaryOp, lhs: &Exp, rhs: &Exp) -
         BinaryOp::Mul => ctx.emit(format!("  {} = mul i32 {}, {}", out, l.name, r.name)),
         BinaryOp::Div => ctx.emit(format!("  {} = sdiv i32 {}, {}", out, l.name, r.name)),
         BinaryOp::Mod => ctx.emit(format!("  {} = srem i32 {}, {}", out, l.name, r.name)),
-        BinaryOp::And => {
-            let lb = ctx.tmp();
-            let rb = ctx.tmp();
-            ctx.emit(format!("  {} = icmp ne i32 {}, 0", lb, l.name));
-            ctx.emit(format!("  {} = icmp ne i32 {}, 0", rb, r.name));
-            let and_tmp = ctx.tmp();
-            ctx.emit(format!("  {} = and i1 {}, {}", and_tmp, lb, rb));
-            ctx.emit(format!("  {} = zext i1 {} to i32", out, and_tmp));
-        }
-        BinaryOp::Or => {
-            let lb = ctx.tmp();
-            let rb = ctx.tmp();
-            ctx.emit(format!("  {} = icmp ne i32 {}, 0", lb, l.name));
-            ctx.emit(format!("  {} = icmp ne i32 {}, 0", rb, r.name));
-            let or_tmp = ctx.tmp();
-            ctx.emit(format!("  {} = or i1 {}, {}", or_tmp, lb, rb));
-            ctx.emit(format!("  {} = zext i1 {} to i32", out, or_tmp));
-        }
+        BinaryOp::And | BinaryOp::Or => unreachable!(),
         cmp => {
             let pred = match cmp {
                 BinaryOp::Lt => "slt",
@@ -925,6 +1444,57 @@ fn emit_binary(ctx: &mut FunctionCtx<'_>, op: &BinaryOp, lhs: &Exp, rhs: &Exp) -
             ctx.emit(format!("  {} = zext i1 {} to i32", out, cmp_tmp));
         }
     }
+    Value {
+        name: out,
+        ty: LlvmType::I32,
+    }
+}
+
+fn emit_short_circuit(
+    ctx: &mut FunctionCtx<'_>,
+    op: &BinaryOp,
+    lhs: &Exp,
+    rhs: &Exp,
+) -> Value {
+    let lhs_value = emit_exp(ctx, lhs);
+    let lhs_bool = ctx.tmp();
+    ctx.emit(format!("  {} = icmp ne i32 {}, 0", lhs_bool, lhs_value.name));
+    let lhs_label = ctx.current_label.clone();
+    let rhs_label = ctx.label("logic.rhs");
+    let end_label = ctx.label("logic.end");
+
+    match op {
+        BinaryOp::And => ctx.terminate(format!(
+            "  br i1 {}, label %{}, label %{}",
+            lhs_bool, rhs_label, end_label
+        )),
+        BinaryOp::Or => ctx.terminate(format!(
+            "  br i1 {}, label %{}, label %{}",
+            lhs_bool, end_label, rhs_label
+        )),
+        _ => unreachable!(),
+    }
+
+    ctx.emit_label(&rhs_label);
+    let rhs_value = emit_exp(ctx, rhs);
+    let rhs_bool = ctx.tmp();
+    ctx.emit(format!("  {} = icmp ne i32 {}, 0", rhs_bool, rhs_value.name));
+    let rhs_pred = ctx.current_label.clone();
+    ctx.terminate(format!("  br label %{}", end_label));
+
+    ctx.emit_label(&end_label);
+    let phi = ctx.tmp();
+    let short_value = match op {
+        BinaryOp::And => "false",
+        BinaryOp::Or => "true",
+        _ => unreachable!(),
+    };
+    ctx.emit(format!(
+        "  {} = phi i1 [{}, %{}], [{}, %{}]",
+        phi, short_value, lhs_label, rhs_bool, rhs_pred
+    ));
+    let out = ctx.tmp();
+    ctx.emit(format!("  {} = zext i1 {} to i32", out, phi));
     Value {
         name: out,
         ty: LlvmType::I32,
@@ -1206,13 +1776,26 @@ fn default_clang() -> String {
     }
 }
 
-const PROMISE_RUNTIME: &str = r#"define ptr @__sysy_promise_new_i32() {
+const PROMISE_RUNTIME: &str = r#"@__sysy_now = internal global i32 0
+@__sysy_pending = internal global ptr null
+
+define ptr @__sysy_promise_new_i32() {
 entry:
-  %p = call ptr @malloc(i32 8)
+  %p = call ptr @malloc(i32 28)
   %ready = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 0
   store i32 0, ptr %ready
   %value = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 1
   store i32 0, ptr %value
+  %callback = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 2
+  store ptr null, ptr %callback
+  %callback_env = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 3
+  store ptr null, ptr %callback_env
+  %driver = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 4
+  store ptr null, ptr %driver
+  %driver_env = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 5
+  store ptr null, ptr %driver_env
+  %next = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 6
+  store ptr null, ptr %next
   ret ptr %p
 }
 
@@ -1222,21 +1805,49 @@ entry:
   store i32 %v, ptr %value
   %ready = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 0
   store i32 1, ptr %ready
+  call void @__sysy_promise_fire_callback(ptr %p)
   ret void
 }
 
-define i32 @__sysy_promise_wait_i32(ptr %p) {
+define i32 @__sysy_promise_result_i32(ptr %p) {
 entry:
   %value = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 1
   %v = load i32, ptr %value
   ret i32 %v
 }
 
+define i32 @__sysy_promise_wait_i32(ptr %p) {
+entry:
+  br label %loop
+loop:
+  %ready = call i32 @__sysy_promise_is_ready(ptr %p)
+  %done = icmp ne i32 %ready, 0
+  br i1 %done, label %exit, label %tick
+tick:
+  call void @__sysy_event_loop_tick()
+  br label %loop
+exit:
+  %v = call i32 @__sysy_promise_result_i32(ptr %p)
+  ret i32 %v
+}
+
 define ptr @__sysy_promise_new_void() {
 entry:
-  %p = call ptr @malloc(i32 4)
+  %p = call ptr @malloc(i32 28)
   %ready = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 0
   store i32 0, ptr %ready
+  %value = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 1
+  store i32 0, ptr %value
+  %callback = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 2
+  store ptr null, ptr %callback
+  %callback_env = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 3
+  store ptr null, ptr %callback_env
+  %driver = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 4
+  store ptr null, ptr %driver
+  %driver_env = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 5
+  store ptr null, ptr %driver_env
+  %next = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 6
+  store ptr null, ptr %next
   ret ptr %p
 }
 
@@ -1244,19 +1855,136 @@ define void @__sysy_promise_resolve_void(ptr %p) {
 entry:
   %ready = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 0
   store i32 1, ptr %ready
+  call void @__sysy_promise_fire_callback(ptr %p)
   ret void
 }
 
 define void @__sysy_promise_wait_void(ptr %p) {
 entry:
+  br label %loop
+loop:
+  %ready = call i32 @__sysy_promise_is_ready(ptr %p)
+  %done = icmp ne i32 %ready, 0
+  br i1 %done, label %exit, label %tick
+tick:
+  call void @__sysy_event_loop_tick()
+  br label %loop
+exit:
+  ret void
+}
+
+define i32 @__sysy_promise_is_ready(ptr %p) {
+entry:
+  %ready_ptr = getelementptr i8, ptr %p, i32 0
+  %ready = load i32, ptr %ready_ptr
+  ret i32 %ready
+}
+
+define void @__sysy_promise_set_callback(ptr %p, ptr %callback, ptr %env) {
+entry:
+  %callback_ptr = getelementptr i8, ptr %p, i32 8
+  store ptr %callback, ptr %callback_ptr
+  %env_ptr = getelementptr i8, ptr %p, i32 12
+  store ptr %env, ptr %env_ptr
+  %ready = call i32 @__sysy_promise_is_ready(ptr %p)
+  %done = icmp ne i32 %ready, 0
+  br i1 %done, label %fire, label %exit
+fire:
+  call void %callback(ptr %env)
+  br label %exit
+exit:
+  ret void
+}
+
+define void @__sysy_promise_fire_callback(ptr %p) {
+entry:
+  %callback_ptr = getelementptr i8, ptr %p, i32 8
+  %callback = load ptr, ptr %callback_ptr
+  %has_callback = icmp ne ptr %callback, null
+  br i1 %has_callback, label %call, label %exit
+call:
+  %env_ptr = getelementptr i8, ptr %p, i32 12
+  %env = load ptr, ptr %env_ptr
+  store ptr null, ptr %callback_ptr
+  call void %callback(ptr %env)
+  br label %exit
+exit:
+  ret void
+}
+
+define void @__sysy_pending_add(ptr %p, ptr %driver, ptr %env) {
+entry:
+  %driver_ptr = getelementptr i8, ptr %p, i32 16
+  store ptr %driver, ptr %driver_ptr
+  %env_ptr = getelementptr i8, ptr %p, i32 20
+  store ptr %env, ptr %env_ptr
+  %head = load ptr, ptr @__sysy_pending
+  %next_ptr = getelementptr i8, ptr %p, i32 24
+  store ptr %head, ptr %next_ptr
+  store ptr %p, ptr @__sysy_pending
+  ret void
+}
+
+define void @__sysy_event_loop_tick() {
+entry:
+  %now = load i32, ptr @__sysy_now
+  %next_now = add i32 %now, 1
+  store i32 %next_now, ptr @__sysy_now
+  %head = load ptr, ptr @__sysy_pending
+  br label %loop
+loop:
+  %cur = phi ptr [%head, %entry], [%next, %step.end]
+  %is_null = icmp eq ptr %cur, null
+  br i1 %is_null, label %exit, label %step
+step:
+  %next_ptr = getelementptr i8, ptr %cur, i32 24
+  %next = load ptr, ptr %next_ptr
+  %ready = call i32 @__sysy_promise_is_ready(ptr %cur)
+  %done = icmp ne i32 %ready, 0
+  br i1 %done, label %step.end, label %drive
+drive:
+  %driver_ptr = getelementptr i8, ptr %cur, i32 16
+  %driver = load ptr, ptr %driver_ptr
+  %has_driver = icmp ne ptr %driver, null
+  br i1 %has_driver, label %drive.call, label %step.end
+drive.call:
+  %env_ptr = getelementptr i8, ptr %cur, i32 20
+  %env = load ptr, ptr %env_ptr
+  call void %driver(ptr %env)
+  br label %step.end
+step.end:
+  br label %loop
+exit:
   ret void
 }
 
 define ptr @__sysy_sleep(i32 %duration) {
 entry:
   %p = call ptr @__sysy_promise_new_void()
-  call void @__sysy_promise_resolve_void(ptr %p)
+  %now = load i32, ptr @__sysy_now
+  %wake = add i32 %now, %duration
+  %wake_ptr = getelementptr i8, ptr %p, i32 4
+  store i32 %wake, ptr %wake_ptr
+  call void @__sysy_pending_add(ptr %p, ptr @__sysy_sleep_drive, ptr %p)
   ret ptr %p
+}
+
+define void @__sysy_sleep_drive(ptr %p) {
+entry:
+  %ready = call i32 @__sysy_promise_is_ready(ptr %p)
+  %done = icmp ne i32 %ready, 0
+  br i1 %done, label %exit, label %check
+check:
+  %now = load i32, ptr @__sysy_now
+  %wake_ptr = getelementptr i8, ptr %p, i32 4
+  %wake = load i32, ptr %wake_ptr
+  %awake = icmp sge i32 %now, %wake
+  br i1 %awake, label %resolve, label %exit
+resolve:
+  call void @__sysy_promise_resolve_void(ptr %p)
+  br label %exit
+exit:
+  ret void
 }
 
 "#;
