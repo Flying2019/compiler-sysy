@@ -5,10 +5,12 @@ use compile_sysy::ast_tool::{scan_global_symbol, Background};
 use compile_sysy::koopa::KoopaLines;
 use compile_sysy::lalr::CompUnit;
 use compile_sysy::lexer::Lexer;
-use compile_sysy::llvm_ir::{compile_llvm_to_riscv_asm, compile_to_llvm, compile_to_llvm_with_target};
+use compile_sysy::llvm_ir::{
+    compile_llvm_to_riscv_asm, try_compile_to_llvm, try_compile_to_llvm_with_target,
+};
 use lalrpop_util::lalrpop_mod;
 use std::env;
-use std::io::Result;
+use std::io::{self, Result};
 use std::{fs::read_to_string, path::PathBuf};
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -50,23 +52,22 @@ fn preprocess_args() -> Vec<String> {
     raw_args
 }
 
-fn str_to_ast(input: &str) -> CompUnit {
+fn str_to_ast(input: &str) -> Result<CompUnit> {
     sysy::CompUnitParser::new()
         .parse(Lexer::new(input))
-        .expect("Failed to parse input")
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("parse error: {err:?}")))
 }
 
-fn ast_to_koopa_lines(ast: &CompUnit) -> (KoopaLines, Background) {
-    if let Err(err) = ast.validate_async_syntax() {
-        panic!("{}", err);
-    }
+fn ast_to_koopa_lines(ast: &CompUnit) -> Result<(KoopaLines, Background)> {
+    ast.validate_semantics()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     if ast.contains_async_syntax() {
         let _ = ast.analyze_async();
     }
     let mut bg = ast_tool::Background::new();
     scan_global_symbol(ast.clone(), &mut bg);
     let lines = ast.to_koopa_lines(&mut bg);
-    (lines, bg)
+    Ok((lines, bg))
 }
 
 fn main() -> Result<()> {
@@ -74,21 +75,26 @@ fn main() -> Result<()> {
     match args.mode {
         Mode::Koopa => {
             let input = read_to_string(args.input)?;
-            let ast = str_to_ast(&input);
-            let (koopa_lines, _) = ast_to_koopa_lines(&ast);
+            let ast = str_to_ast(&input)?;
+            let (koopa_lines, _) = ast_to_koopa_lines(&ast)?;
+            eprintln!(
+                "warning: -koopa is a debug/legacy output path; LLVM/RV32 is the correctness path for struct and async semantics"
+            );
             std::fs::write(args.output, koopa_lines.to_wrapped_string())?;
         }
         Mode::Llvm => {
             let input = read_to_string(args.input)?;
-            let ast = str_to_ast(&input);
+            let ast = str_to_ast(&input)?;
             let target = resolve_llvm_target(&args.target);
-            let llvm_ir = compile_to_llvm_with_target(&ast, &target);
+            let llvm_ir = try_compile_to_llvm_with_target(&ast, &target)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
             std::fs::write(args.output, llvm_ir)?;
         }
         Mode::Riscv => {
             let input = read_to_string(args.input)?;
-            let ast = str_to_ast(&input);
-            let llvm_ir = compile_to_llvm(&ast);
+            let ast = str_to_ast(&input)?;
+            let llvm_ir = try_compile_to_llvm(&ast)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
             compile_llvm_to_riscv_asm(&llvm_ir, &args.output)?;
         }
     }

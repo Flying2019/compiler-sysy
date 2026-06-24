@@ -1,3 +1,5 @@
+// Legacy native-Koopa assembly helpers. The maintained `-riscv` path goes
+// through `llvm_ir.rs` and clang; this module is retained for compatibility.
 use crate::riscv::{AsmLine, AsmValue, RegAddress, RegLocation, RegName, RegisterAllocator};
 use core::panic;
 use koopa::ir::dfg::DataFlowGraph;

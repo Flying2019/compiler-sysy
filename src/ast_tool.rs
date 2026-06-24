@@ -5,7 +5,7 @@ use crate::lalr::VarDecl;
 use crate::{
     ast::{AstNode, ReturnValue},
     lalr::{
-        eval_param_dim, func_param_btype, BType, BinaryOp, CompUnit, Exp, FuncParam, GlobleDef,
+        eval_param_dim, func_param_btype, BType, BinaryOp, CompUnit, Exp, FuncParam, GlobalDef,
         StructDef, Type, UnaryOp,
     },
 };
@@ -666,16 +666,16 @@ pub fn resolve_decl_value_type(base: &Type, var: &VarDecl, bg: &Background) -> V
 }
 
 pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
-    for glob_def in &comp_unit.glob_defs {
-        if let GlobleDef::StructDef(def) = glob_def {
+    for glob_def in &comp_unit.global_defs {
+        if let GlobalDef::StructDef(def) = glob_def {
             bg.register_struct_def(def.clone());
         }
     }
     bg.resolve_struct_layouts();
 
-    for glob_def in comp_unit.glob_defs {
+    for glob_def in comp_unit.global_defs {
         match glob_def {
-            GlobleDef::FuncDef(func_def) => {
+            GlobalDef::FuncDef(func_def) => {
                 let func_name = func_def.ident.clone();
                 let params: Vec<BType> = func_def
                     .func_params
@@ -692,7 +692,7 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                     .async_function
                     .insert(func_def.ident, func_def.is_async);
             }
-            GlobleDef::GlobleDecl(ty, decls) => {
+            GlobalDef::GlobalDecl(ty, decls) => {
                 for decl in decls {
                     if matches!(ty, Type::Const(_)) {
                         if let (VarDecl::Ident(var_name), Some(crate::lalr::InitVal::Exp(exp))) =
@@ -724,7 +724,7 @@ pub fn scan_global_symbol(comp_unit: CompUnit, bg: &mut Background) {
                         .insert(var_name, value_type);
                 }
             }
-            GlobleDef::StructDef(_) => {}
+            GlobalDef::StructDef(_) => {}
         }
     }
 

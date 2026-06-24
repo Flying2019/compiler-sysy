@@ -1,12 +1,13 @@
 use crate::lalr::{
-    eval_const_exp_with, eval_param_dim, func_param_btype, BType, BinaryOp,
-    CompUnit, Exp, FuncDef, FuncParam, GlobleDef, InitVal, SingleDecl, Stmt, StructDef, Type,
-    UnaryOp, VarDecl,
+    eval_const_exp_with, eval_param_dim, func_param_btype, BType, BinaryOp, CompUnit, Exp, FuncDef,
+    FuncParam, GlobalDef, InitVal, SingleDecl, Stmt, StructDef, Type, UnaryOp, VarDecl,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::Path;
-use std::process::Command;
+
+pub use crate::llvm_riscv::compile_llvm_to_riscv_asm;
+
+const RV32_WORD_SIZE: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LlvmType {
@@ -49,25 +50,29 @@ impl LlvmType {
 
     fn size(&self, structs: &HashMap<String, StructLayout>) -> usize {
         match self {
-            Self::I32 | Self::Ptr(_) | Self::Promise(_) => 4,
+            Self::I32 | Self::Ptr(_) | Self::Promise(_) => RV32_WORD_SIZE,
             Self::Void => 0,
             Self::Array(len, inner) => len * inner.size(structs),
-            Self::Struct(name) => structs
-                .get(name)
-                .unwrap_or_else(|| panic!("Unknown struct type {}", name))
-                .size,
+            Self::Struct(name) => {
+                structs
+                    .get(name)
+                    .unwrap_or_else(|| panic!("Unknown struct type {}", name))
+                    .size
+            }
         }
     }
 
     fn align(&self, structs: &HashMap<String, StructLayout>) -> usize {
         match self {
-            Self::I32 | Self::Ptr(_) | Self::Promise(_) => 4,
+            Self::I32 | Self::Ptr(_) | Self::Promise(_) => RV32_WORD_SIZE,
             Self::Void => 1,
             Self::Array(_, inner) => inner.align(structs),
-            Self::Struct(name) => structs
-                .get(name)
-                .unwrap_or_else(|| panic!("Unknown struct type {}", name))
-                .align,
+            Self::Struct(name) => {
+                structs
+                    .get(name)
+                    .unwrap_or_else(|| panic!("Unknown struct type {}", name))
+                    .align
+            }
         }
     }
 
@@ -94,6 +99,7 @@ struct StructLayout {
 struct FuncSig {
     ret: LlvmType,
     is_async: bool,
+    params: Vec<LlvmType>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,8 +122,17 @@ struct LValue {
 
 #[derive(Debug, Clone)]
 struct FrameField {
-    offset: usize,
+    frame_type: String,
+    index: usize,
     ty: LlvmType,
+}
+
+#[derive(Debug, Clone)]
+struct AsyncFrameLayout {
+    type_name: String,
+    fields: HashMap<String, FrameField>,
+    ordered_fields: Vec<(String, LlvmType)>,
+    size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +141,7 @@ struct AwaitPointInfo {
     child_field: String,
     result_target: Option<String>,
     resume_index: usize,
+    callback_name: String,
 }
 
 #[derive(Debug, Default)]
@@ -140,6 +156,7 @@ struct ModuleCtx {
 #[derive(Debug)]
 struct FunctionCtx<'a> {
     module: &'a ModuleCtx,
+    ret_ty: LlvmType,
     vars: Vec<HashMap<String, VarInfo>>,
     lines: Vec<String>,
     tmp_counter: usize,
@@ -161,9 +178,292 @@ pub fn compile_to_llvm(ast: &CompUnit) -> String {
     compile_to_llvm_with_target(ast, "riscv32-unknown-unknown-elf")
 }
 
+pub fn try_compile_to_llvm(ast: &CompUnit) -> Result<String, String> {
+    try_compile_to_llvm_with_target(ast, "riscv32-unknown-unknown-elf")
+}
+
 pub fn compile_to_llvm_with_target(ast: &CompUnit, target_triple: &str) -> String {
-    ast.validate_async_syntax()
-        .unwrap_or_else(|err| panic!("{}", err));
+    try_compile_to_llvm_with_target(ast, target_triple).unwrap_or_else(|err| panic!("{}", err))
+}
+
+pub fn try_compile_to_llvm_with_target(
+    ast: &CompUnit,
+    target_triple: &str,
+) -> Result<String, String> {
+    let ast = normalize_async_awaits(ast);
+    ast.validate_semantics()?;
+    catch_lowering_errors(|| emit_llvm_unchecked(&ast, target_triple))
+}
+
+fn catch_lowering_errors<F>(f: F) -> Result<String, String>
+where
+    F: FnOnce() -> String,
+{
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(previous_hook);
+    result.map_err(|payload| {
+        let message = if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else {
+            "unknown panic".to_string()
+        };
+        format!("LLVM lowering failed: {}", message)
+    })
+}
+
+fn normalize_async_awaits(ast: &CompUnit) -> CompUnit {
+    let mut used_names = HashSet::new();
+    collect_names_comp_unit(ast, &mut used_names);
+    let mut lifter = AwaitLifter {
+        next_id: 0,
+        used_names,
+    };
+    CompUnit {
+        global_defs: ast
+            .global_defs
+            .iter()
+            .map(|global| match global {
+                GlobalDef::FuncDef(func) if func.is_async => {
+                    let mut func = func.clone();
+                    func.block = lifter.lift_stmts(&func.block);
+                    GlobalDef::FuncDef(func)
+                }
+                other => other.clone(),
+            })
+            .collect(),
+    }
+}
+
+struct AwaitLifter {
+    next_id: usize,
+    used_names: HashSet<String>,
+}
+
+impl AwaitLifter {
+    fn lift_stmts(&mut self, stmts: &[Stmt]) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        for stmt in stmts {
+            out.extend(self.lift_stmt(stmt));
+        }
+        out
+    }
+
+    fn lift_stmt(&mut self, stmt: &Stmt) -> Vec<Stmt> {
+        let mut prelude = Vec::new();
+        let stmt = match stmt {
+            Stmt::Block(stmts) => Stmt::Block(self.lift_stmts(stmts)),
+            Stmt::Assign(lhs, rhs)
+                if matches!(lhs, Exp::Ident(_)) && matches!(rhs, Exp::Await(_)) =>
+            {
+                Stmt::Assign(lhs.clone(), self.lift_top_level_await(rhs, &mut prelude))
+            }
+            Stmt::Assign(lhs, rhs) => {
+                let rhs = self.lift_exp(rhs, &mut prelude);
+                Stmt::Assign(lhs.clone(), rhs)
+            }
+            Stmt::Decl(ty, decls) => {
+                let mut out = Vec::new();
+                for decl in decls {
+                    let mut decl_prelude = Vec::new();
+                    let init = decl.init.as_ref().map(|init| match init {
+                        InitVal::Exp(exp) if matches!(exp, Exp::Await(_)) => {
+                            InitVal::Exp(self.lift_top_level_await(exp, &mut decl_prelude))
+                        }
+                        _ => self.lift_init(init, &mut decl_prelude),
+                    });
+                    out.extend(decl_prelude);
+                    out.push(Stmt::Decl(
+                        ty.clone(),
+                        vec![SingleDecl {
+                            var: decl.var.clone(),
+                            init,
+                        }],
+                    ));
+                }
+                return out;
+            }
+            Stmt::Exp(exp) if matches!(exp, Exp::Await(_)) => {
+                Stmt::Exp(self.lift_top_level_await(exp, &mut prelude))
+            }
+            Stmt::Exp(exp) => Stmt::Exp(self.lift_exp(exp, &mut prelude)),
+            Stmt::Return(Some(exp)) if matches!(exp, Exp::Await(_)) => {
+                Stmt::Return(Some(self.lift_top_level_await(exp, &mut prelude)))
+            }
+            Stmt::Return(Some(exp)) => Stmt::Return(Some(self.lift_exp(exp, &mut prelude))),
+            Stmt::PromiseWait(exp) => Stmt::PromiseWait(self.lift_exp(exp, &mut prelude)),
+            Stmt::If(cond, then_stmt) => {
+                let cond = self.lift_exp(cond, &mut prelude);
+                Stmt::If(cond, Box::new(self.lift_stmt_as_block(then_stmt)))
+            }
+            Stmt::IfElse(cond, then_stmt, else_stmt) => {
+                let cond = self.lift_exp(cond, &mut prelude);
+                Stmt::IfElse(
+                    cond,
+                    Box::new(self.lift_stmt_as_block(then_stmt)),
+                    Box::new(self.lift_stmt_as_block(else_stmt)),
+                )
+            }
+            Stmt::While(cond, body) => {
+                // Await in a loop condition cannot be hoisted without changing loop semantics.
+                Stmt::While(cond.clone(), Box::new(self.lift_stmt_as_block(body)))
+            }
+            Stmt::Continue | Stmt::Break | Stmt::Return(None) | Stmt::Empty => stmt.clone(),
+        };
+        prelude.push(stmt);
+        prelude
+    }
+
+    fn lift_stmt_as_block(&mut self, stmt: &Stmt) -> Stmt {
+        match stmt {
+            Stmt::Block(stmts) => Stmt::Block(self.lift_stmts(stmts)),
+            other => {
+                let stmts = self.lift_stmt(other);
+                if stmts.len() == 1 {
+                    stmts.into_iter().next().unwrap()
+                } else {
+                    Stmt::Block(stmts)
+                }
+            }
+        }
+    }
+
+    fn lift_top_level_await(&mut self, exp: &Exp, prelude: &mut Vec<Stmt>) -> Exp {
+        match exp {
+            Exp::Await(inner) => Exp::Await(Box::new(self.lift_exp(inner, prelude))),
+            _ => self.lift_exp(exp, prelude),
+        }
+    }
+
+    fn lift_init(&mut self, init: &InitVal, prelude: &mut Vec<Stmt>) -> InitVal {
+        match init {
+            InitVal::Exp(exp) => InitVal::Exp(self.lift_exp(exp, prelude)),
+            InitVal::Arr(items) => InitVal::Arr(
+                items
+                    .iter()
+                    .map(|item| self.lift_init(item, prelude))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn lift_exp(&mut self, exp: &Exp, prelude: &mut Vec<Stmt>) -> Exp {
+        match exp {
+            Exp::Await(inner) => {
+                let inner = self.lift_exp(inner, prelude);
+                let temp = self.next_temp();
+                prelude.push(Stmt::Decl(
+                    Type::BType(BType::I32),
+                    vec![SingleDecl {
+                        var: VarDecl::Ident(temp.clone()),
+                        init: Some(InitVal::Exp(Exp::Await(Box::new(inner)))),
+                    }],
+                ));
+                Exp::Ident(temp)
+            }
+            Exp::UnaryExp(op, inner) => {
+                Exp::UnaryExp(op.clone(), Box::new(self.lift_exp(inner, prelude)))
+            }
+            Exp::BinaryExp(op @ (BinaryOp::And | BinaryOp::Or), lhs, rhs) => {
+                Exp::BinaryExp(op.clone(), lhs.clone(), rhs.clone())
+            }
+            Exp::BinaryExp(op, lhs, rhs) => Exp::BinaryExp(
+                op.clone(),
+                Box::new(self.lift_exp(lhs, prelude)),
+                Box::new(self.lift_exp(rhs, prelude)),
+            ),
+            Exp::Sleep(inner) => Exp::Sleep(Box::new(self.lift_exp(inner, prelude))),
+            Exp::PromiseWait(inner) => Exp::PromiseWait(Box::new(self.lift_exp(inner, prelude))),
+            Exp::FuncCall(name, args) => Exp::FuncCall(
+                name.clone(),
+                args.iter().map(|arg| self.lift_exp(arg, prelude)).collect(),
+            ),
+            Exp::ArrGet(base, index) => Exp::ArrGet(
+                Box::new(self.lift_exp(base, prelude)),
+                Box::new(self.lift_exp(index, prelude)),
+            ),
+            Exp::Field(base, field) => {
+                Exp::Field(Box::new(self.lift_exp(base, prelude)), field.clone())
+            }
+            Exp::PtrField(base, field) => {
+                Exp::PtrField(Box::new(self.lift_exp(base, prelude)), field.clone())
+            }
+            Exp::Number(_) | Exp::New(_) | Exp::Ident(_) => exp.clone(),
+        }
+    }
+
+    fn next_temp(&mut self) -> String {
+        loop {
+            let name = format!("sysy_await_tmp_{}", self.next_id);
+            self.next_id += 1;
+            if self.used_names.insert(name.clone()) {
+                return name;
+            }
+        }
+    }
+}
+
+fn collect_names_comp_unit(ast: &CompUnit, names: &mut HashSet<String>) {
+    for global in &ast.global_defs {
+        match global {
+            GlobalDef::FuncDef(func) => {
+                names.insert(func.ident.clone());
+                for param in &func.func_params {
+                    names.insert(param.name.clone());
+                }
+                collect_names_stmts(&func.block, names);
+            }
+            GlobalDef::GlobalDecl(_, decls) => {
+                for decl in decls {
+                    names.insert(var_decl_name(&decl.var));
+                }
+            }
+            GlobalDef::StructDef(def) => {
+                names.insert(def.name.clone());
+                for field in &def.fields {
+                    for decl in &field.decls {
+                        names.insert(var_decl_name(&decl.var));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_names_stmts(stmts: &[Stmt], names: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Block(stmts) => collect_names_stmts(stmts, names),
+            Stmt::Decl(_, decls) => {
+                for decl in decls {
+                    names.insert(var_decl_name(&decl.var));
+                }
+            }
+            Stmt::If(_, then_stmt) => collect_names_stmt(then_stmt, names),
+            Stmt::IfElse(_, then_stmt, else_stmt) => {
+                collect_names_stmt(then_stmt, names);
+                collect_names_stmt(else_stmt, names);
+            }
+            Stmt::While(_, body) => collect_names_stmt(body, names),
+            Stmt::Assign(_, _)
+            | Stmt::Exp(_)
+            | Stmt::PromiseWait(_)
+            | Stmt::Continue
+            | Stmt::Break
+            | Stmt::Return(_)
+            | Stmt::Empty => {}
+        }
+    }
+}
+
+fn collect_names_stmt(stmt: &Stmt, names: &mut HashSet<String>) {
+    collect_names_stmts(std::slice::from_ref(stmt), names);
+}
+
+fn emit_llvm_unchecked(ast: &CompUnit, target_triple: &str) -> String {
     let mut module = ModuleCtx::new();
     module.scan(ast);
     module.resolve_struct_layouts();
@@ -179,7 +479,12 @@ pub fn compile_to_llvm_with_target(ast: &CompUnit, target_triple: &str) -> Strin
             .map(|field| field.ty.llvm())
             .collect::<Vec<_>>()
             .join(", ");
-        let _ = writeln!(out, "%struct.{} = type {{ {} }}", sanitize_ident(name), fields);
+        let _ = writeln!(
+            out,
+            "%struct.{} = type {{ {} }}",
+            sanitize_ident(name),
+            fields
+        );
     }
     if !module.layouts.is_empty() {
         out.push('\n');
@@ -197,16 +502,26 @@ pub fn compile_to_llvm_with_target(ast: &CompUnit, target_triple: &str) -> Strin
     out.push_str("declare void @putarray(i32, ptr)\n");
     out.push_str("declare void @starttime()\n");
     out.push_str("declare void @stoptime()\n\n");
-    out.push_str(PROMISE_RUNTIME);
+    out.push_str("declare ptr @__sysy_promise_new_i32()\n");
+    out.push_str("declare void @__sysy_promise_resolve_i32(ptr, i32)\n");
+    out.push_str("declare i32 @__sysy_promise_result_i32(ptr)\n");
+    out.push_str("declare i32 @__sysy_promise_wait_i32(ptr)\n");
+    out.push_str("declare ptr @__sysy_promise_new_void()\n");
+    out.push_str("declare void @__sysy_promise_resolve_void(ptr)\n");
+    out.push_str("declare void @__sysy_promise_wait_void(ptr)\n");
+    out.push_str("declare i32 @__sysy_promise_is_ready(ptr)\n");
+    out.push_str("declare void @__sysy_promise_set_callback(ptr, ptr, ptr)\n");
+    out.push_str("declare void @__sysy_pending_add(ptr, ptr, ptr)\n");
+    out.push_str("declare ptr @__sysy_sleep(i32)\n\n");
 
-    for glob_def in &ast.glob_defs {
-        if let GlobleDef::GlobleDecl(ty, decls) = glob_def {
+    for glob_def in &ast.global_defs {
+        if let GlobalDef::GlobalDecl(ty, decls) = glob_def {
             emit_global_decl(&mut out, &module, ty, decls);
         }
     }
 
-    for glob_def in &ast.glob_defs {
-        if let GlobleDef::FuncDef(func) = glob_def {
+    for glob_def in &ast.global_defs {
+        if let GlobalDef::FuncDef(func) = glob_def {
             if func.is_async && func.ident == "main" {
                 let mut hidden = func.clone();
                 hidden.ident = "__sysy_async_main".to_string();
@@ -220,65 +535,37 @@ pub fn compile_to_llvm_with_target(ast: &CompUnit, target_triple: &str) -> Strin
     out
 }
 
-pub fn compile_llvm_to_riscv_asm(llvm_ir: &str, output: &Path) -> std::io::Result<()> {
-    let mut input = std::env::temp_dir();
-    let unique = format!(
-        "compile_sysy_{}_{}.ll",
-        std::process::id(),
-        unique_suffix()
-    );
-    input.push(unique);
-    std::fs::write(&input, llvm_ir)?;
-    let clang = std::env::var("SYSY_CLANG").unwrap_or_else(|_| default_clang());
-    let status = Command::new(&clang)
-        .arg("-target")
-        .arg("riscv32-unknown-elf")
-        .arg("-march=rv32im")
-        .arg("-mabi=ilp32")
-        .arg("-S")
-        .arg("-ffreestanding")
-        .arg("-fno-addrsig")
-        .arg("-nostdlib")
-        .arg("-O0")
-        .arg(&input)
-        .arg("-o")
-        .arg(output)
-        .status()?;
-    let _ = std::fs::remove_file(&input);
-    if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("{} failed to compile LLVM IR to RISC-V assembly", clang),
-        ));
-    }
-    Ok(())
-}
-
 impl ModuleCtx {
     fn new() -> Self {
         Self::default()
     }
 
     fn scan(&mut self, ast: &CompUnit) {
-        for glob_def in &ast.glob_defs {
-            if let GlobleDef::StructDef(def) = glob_def {
+        for glob_def in &ast.global_defs {
+            if let GlobalDef::StructDef(def) = glob_def {
                 self.structs.insert(def.name.clone(), def.clone());
             }
         }
         self.insert_runtime_funcs();
-        for glob_def in &ast.glob_defs {
+        for glob_def in &ast.global_defs {
             match glob_def {
-                GlobleDef::FuncDef(func) => {
+                GlobalDef::FuncDef(func) => {
                     let ret = type_to_llvm(&func.func_type);
+                    let params = func
+                        .func_params
+                        .iter()
+                        .map(|param| LlvmType::from_btype(&param_resolved_btype(param, self)))
+                        .collect::<Vec<_>>();
                     self.funcs.insert(
                         func.ident.clone(),
                         FuncSig {
                             ret,
                             is_async: func.is_async,
+                            params,
                         },
                     );
                 }
-                GlobleDef::GlobleDecl(ty, decls) => {
+                GlobalDef::GlobalDecl(ty, decls) => {
                     for decl in decls {
                         let name = var_decl_name(&decl.var);
                         let value_ty = decl_type(ty, &decl.var, self);
@@ -293,7 +580,7 @@ impl ModuleCtx {
                         }
                     }
                 }
-                GlobleDef::StructDef(_) => {}
+                GlobalDef::StructDef(_) => {}
             }
         }
     }
@@ -317,6 +604,7 @@ impl ModuleCtx {
                 FuncSig {
                     ret,
                     is_async: false,
+                    params: _params,
                 },
             );
         }
@@ -344,7 +632,7 @@ impl ModuleCtx {
             .clone();
         let mut fields = Vec::new();
         let mut offset = 0usize;
-        let mut align = 4usize;
+        let mut align = RV32_WORD_SIZE;
         for field in &def.fields {
             for decl in &field.decls {
                 let ty = decl_type(&field.ty, &decl.var, self);
@@ -387,9 +675,10 @@ impl ModuleCtx {
 }
 
 impl<'a> FunctionCtx<'a> {
-    fn new(module: &'a ModuleCtx, _ret_ty: LlvmType, is_async: bool) -> Self {
+    fn new(module: &'a ModuleCtx, ret_ty: LlvmType, is_async: bool) -> Self {
         Self {
             module,
+            ret_ty,
             vars: vec![HashMap::new()],
             lines: Vec::new(),
             tmp_counter: 0,
@@ -585,7 +874,12 @@ fn emit_function(module: &ModuleCtx, func: &FuncDef) -> String {
     let params = func
         .func_params
         .iter()
-        .map(|param| (param.name.clone(), LlvmType::from_btype(&param_resolved_btype(param, module))))
+        .map(|param| {
+            (
+                param.name.clone(),
+                LlvmType::from_btype(&param_resolved_btype(param, module)),
+            )
+        })
         .collect::<Vec<_>>();
     let mut ctx = FunctionCtx::new(module, original_ret.clone(), false);
     let param_sig = params
@@ -632,91 +926,193 @@ fn emit_function(module: &ModuleCtx, func: &FuncDef) -> String {
 
 fn async_frame_layout(
     module: &ModuleCtx,
+    frame_type: &str,
     params: &[(String, LlvmType)],
     stmts: &[Stmt],
-) -> (HashMap<String, FrameField>, usize) {
+    frame_locals: &HashSet<String>,
+) -> AsyncFrameLayout {
     let mut fields = HashMap::new();
+    let mut ordered_fields = Vec::new();
     let mut offset = 0usize;
     add_frame_field(
         &mut fields,
+        &mut ordered_fields,
         &mut offset,
+        &module.layouts,
+        frame_type,
         "__promise".to_string(),
         LlvmType::Promise(Box::new(LlvmType::Void)),
     );
-    add_frame_field(&mut fields, &mut offset, "__state".to_string(), LlvmType::I32);
+    add_frame_field(
+        &mut fields,
+        &mut ordered_fields,
+        &mut offset,
+        &module.layouts,
+        frame_type,
+        "__state".to_string(),
+        LlvmType::I32,
+    );
     for (name, ty) in params {
-        add_frame_field(&mut fields, &mut offset, name.clone(), ty.clone());
+        add_frame_field(
+            &mut fields,
+            &mut ordered_fields,
+            &mut offset,
+            &module.layouts,
+            frame_type,
+            name.clone(),
+            ty.clone(),
+        );
     }
-    collect_async_decl_fields(module, stmts, &mut fields, &mut offset);
+    collect_async_decl_fields(
+        module,
+        frame_type,
+        stmts,
+        frame_locals,
+        &mut fields,
+        &mut ordered_fields,
+        &mut offset,
+    );
     let await_count = count_await_stmts(stmts);
     for idx in 0..await_count {
         add_frame_field(
             &mut fields,
+            &mut ordered_fields,
             &mut offset,
+            &module.layouts,
+            frame_type,
             format!("__await{}", idx),
             LlvmType::Promise(Box::new(LlvmType::I32)),
         );
     }
-    add_frame_field(&mut fields, &mut offset, "__return".to_string(), LlvmType::I32);
-    (fields, align_up(offset, 4))
+    add_frame_field(
+        &mut fields,
+        &mut ordered_fields,
+        &mut offset,
+        &module.layouts,
+        frame_type,
+        "__return".to_string(),
+        LlvmType::I32,
+    );
+    AsyncFrameLayout {
+        type_name: frame_type.to_string(),
+        fields,
+        ordered_fields,
+        size: align_up(offset, RV32_WORD_SIZE),
+    }
 }
 
 fn add_frame_field(
     fields: &mut HashMap<String, FrameField>,
+    ordered_fields: &mut Vec<(String, LlvmType)>,
     offset: &mut usize,
+    structs: &HashMap<String, StructLayout>,
+    frame_type: &str,
     name: String,
     ty: LlvmType,
 ) {
     if fields.contains_key(&name) {
         return;
     }
-    *offset = align_up(*offset, 4);
+    let field_align = ty.align(structs).max(RV32_WORD_SIZE);
+    *offset = align_up(*offset, field_align);
+    let index = ordered_fields.len();
     fields.insert(
-        name,
+        name.clone(),
         FrameField {
-            offset: *offset,
+            frame_type: frame_type.to_string(),
+            index,
             ty: ty.clone(),
         },
     );
-    *offset += ty.size(&HashMap::new()).max(4);
+    ordered_fields.push((name, ty.clone()));
+    *offset += ty.size(structs).max(RV32_WORD_SIZE);
 }
 
 fn collect_async_decl_fields(
     module: &ModuleCtx,
+    frame_type: &str,
     stmts: &[Stmt],
+    frame_locals: &HashSet<String>,
     fields: &mut HashMap<String, FrameField>,
+    ordered_fields: &mut Vec<(String, LlvmType)>,
     offset: &mut usize,
 ) {
     for stmt in stmts {
         match stmt {
             Stmt::Decl(ty, decls) => {
                 for decl in decls {
+                    let name = var_decl_name(&decl.var);
+                    if !frame_locals.contains(&name) {
+                        continue;
+                    }
                     add_frame_field(
                         fields,
+                        ordered_fields,
                         offset,
-                        var_decl_name(&decl.var),
+                        &module.layouts,
+                        frame_type,
+                        name,
                         decl_type(ty, &decl.var, module),
                     );
                 }
             }
-            Stmt::Block(stmts) => collect_async_decl_fields(module, stmts, fields, offset),
-            Stmt::If(_, then_stmt) => {
-                collect_async_decl_fields(module, std::slice::from_ref(then_stmt), fields, offset)
-            }
+            Stmt::Block(stmts) => collect_async_decl_fields(
+                module,
+                frame_type,
+                stmts,
+                frame_locals,
+                fields,
+                ordered_fields,
+                offset,
+            ),
+            Stmt::If(_, then_stmt) => collect_async_decl_fields(
+                module,
+                frame_type,
+                std::slice::from_ref(then_stmt),
+                frame_locals,
+                fields,
+                ordered_fields,
+                offset,
+            ),
             Stmt::IfElse(_, then_stmt, else_stmt) => {
-                collect_async_decl_fields(module, std::slice::from_ref(then_stmt), fields, offset);
-                collect_async_decl_fields(module, std::slice::from_ref(else_stmt), fields, offset);
+                collect_async_decl_fields(
+                    module,
+                    frame_type,
+                    std::slice::from_ref(then_stmt),
+                    frame_locals,
+                    fields,
+                    ordered_fields,
+                    offset,
+                );
+                collect_async_decl_fields(
+                    module,
+                    frame_type,
+                    std::slice::from_ref(else_stmt),
+                    frame_locals,
+                    fields,
+                    ordered_fields,
+                    offset,
+                );
             }
-            Stmt::While(_, body) => {
-                collect_async_decl_fields(module, std::slice::from_ref(body), fields, offset)
-            }
+            Stmt::While(_, body) => collect_async_decl_fields(
+                module,
+                frame_type,
+                std::slice::from_ref(body),
+                frame_locals,
+                fields,
+                ordered_fields,
+                offset,
+            ),
             _ => {}
         }
     }
 }
 
 fn count_await_stmts(stmts: &[Stmt]) -> usize {
-    stmts.iter().filter(|stmt| stmt_has_top_level_await(stmt)).count()
+    stmts
+        .iter()
+        .filter(|stmt| stmt_has_top_level_await(stmt))
+        .count()
 }
 
 fn stmt_has_top_level_await(stmt: &Stmt) -> bool {
@@ -729,7 +1125,11 @@ fn stmt_has_top_level_await(stmt: &Stmt) -> bool {
         || matches!(stmt, Stmt::Return(Some(Exp::Await(_))))
 }
 
-fn collect_await_points(module: &ModuleCtx, stmts: &[Stmt]) -> Vec<AwaitPointInfo> {
+fn collect_await_points(
+    module: &ModuleCtx,
+    safe_func_name: &str,
+    stmts: &[Stmt],
+) -> Vec<AwaitPointInfo> {
     let mut points = Vec::new();
     for (idx, stmt) in stmts.iter().enumerate() {
         if !stmt_has_top_level_await(stmt) {
@@ -748,11 +1148,13 @@ fn collect_await_points(module: &ModuleCtx, stmts: &[Stmt]) -> Vec<AwaitPointInf
             _ => None,
         };
         let _ = module;
+        let state = (points.len() + 1) as i32;
         points.push(AwaitPointInfo {
-            state: (points.len() + 1) as i32,
+            state,
             child_field: format!("__await{}", points.len()),
             result_target,
             resume_index: idx + 1,
+            callback_name: format!("__sysy_async_cont_{}_{}", safe_func_name, state),
         });
     }
     points
@@ -761,8 +1163,8 @@ fn collect_await_points(module: &ModuleCtx, stmts: &[Stmt]) -> Vec<AwaitPointInf
 fn async_field_ptr(ctx: &mut FunctionCtx<'_>, frame: &str, field: &FrameField) -> String {
     let ptr = ctx.tmp();
     ctx.emit(format!(
-        "  {} = getelementptr i8, ptr {}, i32 {}",
-        ptr, frame, field.offset
+        "  {} = getelementptr inbounds {}, ptr {}, i32 0, i32 {}",
+        ptr, field.frame_type, frame, field.index
     ));
     ptr
 }
@@ -799,11 +1201,30 @@ fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
             )
         })
         .collect::<Vec<_>>();
-    let (fields, frame_size) = async_frame_layout(module, &params, &func.block);
     let safe_name = sanitize_ident(&func.ident);
+    let frame_type = format!("%async.frame.{}", safe_name);
+    let frame_locals = func
+        .analyze_async()
+        .frame_local_candidates
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let frame_layout = async_frame_layout(module, &frame_type, &params, &func.block, &frame_locals);
+    let fields = &frame_layout.fields;
     let step_name = format!("__sysy_async_step_{}", safe_name);
+    let awaits = collect_await_points(module, &safe_name, &func.block);
 
     let mut out = String::new();
+    let frame_fields = frame_layout
+        .ordered_fields
+        .iter()
+        .map(|(_, ty)| ty.llvm())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        out,
+        "{} = type {{ {} }}\n",
+        frame_layout.type_name, frame_fields
+    );
     let param_sig = params
         .iter()
         .enumerate()
@@ -815,8 +1236,16 @@ fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
     entry.emit_label("entry");
     let promise = entry.promise_new(&ret_ty);
     let frame = entry.tmp();
-    entry.emit(format!("  {} = call ptr @malloc(i32 {})", frame, frame_size));
-    async_store_field(&mut entry, &frame, fields.get("__promise").unwrap(), &promise);
+    entry.emit(format!(
+        "  {} = call ptr @malloc(i32 {})",
+        frame, frame_layout.size
+    ));
+    async_store_field(
+        &mut entry,
+        &frame,
+        fields.get("__promise").unwrap(),
+        &promise,
+    );
     async_store_i32(&mut entry, &frame, fields.get("__state").unwrap(), "0");
     for (idx, (name, ty)) in params.iter().enumerate() {
         let value = Value {
@@ -855,12 +1284,16 @@ fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
         );
     }
 
-    let awaits = collect_await_points(module, &func.block);
     let state_field = fields.get("__state").unwrap();
     let state_val = async_load_field(&mut ctx, "%frame", state_field);
     let state_labels = awaits
         .iter()
-        .map(|await_info| format!("i32 {}, label %async.state.{}", await_info.state, await_info.state))
+        .map(|await_info| {
+            format!(
+                "i32 {}, label %async.state.{}",
+                await_info.state, await_info.state
+            )
+        })
         .collect::<Vec<_>>()
         .join(" ");
     if state_labels.is_empty() {
@@ -877,7 +1310,6 @@ fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
         fields: &fields,
         awaits: &awaits,
         next_await: 0,
-        step_name: step_name.clone(),
     };
     emitter.emit_stmts(&mut ctx, &func.block);
     if !ctx.current_terminated {
@@ -893,7 +1325,11 @@ fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
 
     for await_info in &awaits {
         ctx.emit_label(&format!("async.state.{}", await_info.state));
-        let child = async_load_field(&mut ctx, "%frame", fields.get(&await_info.child_field).unwrap());
+        let child = async_load_field(
+            &mut ctx,
+            "%frame",
+            fields.get(&await_info.child_field).unwrap(),
+        );
         let ready = ctx.tmp();
         ctx.emit(format!(
             "  {} = call i32 @__sysy_promise_is_ready(ptr {})",
@@ -919,10 +1355,9 @@ fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
                 ctx.terminate("  ret void".to_string());
                 continue;
             } else {
-                let target_field = fields.get(target).unwrap_or_else(|| {
-                    panic!("async await target {} is not stored in the frame", target)
-                });
-                async_store_field(&mut ctx, "%frame", target_field, &value);
+                if let Some(target_field) = fields.get(target) {
+                    async_store_field(&mut ctx, "%frame", target_field, &value);
+                }
             }
         }
         async_store_i32(&mut ctx, "%frame", state_field, "0");
@@ -948,6 +1383,15 @@ fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
         let _ = writeln!(out, "{}", line);
     }
     out.push_str("}\n\n");
+
+    for await_info in &awaits {
+        let _ = writeln!(
+            out,
+            "define void @{}(ptr %frame) {{\nentry:\n  call void @{}(ptr %frame)\n  ret void\n}}\n",
+            await_info.callback_name, step_name
+        );
+    }
+
     out
 }
 
@@ -955,7 +1399,6 @@ struct AsyncBodyEmitter<'a> {
     fields: &'a HashMap<String, FrameField>,
     awaits: &'a [AwaitPointInfo],
     next_await: usize,
-    step_name: String,
 }
 
 impl<'a> AsyncBodyEmitter<'a> {
@@ -990,19 +1433,34 @@ impl<'a> AsyncBodyEmitter<'a> {
                                 return;
                             }
                             _ => {
-                                let field = self.fields.get(&name).unwrap();
+                                let value_ty = decl_type(ty, &decl.var, ctx.module);
+                                let ptr = if let Some(field) = self.fields.get(&name) {
+                                    async_field_ptr(ctx, "%frame", field)
+                                } else {
+                                    let ptr = ctx.alloca(&value_ty);
+                                    ctx.insert_var(
+                                        name.clone(),
+                                        VarInfo {
+                                            ptr: ptr.clone(),
+                                            ty: value_ty.clone(),
+                                        },
+                                    );
+                                    ptr
+                                };
                                 let value = match init {
                                     InitVal::Exp(exp) => emit_exp(ctx, exp),
                                     InitVal::Arr(_) => {
-                                        let init_ty = decl_type(ty, &decl.var, ctx.module);
-                                        let init_ptr = async_field_ptr(ctx, "%frame", field);
-                                        init_store(ctx, init, &init_ty, &init_ptr);
+                                        init_store(ctx, init, &value_ty, &ptr);
                                         continue;
                                     }
                                 };
-                                async_store_field(ctx, "%frame", field, &value);
+                                store_value_to_ptr(ctx, &value, &value_ty, &ptr);
                             }
                         }
+                    } else if !self.fields.contains_key(&name) {
+                        let value_ty = decl_type(ty, &decl.var, ctx.module);
+                        let ptr = ctx.alloca(&value_ty);
+                        ctx.insert_var(name, VarInfo { ptr, ty: value_ty });
                     }
                 }
             }
@@ -1016,13 +1474,15 @@ impl<'a> AsyncBodyEmitter<'a> {
             Stmt::Assign(lhs, rhs) => {
                 let value = emit_exp(ctx, rhs);
                 let lvalue = emit_lvalue(ctx, lhs);
-                ctx.store(&value, &lvalue.ptr);
+                store_value_to_ptr(ctx, &value, &lvalue.ty, &lvalue.ptr);
             }
             Stmt::Exp(Exp::Await(inner)) => self.emit_await(ctx, inner, None),
             Stmt::Exp(exp) => {
                 let _ = emit_exp(ctx, exp);
             }
-            Stmt::Return(Some(Exp::Await(inner))) => self.emit_await(ctx, inner, Some("__return".to_string())),
+            Stmt::Return(Some(Exp::Await(inner))) => {
+                self.emit_await(ctx, inner, Some("__return".to_string()))
+            }
             Stmt::Return(Some(exp)) => {
                 let value = emit_exp(ctx, exp);
                 let promise = ctx.promise_ptr.clone().unwrap();
@@ -1039,7 +1499,53 @@ impl<'a> AsyncBodyEmitter<'a> {
                 ctx.terminate("  ret void".to_string());
             }
             Stmt::Block(stmts) => self.emit_stmts(ctx, stmts),
-            Stmt::If(_, _) | Stmt::IfElse(_, _, _) | Stmt::While(_, _) => emit_stmt(ctx, stmt),
+            Stmt::If(cond, then_stmt) => {
+                let then_label = ctx.label("if.then");
+                let end_label = ctx.label("if.end");
+                emit_cond_br(ctx, cond, &then_label, &end_label);
+                ctx.emit_label(&then_label);
+                self.emit_stmt(ctx, then_stmt);
+                if !ctx.current_terminated {
+                    ctx.terminate(format!("  br label %{}", end_label));
+                }
+                ctx.emit_label(&end_label);
+            }
+            Stmt::IfElse(cond, then_stmt, else_stmt) => {
+                let then_label = ctx.label("if.then");
+                let else_label = ctx.label("if.else");
+                let end_label = ctx.label("if.end");
+                emit_cond_br(ctx, cond, &then_label, &else_label);
+                ctx.emit_label(&then_label);
+                self.emit_stmt(ctx, then_stmt);
+                if !ctx.current_terminated {
+                    ctx.terminate(format!("  br label %{}", end_label));
+                }
+                ctx.emit_label(&else_label);
+                self.emit_stmt(ctx, else_stmt);
+                if !ctx.current_terminated {
+                    ctx.terminate(format!("  br label %{}", end_label));
+                }
+                ctx.emit_label(&end_label);
+            }
+            Stmt::While(cond, body) => {
+                let cond_label = ctx.label("while.cond");
+                let body_label = ctx.label("while.body");
+                let end_label = ctx.label("while.end");
+                ctx.terminate(format!("  br label %{}", cond_label));
+                ctx.emit_label(&cond_label);
+                emit_cond_br(ctx, cond, &body_label, &end_label);
+                ctx.emit_label(&body_label);
+                ctx.loop_stack.push(LoopLabels {
+                    break_label: end_label.clone(),
+                    continue_label: cond_label.clone(),
+                });
+                self.emit_stmt(ctx, body);
+                ctx.loop_stack.pop();
+                if !ctx.current_terminated {
+                    ctx.terminate(format!("  br label %{}", cond_label));
+                }
+                ctx.emit_label(&end_label);
+            }
             Stmt::PromiseWait(exp) => {
                 let promise = emit_exp(ctx, exp);
                 let _ = ctx.promise_wait(promise);
@@ -1070,7 +1576,7 @@ impl<'a> AsyncBodyEmitter<'a> {
         );
         ctx.emit(format!(
             "  call void @__sysy_promise_set_callback(ptr {}, ptr @{}, ptr %frame)",
-            child.name, self.step_name
+            child.name, await_info.callback_name
         ));
         let ready = ctx.tmp();
         ctx.emit(format!(
@@ -1096,12 +1602,9 @@ impl<'a> AsyncBodyEmitter<'a> {
                 }
                 ctx.terminate("  ret void".to_string());
             } else if !value.ty.is_void() {
-                async_store_field(
-                    ctx,
-                    "%frame",
-                    self.fields.get(&target_name).unwrap(),
-                    &value,
-                );
+                if let Some(field) = self.fields.get(&target_name) {
+                    async_store_field(ctx, "%frame", field, &value);
+                }
             }
         }
     }
@@ -1141,7 +1644,9 @@ fn emit_global_decl(out: &mut String, module: &ModuleCtx, ty: &Type, decls: &[Si
         let init = match (&value_ty, &decl.init) {
             (LlvmType::I32, Some(init)) => init_const(init, module).unwrap_or(0).to_string(),
             (LlvmType::I32, None) => "0".to_string(),
-            _ => "zeroinitializer".to_string(),
+            (_, Some(init)) => const_initializer(init, &value_ty, module)
+                .unwrap_or_else(|| zero_initializer(&value_ty)),
+            _ => zero_initializer(&value_ty),
         };
         let _ = writeln!(
             out,
@@ -1173,7 +1678,7 @@ fn emit_stmt(ctx: &mut FunctionCtx<'_>, stmt: &Stmt) {
         Stmt::Assign(lhs, rhs) => {
             let value = emit_exp(ctx, rhs);
             let lvalue = emit_lvalue(ctx, lhs);
-            ctx.store(&value, &lvalue.ptr);
+            store_value_to_ptr(ctx, &value, &lvalue.ty, &lvalue.ptr);
         }
         Stmt::Decl(ty, decls) => {
             for decl in decls {
@@ -1208,7 +1713,7 @@ fn emit_stmt(ctx: &mut FunctionCtx<'_>, stmt: &Stmt) {
             let _ = ctx.promise_wait(promise);
         }
         Stmt::Return(Some(exp)) => {
-            let value = emit_exp(ctx, exp);
+            let mut value = emit_exp(ctx, exp);
             if ctx.is_async {
                 let promise = ctx.promise_ptr.clone().unwrap();
                 if value.ty.is_void() {
@@ -1218,6 +1723,11 @@ fn emit_stmt(ctx: &mut FunctionCtx<'_>, stmt: &Stmt) {
                 }
                 ctx.terminate(format!("  ret ptr {}", promise));
             } else {
+                if matches!(ctx.ret_ty, LlvmType::Struct(_))
+                    && matches!(&value.ty, LlvmType::Ptr(inner) if **inner == ctx.ret_ty)
+                {
+                    value = ctx.load(&value.name, &ctx.ret_ty.clone());
+                }
                 ctx.terminate(format!("  ret {} {}", value.ty.llvm(), value.name));
             }
         }
@@ -1388,7 +1898,10 @@ fn emit_exp(ctx: &mut FunctionCtx<'_>, exp: &Exp) -> Value {
         Exp::Sleep(duration) => {
             let value = emit_exp(ctx, duration);
             let promise = ctx.tmp();
-            ctx.emit(format!("  {} = call ptr @__sysy_sleep(i32 {})", promise, value.name));
+            ctx.emit(format!(
+                "  {} = call ptr @__sysy_sleep(i32 {})",
+                promise, value.name
+            ));
             Value {
                 name: promise,
                 ty: LlvmType::Promise(Box::new(LlvmType::Void)),
@@ -1399,7 +1912,10 @@ fn emit_exp(ctx: &mut FunctionCtx<'_>, exp: &Exp) -> Value {
             ctx.promise_wait(promise)
         }
         Exp::FuncCall(name, args) => {
-            let values = args.iter().map(|arg| emit_exp(ctx, arg)).collect::<Vec<_>>();
+            let values = args
+                .iter()
+                .map(|arg| emit_exp(ctx, arg))
+                .collect::<Vec<_>>();
             call_function(ctx, name, &values)
         }
         Exp::ArrGet(_, _) | Exp::Field(_, _) | Exp::PtrField(_, _) => {
@@ -1454,15 +1970,13 @@ fn emit_binary(ctx: &mut FunctionCtx<'_>, op: &BinaryOp, lhs: &Exp, rhs: &Exp) -
     }
 }
 
-fn emit_short_circuit(
-    ctx: &mut FunctionCtx<'_>,
-    op: &BinaryOp,
-    lhs: &Exp,
-    rhs: &Exp,
-) -> Value {
+fn emit_short_circuit(ctx: &mut FunctionCtx<'_>, op: &BinaryOp, lhs: &Exp, rhs: &Exp) -> Value {
     let lhs_value = emit_exp(ctx, lhs);
     let lhs_bool = ctx.tmp();
-    ctx.emit(format!("  {} = icmp ne i32 {}, 0", lhs_bool, lhs_value.name));
+    ctx.emit(format!(
+        "  {} = icmp ne i32 {}, 0",
+        lhs_bool, lhs_value.name
+    ));
     let lhs_label = ctx.current_label.clone();
     let rhs_label = ctx.label("logic.rhs");
     let end_label = ctx.label("logic.end");
@@ -1482,7 +1996,10 @@ fn emit_short_circuit(
     ctx.emit_label(&rhs_label);
     let rhs_value = emit_exp(ctx, rhs);
     let rhs_bool = ctx.tmp();
-    ctx.emit(format!("  {} = icmp ne i32 {}, 0", rhs_bool, rhs_value.name));
+    ctx.emit(format!(
+        "  {} = icmp ne i32 {}, 0",
+        rhs_bool, rhs_value.name
+    ));
     let rhs_pred = ctx.current_label.clone();
     ctx.terminate(format!("  br label %{}", end_label));
 
@@ -1635,13 +2152,25 @@ fn call_function(ctx: &mut FunctionCtx<'_>, name: &str, args: &[Value]) -> Value
     } else {
         sig.ret.clone()
     };
-    let args_text = args
+    let adapted_args = args
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| {
+            let expected = sig.params.get(idx).unwrap_or(&arg.ty);
+            adapt_call_arg(ctx, arg, expected)
+        })
+        .collect::<Vec<_>>();
+    let args_text = adapted_args
         .iter()
         .map(|arg| format!("{} {}", arg.ty.llvm(), arg.name))
         .collect::<Vec<_>>()
         .join(", ");
     if ret_ty.is_void() {
-        ctx.emit(format!("  call void @{}({})", sanitize_ident(name), args_text));
+        ctx.emit(format!(
+            "  call void @{}({})",
+            sanitize_ident(name),
+            args_text
+        ));
         Value {
             name: "0".to_string(),
             ty: LlvmType::Void,
@@ -1662,27 +2191,149 @@ fn call_function(ctx: &mut FunctionCtx<'_>, name: &str, args: &[Value]) -> Value
     }
 }
 
+fn adapt_call_arg(ctx: &mut FunctionCtx<'_>, arg: &Value, expected: &LlvmType) -> Value {
+    match (expected, &arg.ty) {
+        (LlvmType::Struct(_), LlvmType::Ptr(inner)) if **inner == *expected => {
+            ctx.load(&arg.name, expected)
+        }
+        (LlvmType::Array(_, _), LlvmType::Ptr(inner)) if **inner == *expected => Value {
+            name: arg.name.clone(),
+            ty: arg.ty.clone(),
+        },
+        (LlvmType::Ptr(_), LlvmType::Ptr(_)) => arg.clone(),
+        _ => arg.clone(),
+    }
+}
+
 fn init_store(ctx: &mut FunctionCtx<'_>, init: &InitVal, ty: &LlvmType, ptr: &str) {
     match init {
         InitVal::Exp(exp) => {
             let value = emit_exp(ctx, exp);
-            ctx.emit(format!("  store {} {}, ptr {}", ty.llvm(), value.name, ptr));
+            store_value_to_ptr(ctx, &value, ty, ptr);
         }
         InitVal::Arr(items) => {
-            if let LlvmType::Array(_, inner) = ty {
+            if let LlvmType::Struct(struct_name) = ty {
+                ctx.emit(format!(
+                    "  store {} {}, ptr {}",
+                    ty.llvm(),
+                    zero_initializer(ty),
+                    ptr
+                ));
+                let fields = ctx
+                    .module
+                    .layouts
+                    .get(struct_name)
+                    .map(|layout| layout.fields.clone())
+                    .unwrap_or_default();
                 for (idx, item) in items.iter().enumerate() {
-                    let elem_ptr = ctx.tmp();
+                    let Some(field) = fields.get(idx) else {
+                        break;
+                    };
+                    let field_ptr = ctx.tmp();
                     ctx.emit(format!(
                         "  {} = getelementptr inbounds {}, ptr {}, i32 0, i32 {}",
-                        elem_ptr,
+                        field_ptr,
                         ty.llvm(),
                         ptr,
-                        idx
+                        field.index
                     ));
-                    init_store(ctx, item, inner, &elem_ptr);
+                    init_store(ctx, item, &field.ty, &field_ptr);
+                }
+            } else if let LlvmType::Array(_, _) = ty {
+                ctx.emit(format!(
+                    "  store {} {}, ptr {}",
+                    ty.llvm(),
+                    zero_initializer(ty),
+                    ptr
+                ));
+                let scalar_inits = flatten_runtime_array_init(items, ty);
+                for (flat_index, exp) in scalar_inits {
+                    let scalar_ptr = scalar_ptr_at(ctx, ty, ptr, flat_index);
+                    let value = emit_exp(ctx, &exp);
+                    store_value_to_ptr(ctx, &value, inner_scalar_type(ty), &scalar_ptr);
                 }
             }
         }
+    }
+}
+
+fn flatten_runtime_array_init(items: &[InitVal], ty: &LlvmType) -> Vec<(usize, Exp)> {
+    let mut out = Vec::new();
+    flatten_runtime_items(items, ty, 0, &mut out);
+    out
+}
+
+fn flatten_runtime_items(
+    items: &[InitVal],
+    ty: &LlvmType,
+    base: usize,
+    out: &mut Vec<(usize, Exp)>,
+) {
+    if let LlvmType::Array(len, inner) = ty {
+        let inner_count = scalar_count(inner);
+        let total = len * inner_count;
+        let mut cursor = 0usize;
+        for item in items {
+            if cursor >= total {
+                break;
+            }
+            match item {
+                InitVal::Exp(exp) => {
+                    out.push((base + cursor, exp.clone()));
+                    cursor += 1;
+                }
+                InitVal::Arr(nested) => {
+                    flatten_runtime_items(nested, inner, base + cursor, out);
+                    cursor += inner_count;
+                }
+            }
+        }
+    } else if let Some(InitVal::Exp(exp)) = items.first() {
+        out.push((base, exp.clone()));
+    }
+}
+
+fn scalar_count(ty: &LlvmType) -> usize {
+    match ty {
+        LlvmType::Array(len, inner) => len * scalar_count(inner),
+        _ => 1,
+    }
+}
+
+fn inner_scalar_type(ty: &LlvmType) -> &LlvmType {
+    match ty {
+        LlvmType::Array(_, inner) => inner_scalar_type(inner),
+        other => other,
+    }
+}
+
+fn scalar_ptr_at(ctx: &mut FunctionCtx<'_>, ty: &LlvmType, ptr: &str, flat_index: usize) -> String {
+    match ty {
+        LlvmType::Array(_, inner) => {
+            let inner_count = scalar_count(inner);
+            let elem_index = flat_index / inner_count;
+            let rest = flat_index % inner_count;
+            let elem_ptr = ctx.tmp();
+            ctx.emit(format!(
+                "  {} = getelementptr inbounds {}, ptr {}, i32 0, i32 {}",
+                elem_ptr,
+                ty.llvm(),
+                ptr,
+                elem_index
+            ));
+            scalar_ptr_at(ctx, inner, &elem_ptr, rest)
+        }
+        _ => ptr.to_string(),
+    }
+}
+
+fn store_value_to_ptr(ctx: &mut FunctionCtx<'_>, value: &Value, dest_ty: &LlvmType, ptr: &str) {
+    match (dest_ty, &value.ty) {
+        (LlvmType::Struct(_), LlvmType::Ptr(inner)) if **inner == *dest_ty => {
+            let loaded = ctx.load(&value.name, dest_ty);
+            ctx.store(&loaded, ptr);
+        }
+        _ => ctx.store(value, ptr),
     }
 }
 
@@ -1698,13 +2349,23 @@ fn decl_type(ty: &Type, var: &VarDecl, module: &ModuleCtx) -> LlvmType {
 }
 
 fn apply_var_dims(base: LlvmType, var: &VarDecl, module: &ModuleCtx) -> LlvmType {
+    let mut dims = Vec::new();
+    collect_var_dims(var, module, &mut dims);
+    let mut ty = base;
+    for dim in dims.into_iter().rev() {
+        ty = LlvmType::Array(dim, Box::new(ty));
+    }
+    ty
+}
+
+fn collect_var_dims(var: &VarDecl, module: &ModuleCtx, dims: &mut Vec<usize>) {
     match var {
-        VarDecl::Ident(_) => base,
+        VarDecl::Ident(_) => {}
         VarDecl::Array(inner, len) => {
-            let inner_ty = apply_var_dims(base, inner, module);
+            collect_var_dims(inner, module, dims);
             let len = eval_const_exp_with(len, &|name| module.constants.get(name).copied())
                 .expect("Array length must be a constant expression");
-            LlvmType::Array(len as usize, Box::new(inner_ty))
+            dims.push(len as usize);
         }
     }
 }
@@ -1735,6 +2396,103 @@ fn init_const(init: &InitVal, module: &ModuleCtx) -> Option<i32> {
     }
 }
 
+fn zero_initializer(ty: &LlvmType) -> String {
+    match ty {
+        LlvmType::I32 => "0".to_string(),
+        LlvmType::Void => "zeroinitializer".to_string(),
+        LlvmType::Ptr(_) | LlvmType::Promise(_) => "null".to_string(),
+        LlvmType::Struct(_) | LlvmType::Array(_, _) => "zeroinitializer".to_string(),
+    }
+}
+
+fn const_initializer(init: &InitVal, ty: &LlvmType, module: &ModuleCtx) -> Option<String> {
+    match (init, ty) {
+        (InitVal::Exp(exp), LlvmType::I32) => {
+            Some(eval_const_exp_with(exp, &|name| module.constants.get(name).copied())?.to_string())
+        }
+        (InitVal::Exp(_), _) => None,
+        (InitVal::Arr(items), LlvmType::Struct(struct_name)) => {
+            let layout = module.layouts.get(struct_name)?;
+            let mut values = Vec::new();
+            for (idx, field) in layout.fields.iter().enumerate() {
+                let value = if let Some(item) = items.get(idx) {
+                    const_initializer(item, &field.ty, module)?
+                } else {
+                    zero_initializer(&field.ty)
+                };
+                values.push(format!("{} {}", field.ty.llvm(), value));
+            }
+            Some(format!("{{ {} }}", values.join(", ")))
+        }
+        (InitVal::Arr(items), LlvmType::Array(_, _)) => {
+            let mut flat = vec!["0".to_string(); scalar_count(ty)];
+            flatten_const_items(items, ty, 0, &mut flat, module)?;
+            let mut cursor = 0usize;
+            Some(const_initializer_from_flat(ty, &flat, &mut cursor))
+        }
+        _ => None,
+    }
+}
+
+fn flatten_const_items(
+    items: &[InitVal],
+    ty: &LlvmType,
+    base: usize,
+    flat: &mut [String],
+    module: &ModuleCtx,
+) -> Option<()> {
+    if let LlvmType::Array(len, inner) = ty {
+        let inner_count = scalar_count(inner);
+        let total = len * inner_count;
+        let mut cursor = 0usize;
+        for item in items {
+            if cursor >= total {
+                break;
+            }
+            match item {
+                InitVal::Exp(exp) => {
+                    flat[base + cursor] =
+                        eval_const_exp_with(exp, &|name| module.constants.get(name).copied())?
+                            .to_string();
+                    cursor += 1;
+                }
+                InitVal::Arr(nested) => {
+                    flatten_const_items(nested, inner, base + cursor, flat, module)?;
+                    cursor += inner_count;
+                }
+            }
+        }
+        Some(())
+    } else if let Some(InitVal::Exp(exp)) = items.first() {
+        flat[base] =
+            eval_const_exp_with(exp, &|name| module.constants.get(name).copied())?.to_string();
+        Some(())
+    } else {
+        Some(())
+    }
+}
+
+fn const_initializer_from_flat(ty: &LlvmType, flat: &[String], cursor: &mut usize) -> String {
+    match ty {
+        LlvmType::Array(len, inner) => {
+            let mut values = Vec::new();
+            for _ in 0..*len {
+                let value = const_initializer_from_flat(inner, flat, cursor);
+                values.push(format!("{} {}", inner.llvm(), value));
+            }
+            format!("[{}]", values.join(", "))
+        }
+        _ => {
+            let value = flat
+                .get(*cursor)
+                .cloned()
+                .unwrap_or_else(|| zero_initializer(ty));
+            *cursor += 1;
+            value
+        }
+    }
+}
+
 fn stable_structs(layouts: &HashMap<String, StructLayout>) -> Vec<(&String, &StructLayout)> {
     let mut items = layouts.iter().collect::<Vec<_>>();
     items.sort_by(|lhs, rhs| lhs.0.cmp(rhs.0));
@@ -1760,235 +2518,3 @@ fn sanitize_ident(name: &str) -> String {
         })
         .collect()
 }
-
-fn unique_suffix() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
-}
-
-fn default_clang() -> String {
-    if Command::new("clang-18")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        "clang-18".to_string()
-    } else {
-        "clang".to_string()
-    }
-}
-
-const PROMISE_RUNTIME: &str = r#"@__sysy_now = internal global i32 0
-@__sysy_pending = internal global ptr null
-
-define ptr @__sysy_promise_new_i32() {
-entry:
-  %p = call ptr @malloc(i32 28)
-  %ready = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 0
-  store i32 0, ptr %ready
-  %value = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 1
-  store i32 0, ptr %value
-  %callback = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 2
-  store ptr null, ptr %callback
-  %callback_env = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 3
-  store ptr null, ptr %callback_env
-  %driver = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 4
-  store ptr null, ptr %driver
-  %driver_env = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 5
-  store ptr null, ptr %driver_env
-  %next = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 6
-  store ptr null, ptr %next
-  ret ptr %p
-}
-
-define void @__sysy_promise_resolve_i32(ptr %p, i32 %v) {
-entry:
-  %value = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 1
-  store i32 %v, ptr %value
-  %ready = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 0
-  store i32 1, ptr %ready
-  call void @__sysy_promise_fire_callback(ptr %p)
-  ret void
-}
-
-define i32 @__sysy_promise_result_i32(ptr %p) {
-entry:
-  %value = getelementptr inbounds %promise.i32, ptr %p, i32 0, i32 1
-  %v = load i32, ptr %value
-  ret i32 %v
-}
-
-define i32 @__sysy_promise_wait_i32(ptr %p) {
-entry:
-  br label %loop
-loop:
-  %ready = call i32 @__sysy_promise_is_ready(ptr %p)
-  %done = icmp ne i32 %ready, 0
-  br i1 %done, label %exit, label %tick
-tick:
-  call void @__sysy_event_loop_tick()
-  br label %loop
-exit:
-  %v = call i32 @__sysy_promise_result_i32(ptr %p)
-  ret i32 %v
-}
-
-define ptr @__sysy_promise_new_void() {
-entry:
-  %p = call ptr @malloc(i32 28)
-  %ready = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 0
-  store i32 0, ptr %ready
-  %value = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 1
-  store i32 0, ptr %value
-  %callback = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 2
-  store ptr null, ptr %callback
-  %callback_env = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 3
-  store ptr null, ptr %callback_env
-  %driver = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 4
-  store ptr null, ptr %driver
-  %driver_env = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 5
-  store ptr null, ptr %driver_env
-  %next = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 6
-  store ptr null, ptr %next
-  ret ptr %p
-}
-
-define void @__sysy_promise_resolve_void(ptr %p) {
-entry:
-  %ready = getelementptr inbounds %promise.void, ptr %p, i32 0, i32 0
-  store i32 1, ptr %ready
-  call void @__sysy_promise_fire_callback(ptr %p)
-  ret void
-}
-
-define void @__sysy_promise_wait_void(ptr %p) {
-entry:
-  br label %loop
-loop:
-  %ready = call i32 @__sysy_promise_is_ready(ptr %p)
-  %done = icmp ne i32 %ready, 0
-  br i1 %done, label %exit, label %tick
-tick:
-  call void @__sysy_event_loop_tick()
-  br label %loop
-exit:
-  ret void
-}
-
-define i32 @__sysy_promise_is_ready(ptr %p) {
-entry:
-  %ready_ptr = getelementptr i8, ptr %p, i32 0
-  %ready = load i32, ptr %ready_ptr
-  ret i32 %ready
-}
-
-define void @__sysy_promise_set_callback(ptr %p, ptr %callback, ptr %env) {
-entry:
-  %callback_ptr = getelementptr i8, ptr %p, i32 8
-  store ptr %callback, ptr %callback_ptr
-  %env_ptr = getelementptr i8, ptr %p, i32 12
-  store ptr %env, ptr %env_ptr
-  %ready = call i32 @__sysy_promise_is_ready(ptr %p)
-  %done = icmp ne i32 %ready, 0
-  br i1 %done, label %fire, label %exit
-fire:
-  call void %callback(ptr %env)
-  br label %exit
-exit:
-  ret void
-}
-
-define void @__sysy_promise_fire_callback(ptr %p) {
-entry:
-  %callback_ptr = getelementptr i8, ptr %p, i32 8
-  %callback = load ptr, ptr %callback_ptr
-  %has_callback = icmp ne ptr %callback, null
-  br i1 %has_callback, label %call, label %exit
-call:
-  %env_ptr = getelementptr i8, ptr %p, i32 12
-  %env = load ptr, ptr %env_ptr
-  store ptr null, ptr %callback_ptr
-  call void %callback(ptr %env)
-  br label %exit
-exit:
-  ret void
-}
-
-define void @__sysy_pending_add(ptr %p, ptr %driver, ptr %env) {
-entry:
-  %driver_ptr = getelementptr i8, ptr %p, i32 16
-  store ptr %driver, ptr %driver_ptr
-  %env_ptr = getelementptr i8, ptr %p, i32 20
-  store ptr %env, ptr %env_ptr
-  %head = load ptr, ptr @__sysy_pending
-  %next_ptr = getelementptr i8, ptr %p, i32 24
-  store ptr %head, ptr %next_ptr
-  store ptr %p, ptr @__sysy_pending
-  ret void
-}
-
-define void @__sysy_event_loop_tick() {
-entry:
-  %now = load i32, ptr @__sysy_now
-  %next_now = add i32 %now, 1
-  store i32 %next_now, ptr @__sysy_now
-  %head = load ptr, ptr @__sysy_pending
-  br label %loop
-loop:
-  %cur = phi ptr [%head, %entry], [%next, %step.end]
-  %is_null = icmp eq ptr %cur, null
-  br i1 %is_null, label %exit, label %step
-step:
-  %next_ptr = getelementptr i8, ptr %cur, i32 24
-  %next = load ptr, ptr %next_ptr
-  %ready = call i32 @__sysy_promise_is_ready(ptr %cur)
-  %done = icmp ne i32 %ready, 0
-  br i1 %done, label %step.end, label %drive
-drive:
-  %driver_ptr = getelementptr i8, ptr %cur, i32 16
-  %driver = load ptr, ptr %driver_ptr
-  %has_driver = icmp ne ptr %driver, null
-  br i1 %has_driver, label %drive.call, label %step.end
-drive.call:
-  %env_ptr = getelementptr i8, ptr %cur, i32 20
-  %env = load ptr, ptr %env_ptr
-  call void %driver(ptr %env)
-  br label %step.end
-step.end:
-  br label %loop
-exit:
-  ret void
-}
-
-define ptr @__sysy_sleep(i32 %duration) {
-entry:
-  %p = call ptr @__sysy_promise_new_void()
-  %now = load i32, ptr @__sysy_now
-  %wake = add i32 %now, %duration
-  %wake_ptr = getelementptr i8, ptr %p, i32 4
-  store i32 %wake, ptr %wake_ptr
-  call void @__sysy_pending_add(ptr %p, ptr @__sysy_sleep_drive, ptr %p)
-  ret ptr %p
-}
-
-define void @__sysy_sleep_drive(ptr %p) {
-entry:
-  %ready = call i32 @__sysy_promise_is_ready(ptr %p)
-  %done = icmp ne i32 %ready, 0
-  br i1 %done, label %exit, label %check
-check:
-  %now = load i32, ptr @__sysy_now
-  %wake_ptr = getelementptr i8, ptr %p, i32 4
-  %wake = load i32, ptr %wake_ptr
-  %awake = icmp sge i32 %now, %wake
-  br i1 %awake, label %resolve, label %exit
-resolve:
-  call void @__sysy_promise_resolve_void(ptr %p)
-  br label %exit
-exit:
-  ret void
-}
-
-"#;

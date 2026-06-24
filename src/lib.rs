@@ -5,6 +5,7 @@ pub mod ast_tool;
 pub mod koopa;
 pub mod lalr;
 pub mod lexer;
-pub mod lower;
 pub mod llvm_ir;
+pub mod llvm_riscv;
+pub mod lower;
 pub mod riscv;

@@ -1,3 +1,5 @@
+// Legacy native-Koopa RISC-V backend. The maintained `-riscv` path goes
+// through `llvm_ir.rs` and clang; this module is retained for compatibility.
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;

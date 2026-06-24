@@ -429,8 +429,8 @@ impl AstNode for CompUnit {
             panic!("No main function defined, or global symbol scanner didn't run");
         }
         let mut lines = KoopaLines::new();
-        for glob_def in &self.glob_defs {
-            if let GlobleDef::StructDef(def) = glob_def {
+        for glob_def in &self.global_defs {
+            if let GlobalDef::StructDef(def) = glob_def {
                 let mut fields = Vec::new();
                 for field in &def.fields {
                     for decl in &field.decls {
@@ -443,8 +443,8 @@ impl AstNode for CompUnit {
                 lines.add_line(KoopaLine::StructDecl(def.name.clone(), fields));
             }
         }
-        for glob_def in &self.glob_defs {
-            if let GlobleDef::FuncDef(func) = glob_def {
+        for glob_def in &self.global_defs {
+            if let GlobalDef::FuncDef(func) = glob_def {
                 if func.is_async {
                     let promise_name = if func.ident == "main" {
                         "__sysy_async_main"
@@ -469,9 +469,9 @@ impl AstNode for CompUnit {
             let ret = func.1;
             lines.add_line(KoopaLine::FuncDecl(name, params, ret.to_koopa_type(bg)));
         }
-        for glob_def in &self.glob_defs {
+        for glob_def in &self.global_defs {
             match glob_def {
-                GlobleDef::FuncDef(func) if func.is_async && func.ident == "main" => {
+                GlobalDef::FuncDef(func) if func.is_async && func.ident == "main" => {
                     let mut hidden = func.clone();
                     hidden.ident = "__sysy_async_main".to_string();
                     lines.add_lines(hidden.to_koopa_lines(bg));
@@ -509,12 +509,12 @@ fn async_main_driver_lines(bg: &mut Background, ret_type: &Type) -> KoopaLines {
     lines
 }
 
-impl AstNode for GlobleDef {
+impl AstNode for GlobalDef {
     fn to_koopa_lines(&self, bg: &mut Background) -> KoopaLines {
         match self {
-            GlobleDef::FuncDef(func_def) => func_def.to_koopa_lines(bg),
-            GlobleDef::StructDef(_) => KoopaLines::new(),
-            GlobleDef::GlobleDecl(typ, decls) => {
+            GlobalDef::FuncDef(func_def) => func_def.to_koopa_lines(bg),
+            GlobalDef::StructDef(_) => KoopaLines::new(),
+            GlobalDef::GlobalDecl(typ, decls) => {
                 let mut lines = KoopaLines::new();
                 for decl in decls {
                     let value_type = value_type_from_decl(&typ, &decl.var, bg);

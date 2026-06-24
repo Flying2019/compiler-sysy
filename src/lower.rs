@@ -1,3 +1,5 @@
+// Legacy sugared-Koopa compatibility lowering. Struct/async correctness is
+// implemented in the LLVM/RV32 backend, not in this compatibility path.
 use std::collections::HashMap;
 
 use crate::ast_tool::{Background, ValueType};

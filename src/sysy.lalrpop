@@ -65,18 +65,18 @@ StructName: String = {
 IntConst: i32 = "IntConst" => <>;
 
 pub CompUnit: CompUnit = {
-  <glob_def: GlobleDef> => CompUnit { glob_defs: vec![<>] },
-  <glob_def: GlobleDef> <comp_unit: CompUnit> => {
-    let mut glob_defs = vec![glob_def];
-    glob_defs.extend(comp_unit.glob_defs);
-    CompUnit { glob_defs: glob_defs }
+  <global_def: GlobalDef> => CompUnit { global_defs: vec![<>] },
+  <global_def: GlobalDef> <comp_unit: CompUnit> => {
+    let mut global_defs = vec![global_def];
+    global_defs.extend(comp_unit.global_defs);
+    CompUnit { global_defs: global_defs }
   },
 }
 
-GlobleDef: GlobleDef = {
-  <StructDef> => GlobleDef::StructDef(<>),
-  <FuncDef> => GlobleDef::FuncDef(<>),
-  <Type> <MultipleDecl> ";" => GlobleDef::GlobleDecl(<>),
+GlobalDef: GlobalDef = {
+  <StructDef> => GlobalDef::StructDef(<>),
+  <FuncDef> => GlobalDef::FuncDef(<>),
+  <Type> <MultipleDecl> ";" => GlobalDef::GlobalDecl(<>),
 }
 
 StructDef: StructDef = {

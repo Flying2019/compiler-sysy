@@ -191,7 +191,13 @@ impl<'input> Lexer<'input> {
                     self.struct_names.insert(name);
                 }
             }
-            Tok::Semicolon | Tok::RBrace | Tok::LParen | Tok::RParen | Tok::Comma => {
+            Tok::Semicolon
+            | Tok::RBrace
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::Assign
+            | Tok::Comma => {
                 self.possible_bare_struct_name = None;
             }
             _ => {}
