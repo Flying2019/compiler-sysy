@@ -1,0 +1,4 @@
+int main() {
+  new void;
+  return 0;
+}

@@ -1,0 +1,11 @@
+struct left {
+  struct right value;
+};
+
+struct right {
+  struct left value;
+};
+
+int main() {
+  return 0;
+}

@@ -1,0 +1,15 @@
+int global[2][3] = {{1, 2}, {3}, 4};
+
+int main() {
+  int local[2][2][3] = {{{1}, {2, 3}}, {{4, 5}, {6}}};
+  return global[0][0]
+       + global[0][1] * 2
+       + global[1][0] * 3
+       + global[1][1] * 4
+       + local[0][0][0]
+       + local[0][1][0]
+       + local[0][1][1]
+       + local[1][0][0]
+       + local[1][0][1]
+       + local[1][1][0];
+}

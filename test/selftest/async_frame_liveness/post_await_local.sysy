@@ -1,0 +1,10 @@
+async int compute() {
+  await sleep(1);
+  int value = 40;
+  return value + 2;
+}
+
+int main() {
+  Promise<int> p = compute();
+  return p.wait();
+}

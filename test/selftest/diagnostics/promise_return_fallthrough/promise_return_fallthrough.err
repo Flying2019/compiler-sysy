@@ -1,0 +1,1 @@
+Function returning Promise<int> may fall through without return

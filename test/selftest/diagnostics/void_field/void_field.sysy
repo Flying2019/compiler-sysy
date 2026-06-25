@@ -1,0 +1,7 @@
+struct bad {
+  void value;
+};
+
+int main() {
+  return 0;
+}

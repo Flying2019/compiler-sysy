@@ -1,0 +1,1 @@
+int_octal_invalid.sysy:2:10: parse error: lexer error: invalid integer literal 09

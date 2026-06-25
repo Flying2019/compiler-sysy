@@ -1,0 +1,17 @@
+async int shadow() {
+  int x = 30;
+  {
+    int x = 5;
+    await sleep(1);
+    if (x != 5) {
+      return 99;
+    }
+  }
+  await sleep(1);
+  return x + 7;
+}
+
+int main() {
+  Promise<int> p = shadow();
+  return p.wait();
+}

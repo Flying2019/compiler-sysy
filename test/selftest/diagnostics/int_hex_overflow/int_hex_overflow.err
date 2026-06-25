@@ -1,0 +1,1 @@
+int_hex_overflow.sysy:2:10: parse error: lexer error: invalid integer literal 0x80000000

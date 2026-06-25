@@ -1,0 +1,14 @@
+async int make_value() {
+  return 1;
+}
+
+Promise<int> maybe_promise(int x) {
+  if (x > 0) {
+    return make_value();
+  }
+}
+
+int main() {
+  Promise<int> p = maybe_promise(1);
+  return p.wait();
+}

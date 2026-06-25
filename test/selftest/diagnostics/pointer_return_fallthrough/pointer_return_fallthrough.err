@@ -1,0 +1,1 @@
+Function returning int* may fall through without return

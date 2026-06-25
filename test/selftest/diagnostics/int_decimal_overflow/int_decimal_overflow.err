@@ -1,0 +1,1 @@
+int_decimal_overflow.sysy:2:10: parse error: lexer error: invalid integer literal 2147483648
