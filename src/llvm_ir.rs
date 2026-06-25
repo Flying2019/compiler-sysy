@@ -2,122 +2,19 @@ use crate::lalr::{
     eval_const_exp_with, eval_param_dim, func_param_btype, BType, BinaryOp, CompUnit, Exp, FuncDef,
     FuncParam, GlobalDef, InitVal, SingleDecl, Stmt, StructDef, Type, UnaryOp, VarDecl,
 };
-use crate::llvm_async_cfg::{
+use crate::llvm::async_cfg::{
     build_async_cfg, AsyncCfgFunction, AsyncOp, AsyncTerminator, AwaitTerminator,
 };
+use crate::llvm::layout::{
+    align_up, FieldLayout, StructLayout, RISCV64_DATA_LAYOUT, TARGET_LAYOUT,
+};
+use crate::llvm::types::LlvmType;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-pub use crate::llvm_riscv::compile_llvm_to_riscv_asm;
+pub use crate::llvm::toolchain::compile_llvm_to_riscv_asm;
 
 pub const DEFAULT_RISCV_TARGET: &str = "riscv64-unknown-unknown-elf";
-
-const RISCV64_DATA_LAYOUT: &str = "e-m:e-p:64:64-i64:64-i128:128-n64-S128";
-
-#[derive(Debug, Clone, Copy)]
-struct TargetLayout {
-    pointer_size: usize,
-    pointer_align: usize,
-    int_size: usize,
-    int_align: usize,
-    malloc_size_type: &'static str,
-}
-
-const TARGET_LAYOUT: TargetLayout = TargetLayout {
-    pointer_size: 8,
-    pointer_align: 8,
-    int_size: 4,
-    int_align: 4,
-    malloc_size_type: "i64",
-};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LlvmType {
-    I32,
-    Void,
-    Ptr(Box<LlvmType>),
-    Struct(String),
-    Array(usize, Box<LlvmType>),
-    Promise(Box<LlvmType>),
-}
-
-impl LlvmType {
-    fn from_btype(btype: &BType) -> Self {
-        match btype {
-            BType::I32 => Self::I32,
-            BType::Void => Self::Void,
-            BType::Struct(name) => Self::Struct(name.clone()),
-            BType::Promise(inner) => Self::Promise(Box::new(Self::from_btype(inner))),
-            BType::Ptr(inner) => Self::Ptr(Box::new(Self::from_btype(inner))),
-            BType::Array(len, inner) => Self::Array(*len, Box::new(Self::from_btype(inner))),
-        }
-    }
-
-    fn llvm(&self) -> String {
-        match self {
-            Self::I32 => "i32".to_string(),
-            Self::Void => "void".to_string(),
-            Self::Ptr(_) | Self::Promise(_) => "ptr".to_string(),
-            Self::Struct(name) => format!("%struct.{}", sanitize_ident(name)),
-            Self::Array(len, inner) => format!("[{} x {}]", len, inner.llvm()),
-        }
-    }
-
-    fn promise_value(&self) -> LlvmType {
-        match self {
-            Self::Promise(inner) => (**inner).clone(),
-            other => other.clone(),
-        }
-    }
-
-    fn size(&self, structs: &HashMap<String, StructLayout>) -> usize {
-        match self {
-            Self::I32 => TARGET_LAYOUT.int_size,
-            Self::Ptr(_) | Self::Promise(_) => TARGET_LAYOUT.pointer_size,
-            Self::Void => 0,
-            Self::Array(len, inner) => len * inner.size(structs),
-            Self::Struct(name) => {
-                structs
-                    .get(name)
-                    .unwrap_or_else(|| panic!("Unknown struct type {}", name))
-                    .size
-            }
-        }
-    }
-
-    fn align(&self, structs: &HashMap<String, StructLayout>) -> usize {
-        match self {
-            Self::I32 => TARGET_LAYOUT.int_align,
-            Self::Ptr(_) | Self::Promise(_) => TARGET_LAYOUT.pointer_align,
-            Self::Void => 1,
-            Self::Array(_, inner) => inner.align(structs),
-            Self::Struct(name) => {
-                structs
-                    .get(name)
-                    .unwrap_or_else(|| panic!("Unknown struct type {}", name))
-                    .align
-            }
-        }
-    }
-
-    fn is_void(&self) -> bool {
-        matches!(self, Self::Void)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FieldLayout {
-    name: String,
-    ty: LlvmType,
-    index: usize,
-}
-
-#[derive(Debug, Clone)]
-struct StructLayout {
-    fields: Vec<FieldLayout>,
-    size: usize,
-    align: usize,
-}
 
 #[derive(Debug, Clone)]
 struct FuncSig {
@@ -2478,14 +2375,6 @@ fn stable_structs(layouts: &HashMap<String, StructLayout>) -> Vec<(&String, &Str
     let mut items = layouts.iter().collect::<Vec<_>>();
     items.sort_by(|lhs, rhs| lhs.0.cmp(rhs.0));
     items
-}
-
-fn align_up(value: usize, align: usize) -> usize {
-    if align == 0 {
-        value
-    } else {
-        (value + align - 1) / align * align
-    }
 }
 
 fn sanitize_ident(name: &str) -> String {
