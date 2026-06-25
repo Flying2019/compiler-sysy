@@ -1,0 +1,11 @@
+async int make_value(int x) {
+  return x + 1;
+}
+
+int consume(Promise<int> p) {
+  return p.wait() + 1;
+}
+
+int main() {
+  return consume(make_value(40));
+}

@@ -1,0 +1,10 @@
+struct box {
+  int values[n];
+};
+
+const int n = 3;
+
+int main() {
+  box b = {{1, 2, 3}};
+  return b.values[2];
+}

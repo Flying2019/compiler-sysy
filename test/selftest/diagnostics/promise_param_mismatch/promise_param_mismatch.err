@@ -1,0 +1,1 @@
+Function consume argument 1 type mismatch: expected Promise<int>, got Promise<node>

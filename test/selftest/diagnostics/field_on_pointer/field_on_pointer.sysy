@@ -1,0 +1,8 @@
+struct node {
+  int value;
+};
+
+int main() {
+  node* p = new node;
+  return p.value;
+}

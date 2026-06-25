@@ -1,0 +1,7 @@
+int consume(Promise<int> p) {
+  return p.wait();
+}
+
+int main() {
+  return consume(1);
+}

@@ -1,0 +1,11 @@
+async int f() {
+  const int n = 2;
+  int values[n] = {7, 8};
+  await sleep(1);
+  return values[1];
+}
+
+int main() {
+  Promise<int> p = f();
+  return p.wait();
+}

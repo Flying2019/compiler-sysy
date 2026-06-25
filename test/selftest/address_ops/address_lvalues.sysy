@@ -1,0 +1,15 @@
+struct pair {
+  int value;
+  int next;
+};
+
+int main() {
+  int x = 7;
+  int arr[2] = {3, 4};
+  pair p = {5, 6};
+  int* px = &x;
+  int* pa = &arr[1];
+  int* pf = &p.value;
+  int* pd = &*px;
+  return *px + *pa + *pf + *pd;
+}

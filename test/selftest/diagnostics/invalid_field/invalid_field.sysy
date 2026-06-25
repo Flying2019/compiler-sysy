@@ -1,0 +1,8 @@
+node {
+  int value;
+};
+
+int main() {
+  node n;
+  return n.missing;
+}

@@ -1,0 +1,17 @@
+inner {
+  Promise<int> p;
+};
+
+outer {
+  inner child;
+};
+
+async int make_value(int x) {
+  return x;
+}
+
+int main() {
+  outer box;
+  box.child.p = make_value(44);
+  return box.child.p.wait();
+}

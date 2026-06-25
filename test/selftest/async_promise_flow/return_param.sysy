@@ -1,0 +1,12 @@
+async int make_value(int x) {
+  return x;
+}
+
+Promise<int> forward(Promise<int> p) {
+  return p;
+}
+
+int main() {
+  Promise<int> p = forward(make_value(43));
+  return p.wait();
+}

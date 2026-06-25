@@ -1,0 +1,8 @@
+struct item {
+  int value;
+};
+
+int main() {
+  item x = {1, 2};
+  return 0;
+}

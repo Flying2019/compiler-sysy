@@ -1,0 +1,14 @@
+struct left {
+  int value;
+};
+
+struct right {
+  int value;
+};
+
+int main() {
+  left l = {1};
+  right r = {2};
+  l = r;
+  return 0;
+}

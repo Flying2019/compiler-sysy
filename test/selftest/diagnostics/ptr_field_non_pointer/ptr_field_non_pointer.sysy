@@ -1,0 +1,8 @@
+struct node {
+  int value;
+};
+
+int main() {
+  node n = {1};
+  return n->value;
+}

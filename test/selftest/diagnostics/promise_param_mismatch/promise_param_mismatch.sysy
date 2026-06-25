@@ -1,0 +1,16 @@
+node {
+  int value;
+};
+
+async node make_node() {
+  node n = {1};
+  return n;
+}
+
+int consume(Promise<int> p) {
+  return p.wait();
+}
+
+int main() {
+  return consume(make_node());
+}
