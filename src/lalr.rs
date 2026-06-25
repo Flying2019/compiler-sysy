@@ -231,15 +231,19 @@ impl CompUnit {
 
     pub fn validate_async_syntax(&self) -> Result<(), String> {
         let funcs = self.async_function_sigs()?;
+        let program = self.semantic_program()?;
         for glob_def in &self.global_defs {
-            glob_def.validate_async_syntax(&funcs)?;
+            glob_def.validate_async_syntax(&funcs, &program)?;
         }
         Ok(())
     }
 
     pub fn validate_semantics(&self) -> Result<(), String> {
-        self.validate_async_syntax()?;
         let program = self.semantic_program()?;
+        let funcs = self.async_function_sigs()?;
+        for glob_def in &self.global_defs {
+            glob_def.validate_async_syntax(&funcs, &program)?;
+        }
         for glob_def in &self.global_defs {
             glob_def.validate_semantics(&program)?;
         }
@@ -341,11 +345,12 @@ impl GlobalDef {
     fn validate_async_syntax(
         &self,
         funcs: &HashMap<String, AsyncFunctionSig>,
+        program: &SemanticProgram,
     ) -> Result<(), String> {
         match self {
-            GlobalDef::FuncDef(func) => func.validate_async_syntax(funcs),
+            GlobalDef::FuncDef(func) => func.validate_async_syntax(funcs, program),
             GlobalDef::GlobalDecl(_, decls) => {
-                let mut ctx = AsyncValidationContext::new(funcs, false);
+                let mut ctx = AsyncValidationContext::new(funcs, program, false);
                 for decl in decls {
                     if let Some(init) = &decl.init {
                         init.validate_async_syntax(&mut ctx)?;
@@ -388,13 +393,12 @@ impl FuncDef {
     fn validate_async_syntax(
         &self,
         funcs: &HashMap<String, AsyncFunctionSig>,
+        program: &SemanticProgram,
     ) -> Result<(), String> {
-        let mut ctx = AsyncValidationContext::new(funcs, self.is_async);
+        let mut ctx = AsyncValidationContext::new(funcs, program, self.is_async);
         ctx.push_scope();
         for param in &self.func_params {
-            if let BType::Promise(inner) = &param.btype {
-                ctx.define_promise(param.name.clone(), (**inner).clone());
-            }
+            ctx.define_var(param.name.clone(), func_param_semantic_btype(param));
         }
         for stmt in &self.block {
             stmt.validate_async_syntax(&mut ctx)?;
@@ -478,20 +482,33 @@ impl Stmt {
                 if matches!(rhs, Exp::Await(_)) && !matches!(lhs, Exp::Ident(_)) {
                     return Err("await assignment target must be a simple identifier".to_string());
                 }
-                lhs.validate_async_syntax(ctx)?;
+                let lhs_kind = lhs.validate_async_syntax(ctx)?;
                 let rhs_kind = rhs.validate_async_syntax(ctx)?;
-                if rhs_kind.is_promise() {
-                    return Err("Promise value cannot be assigned without await".to_string());
+                match (lhs_kind, rhs_kind) {
+                    (AsyncExprKind::Promise(expected), AsyncExprKind::Promise(actual)) => {
+                        if !btype_same(&expected, &actual) {
+                            return Err(format!(
+                                "Promise assignment type mismatch: expected {}, got {}",
+                                btype_name(&expected),
+                                btype_name(&actual)
+                            ));
+                        }
+                    }
+                    (AsyncExprKind::Plain(_), AsyncExprKind::Promise(_)) => {
+                        return Err("Promise value cannot be assigned without await".to_string());
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
             Stmt::Decl(ty, decls) => {
-                let declared_promise = match type_base_btype(ty) {
-                    BType::Promise(inner) => Some((**inner).clone()),
-                    _ => None,
-                };
                 for decl in decls {
                     let var_name = var_decl_name(&decl.var);
+                    let decl_ty = decl_btype(ty, &decl.var);
+                    let declared_promise = match &decl_ty {
+                        BType::Promise(inner) => Some((**inner).clone()),
+                        _ => None,
+                    };
                     if let Some(init) = &decl.init {
                         reject_unsupported_await_nested_in_init(init, "declaration initializer")?;
                         let init_kind = init.validate_async_syntax(ctx)?;
@@ -519,9 +536,7 @@ impl Stmt {
                             (None, AsyncExprKind::Plain(_)) => {}
                         }
                     }
-                    if let Some(inner) = &declared_promise {
-                        ctx.define_promise(var_name, inner.clone());
-                    }
+                    ctx.define_var(var_name, decl_ty);
                 }
                 Ok(())
             }
@@ -550,14 +565,12 @@ impl Stmt {
                 Ok(())
             }
             Stmt::If(cond, then_stmt) => {
-                reject_unsupported_await_position(cond, "if condition")?;
                 if cond.validate_async_syntax(ctx)?.is_promise() {
                     return Err("Promise value cannot be used as an if condition".to_string());
                 }
                 then_stmt.validate_async_syntax(ctx)
             }
             Stmt::IfElse(cond, then_stmt, else_stmt) => {
-                reject_unsupported_await_position(cond, "if condition")?;
                 if cond.validate_async_syntax(ctx)?.is_promise() {
                     return Err("Promise value cannot be used as an if condition".to_string());
                 }
@@ -565,13 +578,6 @@ impl Stmt {
                 else_stmt.validate_async_syntax(ctx)
             }
             Stmt::While(cond, body) => {
-                reject_unsupported_await_position(cond, "while condition")?;
-                if body.contains_async_syntax() {
-                    return Err(
-                        "await inside while body is not supported by callback-hole lowering yet"
-                            .to_string(),
-                    );
-                }
                 if cond.validate_async_syntax(ctx)?.is_promise() {
                     return Err("Promise value cannot be used as a while condition".to_string());
                 }
@@ -615,7 +621,17 @@ impl Stmt {
             }
             Stmt::Return(Some(exp)) => {
                 let kind = exp.validate_semantics(ctx, loop_depth)?;
-                if kind.is_promise() {
+                if let AsyncExprKind::Promise(actual) = kind {
+                    if let BType::Promise(expected) = ctx.ret_ty {
+                        if btype_same(expected, &actual) {
+                            return Ok(());
+                        }
+                        return Err(format!(
+                            "Return type mismatch: expected Promise<{}>, got Promise<{}>",
+                            btype_name(expected),
+                            btype_name(&actual)
+                        ));
+                    }
                     return Err("Promise value cannot be returned without await".to_string());
                 }
                 let actual_ty = kind.plain_ty().unwrap_or(&BType::Void);
@@ -762,7 +778,7 @@ impl Exp {
                 }
                 Ok(AsyncExprKind::Plain(BType::I32))
             }
-            Exp::BinaryExp(_, lhs, rhs) | Exp::ArrGet(lhs, rhs) => {
+            Exp::BinaryExp(_, lhs, rhs) => {
                 if lhs.validate_async_syntax(ctx)?.is_promise()
                     || rhs.validate_async_syntax(ctx)?.is_promise()
                 {
@@ -771,6 +787,18 @@ impl Exp {
                     );
                 }
                 Ok(AsyncExprKind::Plain(BType::I32))
+            }
+            Exp::ArrGet(lhs, rhs) => {
+                let lhs_kind = lhs.validate_async_syntax(ctx)?;
+                if lhs_kind.is_promise() {
+                    return Err("Promise value cannot be indexed without await".to_string());
+                }
+                if rhs.validate_async_syntax(ctx)?.is_promise() {
+                    return Err(
+                        "Promise value cannot be used as an array index without await".to_string(),
+                    );
+                }
+                array_element_type(lhs_kind.plain_ty())
             }
             Exp::FuncCall(_, args) => {
                 for arg in args {
@@ -786,21 +814,27 @@ impl Exp {
                         if sig.is_async {
                             return Ok(AsyncExprKind::Promise(sig.ret.clone()));
                         }
+                        return Ok(kind_from_btype(sig.ret.clone()));
                     }
                 }
                 Ok(AsyncExprKind::Plain(BType::I32))
             }
-            Exp::Field(base, _) | Exp::PtrField(base, _) => {
-                if base.validate_async_syntax(ctx)?.is_promise() {
+            Exp::Field(base, field) | Exp::PtrField(base, field) => {
+                let base_kind = base.validate_async_syntax(ctx)?;
+                if base_kind.is_promise() {
                     return Err(
                         "Promise value cannot be used for field access without await".to_string(),
                     );
                 }
-                Ok(AsyncExprKind::Plain(BType::I32))
+                match self {
+                    Exp::Field(_, _) => field_access_type(ctx.program, base_kind.plain_ty(), field),
+                    Exp::PtrField(_, _) => {
+                        ptr_field_access_type(ctx.program, base_kind.plain_ty(), field)
+                    }
+                    _ => unreachable!(),
+                }
             }
-            Exp::Ident(name) => Ok(ctx
-                .lookup_promise(name)
-                .map_or(AsyncExprKind::Plain(BType::I32), AsyncExprKind::Promise)),
+            Exp::Ident(name) => Ok(kind_from_btype(ctx.lookup_var(name).unwrap_or(BType::I32))),
             Exp::Number(_) => Ok(AsyncExprKind::Plain(BType::I32)),
             Exp::New(ty) => Ok(AsyncExprKind::Plain(BType::Ptr(Box::new(ty.clone())))),
         }
@@ -853,7 +887,7 @@ impl Exp {
                 if sig.is_async {
                     Ok(AsyncExprKind::Promise(sig.ret.clone()))
                 } else {
-                    Ok(AsyncExprKind::Plain(sig.ret.clone()))
+                    Ok(kind_from_btype(sig.ret.clone()))
                 }
             }
             Exp::Sleep(duration) => {
@@ -866,9 +900,11 @@ impl Exp {
             | Exp::PtrField(inner, _) => {
                 let inner_kind = inner.validate_semantics(ctx, loop_depth)?;
                 match self {
-                    Exp::Field(_, field) => field_access_type(ctx, inner_kind.plain_ty(), field),
+                    Exp::Field(_, field) => {
+                        field_access_type(ctx.program, inner_kind.plain_ty(), field)
+                    }
                     Exp::PtrField(_, field) => {
-                        ptr_field_access_type(ctx, inner_kind.plain_ty(), field)
+                        ptr_field_access_type(ctx.program, inner_kind.plain_ty(), field)
                     }
                     Exp::UnaryExp(UnaryOp::Addr, _) => Ok(AsyncExprKind::Plain(BType::Ptr(
                         Box::new(inner_kind.plain_ty().cloned().unwrap_or(BType::I32)),
@@ -895,10 +931,7 @@ impl Exp {
                 }
             }
             Exp::Number(_) => Ok(AsyncExprKind::Plain(BType::I32)),
-            Exp::Ident(name) => match ctx.lookup_var(name).unwrap_or(BType::I32) {
-                BType::Promise(inner) => Ok(AsyncExprKind::Promise(*inner)),
-                ty => Ok(AsyncExprKind::Plain(ty)),
-            },
+            Exp::Ident(name) => Ok(kind_from_btype(ctx.lookup_var(name).unwrap_or(BType::I32))),
             Exp::New(ty) => Ok(AsyncExprKind::Plain(BType::Ptr(Box::new(ty.clone())))),
         }
     }
@@ -931,6 +964,7 @@ impl AsyncExprKind {
 
 struct AsyncValidationContext<'a> {
     funcs: &'a HashMap<String, AsyncFunctionSig>,
+    program: &'a SemanticProgram,
     in_async_fn: bool,
     scopes: Vec<HashMap<String, BType>>,
     declared_promises: HashSet<String>,
@@ -977,9 +1011,14 @@ impl<'a> SemanticCtx<'a> {
 }
 
 impl<'a> AsyncValidationContext<'a> {
-    fn new(funcs: &'a HashMap<String, AsyncFunctionSig>, in_async_fn: bool) -> Self {
+    fn new(
+        funcs: &'a HashMap<String, AsyncFunctionSig>,
+        program: &'a SemanticProgram,
+        in_async_fn: bool,
+    ) -> Self {
         Self {
             funcs,
+            program,
             in_async_fn,
             scopes: Vec::new(),
             declared_promises: HashSet::new(),
@@ -995,14 +1034,16 @@ impl<'a> AsyncValidationContext<'a> {
         self.scopes.pop();
     }
 
-    fn define_promise(&mut self, name: String, ty: BType) {
+    fn define_var(&mut self, name: String, ty: BType) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.clone(), ty);
+            scope.insert(name.clone(), ty.clone());
         }
-        self.declared_promises.insert(name);
+        if let BType::Promise(_) = ty {
+            self.declared_promises.insert(name);
+        }
     }
 
-    fn lookup_promise(&self, name: &str) -> Option<BType> {
+    fn lookup_var(&self, name: &str) -> Option<BType> {
         self.scopes
             .iter()
             .rev()
@@ -1088,40 +1129,46 @@ fn call_arg_compatible(expected: &BType, actual: &BType) -> bool {
 fn array_element_type(ty: Option<&BType>) -> Result<AsyncExprKind, String> {
     match ty {
         Some(BType::Array(_, inner)) | Some(BType::Ptr(inner)) => {
-            Ok(AsyncExprKind::Plain((**inner).clone()))
+            Ok(kind_from_btype((**inner).clone()))
         }
         _ => Ok(AsyncExprKind::Plain(BType::I32)),
     }
 }
 
 fn field_access_type(
-    ctx: &SemanticCtx<'_>,
+    program: &SemanticProgram,
     base: Option<&BType>,
     field: &str,
 ) -> Result<AsyncExprKind, String> {
     match base {
         Some(BType::Struct(name)) => {
-            let ty = ctx
-                .program
+            let ty = program
                 .structs
                 .get(name)
                 .and_then(|sig| sig.fields.get(field))
                 .cloned()
                 .unwrap_or(BType::I32);
-            Ok(AsyncExprKind::Plain(ty))
+            Ok(kind_from_btype(ty))
         }
         _ => Ok(AsyncExprKind::Plain(BType::I32)),
     }
 }
 
 fn ptr_field_access_type(
-    ctx: &SemanticCtx<'_>,
+    program: &SemanticProgram,
     base: Option<&BType>,
     field: &str,
 ) -> Result<AsyncExprKind, String> {
     match base {
-        Some(BType::Ptr(inner)) => field_access_type(ctx, Some(inner), field),
+        Some(BType::Ptr(inner)) => field_access_type(program, Some(inner), field),
         _ => Ok(AsyncExprKind::Plain(BType::I32)),
+    }
+}
+
+fn kind_from_btype(ty: BType) -> AsyncExprKind {
+    match ty {
+        BType::Promise(inner) => AsyncExprKind::Promise(*inner),
+        other => AsyncExprKind::Plain(other),
     }
 }
 
