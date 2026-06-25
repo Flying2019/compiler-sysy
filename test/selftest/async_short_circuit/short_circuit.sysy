@@ -1,0 +1,29 @@
+int calls;
+
+async int zero() {
+  calls = calls + 1;
+  return 0;
+}
+
+async int one() {
+  calls = calls + 10;
+  return 1;
+}
+
+async int main_async() {
+  int score = 0;
+  if (await zero() && await one()) {
+    score = score + 100;
+  } else {
+    score = score + 1;
+  }
+  if (await one() || await zero()) {
+    score = score + 20;
+  }
+  return score + calls;
+}
+
+int main() {
+  Promise<int> p = main_async();
+  return p.wait();
+}

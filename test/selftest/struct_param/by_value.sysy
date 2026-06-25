@@ -1,0 +1,16 @@
+pair {
+  int x;
+  int y;
+};
+
+int sum_pair(pair p) {
+  p.x = p.x + 1;
+  return p.x + p.y;
+}
+
+int main() {
+  pair p;
+  p.x = 10;
+  p.y = 31;
+  return sum_pair(p) + p.x - 10;
+}

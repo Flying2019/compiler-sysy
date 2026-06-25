@@ -1,0 +1,21 @@
+node {
+  int value;
+  node* next;
+};
+
+int link_and_sum(node* first, node* second) {
+  first->next = second;
+  second->value = second->value + first->value;
+  return first->next->value;
+}
+
+int main() {
+  node* a = new node;
+  node* b = new node;
+  a->value = 10;
+  b->value = 11;
+  node* c = a;
+  int total = link_and_sum(c, b);
+  a->next->value = a->next->value + 21;
+  return total + b->value;
+}

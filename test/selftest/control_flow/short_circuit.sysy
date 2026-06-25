@@ -1,0 +1,13 @@
+int boom() {
+  return 1 / 0;
+}
+
+int main() {
+  if (0 && boom()) {
+    return 1;
+  }
+  if (1 || boom()) {
+    return 42;
+  }
+  return 2;
+}

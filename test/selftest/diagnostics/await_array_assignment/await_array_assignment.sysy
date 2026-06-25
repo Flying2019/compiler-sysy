@@ -1,0 +1,9 @@
+async int one() {
+  return 1;
+}
+
+async int main() {
+  int a[1];
+  a[0] = await one();
+  return a[0];
+}

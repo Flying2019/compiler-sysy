@@ -1,0 +1,19 @@
+pair {
+  int x;
+  int y;
+};
+
+box {
+  pair p;
+  int z;
+};
+
+pair g = {10, 20};
+box gb = {{1, 2}, 3};
+
+int main() {
+  pair p = {30};
+  box b = {{4, 5}, 6};
+  return g.x + g.y + gb.p.x + gb.p.y + gb.z
+      + p.x + p.y + b.p.x + b.p.y + b.z;
+}

@@ -1,0 +1,8 @@
+async int bad() {
+  return await sleep(1);
+}
+
+int main() {
+  Promise<int> p = bad();
+  return p.wait();
+}

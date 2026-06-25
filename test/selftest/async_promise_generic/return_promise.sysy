@@ -1,0 +1,12 @@
+async int id(int x) {
+  return x;
+}
+
+Promise<int> make_promise() {
+  return id(46);
+}
+
+int main() {
+  Promise<int> p = make_promise();
+  return p.wait();
+}

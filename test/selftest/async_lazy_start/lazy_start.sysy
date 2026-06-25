@@ -1,0 +1,16 @@
+int marker;
+
+async int mutate() {
+  marker = marker + 10;
+  await sleep(1);
+  marker = marker + 100;
+  return marker;
+}
+
+int main() {
+  Promise<int> p = mutate();
+  marker = marker + 1;
+  int before_wait = marker;
+  int result = p.wait();
+  return before_wait + result;
+}

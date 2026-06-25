@@ -1,0 +1,10 @@
+async int one() {
+  return 1;
+}
+
+async int main() {
+  if (await one()) {
+    return 1;
+  }
+  return 0;
+}

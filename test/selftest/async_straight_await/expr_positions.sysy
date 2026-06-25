@@ -1,0 +1,23 @@
+async int val(int x) {
+  return x;
+}
+
+int add(int a, int b) {
+  return a + b;
+}
+
+node {
+  int x;
+  int y;
+};
+
+async int main_async() {
+  int arr[2] = {await val(10), await val(20)};
+  node n = {await val(5), await val(7)};
+  return add(await val(arr[0]), arr[1]) + n.x + n.y;
+}
+
+int main() {
+  Promise<int> p = main_async();
+  return p.wait();
+}

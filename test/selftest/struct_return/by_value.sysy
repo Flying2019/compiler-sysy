@@ -1,0 +1,16 @@
+pair {
+  int x;
+  int y;
+};
+
+pair make_pair(int x, int y) {
+  pair p;
+  p.x = x;
+  p.y = y;
+  return p;
+}
+
+int main() {
+  pair p = make_pair(19, 23);
+  return p.x + p.y;
+}

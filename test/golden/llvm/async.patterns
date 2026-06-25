@@ -1,0 +1,14 @@
+%async.frame.
+getelementptr inbounds %async.frame.
+target triple = "riscv64-unknown-unknown-elf"
+target datalayout = "e-m:e-p:64:64-i64:64-i128:128-n64-S128"
+declare ptr @__sysy_promise_new(i64)
+declare void @__sysy_promise_set_callback(ptr, ptr, ptr)
+declare void @__sysy_pending_add(ptr, ptr, ptr)
+declare void @__sysy_promise_clear_driver(ptr)
+define void @__sysy_async_start_
+call void @__sysy_promise_set_callback
+call void @__sysy_pending_add
+define void @__sysy_async_cont_
+call ptr @__sysy_promise_result_ptr
+call void @__sysy_promise_clear_driver

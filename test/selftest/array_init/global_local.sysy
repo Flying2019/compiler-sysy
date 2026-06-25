@@ -1,0 +1,6 @@
+int global_arr[2][3] = {{1, 2, 3}, {4, 5, 6}};
+
+int main() {
+  int local[2][3] = {{7, 8}, {9}};
+  return global_arr[1][2] + local[0][1] + local[1][0] + local[1][2];
+}

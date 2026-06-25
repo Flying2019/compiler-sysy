@@ -1,0 +1,32 @@
+pair {
+  int x;
+  int y;
+};
+
+box {
+  pair p;
+  int z;
+};
+
+pair make_pair(int x, int y) {
+  pair p = {x, y};
+  return p;
+}
+
+int main() {
+  pair arr[2];
+  pair first = {10, 11};
+  pair second = make_pair(20, 21);
+  arr[0] = first;
+  arr[1] = second;
+
+  box boxes[2];
+  box seed = {{1, 2}, 3};
+  boxes[0] = seed;
+  boxes[1] = boxes[0];
+  boxes[1].p.x = boxes[1].p.x + 5;
+
+  return arr[0].x + arr[0].y + arr[1].x + arr[1].y
+      + boxes[0].p.x + boxes[0].p.y + boxes[0].z
+      + boxes[1].p.x + boxes[1].p.y + boxes[1].z;
+}

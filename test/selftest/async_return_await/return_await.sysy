@@ -1,0 +1,13 @@
+async int id_after_sleep(int value) {
+  await sleep(1);
+  return value;
+}
+
+async int wrapper() {
+  return await id_after_sleep(33);
+}
+
+int main() {
+  Promise<int> result = wrapper();
+  return result.wait();
+}

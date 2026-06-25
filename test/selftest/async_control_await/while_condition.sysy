@@ -1,0 +1,18 @@
+async int tick(int x) {
+  return x;
+}
+
+async int main_async() {
+  int i = 0;
+  int sum = 0;
+  while (await tick(i < 3)) {
+    sum = sum + i;
+    i = i + 1;
+  }
+  return sum;
+}
+
+int main() {
+  Promise<int> p = main_async();
+  return p.wait();
+}

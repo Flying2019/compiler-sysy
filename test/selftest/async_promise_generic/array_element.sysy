@@ -1,0 +1,10 @@
+async int id(int x) {
+  return x;
+}
+
+int main() {
+  Promise<int> ps[2];
+  ps[0] = id(20);
+  ps[1] = id(22);
+  return ps[0].wait() + ps[1].wait();
+}

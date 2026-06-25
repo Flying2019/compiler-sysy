@@ -1,0 +1,8 @@
+async int make_value() {
+  return 1;
+}
+
+int main() {
+  int x = make_value();
+  return x;
+}

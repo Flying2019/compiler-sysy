@@ -1,0 +1,17 @@
+async int delayed_add(int x, int y) {
+  await sleep(3);
+  return x + y;
+}
+
+async int chain(int base) {
+  int first = await delayed_add(base, 7);
+  await sleep(2);
+  int second = await delayed_add(first, 5);
+  return second;
+}
+
+int main() {
+  Promise<int> result = chain(30);
+  return result.wait();
+}
+

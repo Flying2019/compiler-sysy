@@ -1,0 +1,13 @@
+pair {
+  int x;
+  int y;
+};
+
+int main() {
+  pair a;
+  pair b;
+  a.x = 19;
+  a.y = 23;
+  b = a;
+  return b.x + b.y;
+}

@@ -1,0 +1,13 @@
+int x=0;
+int y=0;
+
+async int chain() {
+  await sleep(2);
+  return x;
+}
+
+int main() {
+  Promise<int> result = chain(30);
+  x=x+42;
+  return result.wait();
+}

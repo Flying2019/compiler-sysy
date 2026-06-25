@@ -1,0 +1,13 @@
+point {
+  int x;
+  int y;
+};
+
+int main() {
+  point items[2];
+  items[0].x = 5;
+  items[0].y = 7;
+  items[1].x = items[0].x + 11;
+  items[1].y = items[0].y + 19;
+  return items[1].x + items[1].y;
+}

@@ -1,0 +1,4 @@
+async int main() {
+  await sleep(4);
+  return 7;
+}

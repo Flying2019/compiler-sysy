@@ -1,0 +1,28 @@
+int sum1(int a[], int n) {
+  int i = 0;
+  int total = 0;
+  while (i < n) {
+    total = total + a[i];
+    i = i + 1;
+  }
+  return total;
+}
+
+int bump(int a[], int idx) {
+  a[idx] = a[idx] + 3;
+  return a[idx];
+}
+
+int pick(int a[][2], int i, int j) {
+  return a[i][j];
+}
+
+int main() {
+  int a[3] = {1, 2, 3};
+  int b[2][2] = {{4, 5}, {6, 7}};
+  int total = sum1(a, 3);
+  total = total + bump(a, 1);
+  total = total + sum1(b[1], 2);
+  b[0][1] = a[1] + pick(b, 1, 0);
+  return total + b[0][1];
+}

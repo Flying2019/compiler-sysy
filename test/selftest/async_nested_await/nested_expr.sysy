@@ -1,0 +1,63 @@
+int calls;
+
+node {
+  int value;
+};
+
+async int id(int x) {
+  return x;
+}
+
+async int mark(int x) {
+  calls = calls + 1;
+  return x;
+}
+
+async void tick() {
+  calls = calls + 10;
+  return;
+}
+
+async int* id_ptr(int* p) {
+  return p;
+}
+
+async node make_node(int value) {
+  node out = {value};
+  return out;
+}
+
+int add3(int a, int b, int c) {
+  return a + b + c;
+}
+
+int read_ptr(int* p) {
+  return *p;
+}
+
+int read_node(node n) {
+  return n.value;
+}
+
+async int main_async() {
+  int total = 1 + await id(2);
+  total = total + add3(await id(3), await id(4), 5);
+  total = total + (0 && await mark(100));
+  total = total + (1 || await mark(100));
+  total = total + ((await mark(1)) && (await mark(1)));
+  await tick();
+
+  int value = 6;
+  int* p = await id_ptr(&value);
+  total = total + read_ptr(await id_ptr(p));
+
+  node n = await make_node(7);
+  total = total + read_node(await make_node(n.value));
+
+  return total + await id(8) + calls;
+}
+
+int main() {
+  Promise<int> p = main_async();
+  return p.wait();
+}

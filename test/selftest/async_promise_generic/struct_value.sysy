@@ -1,0 +1,14 @@
+node {
+  int value;
+};
+
+async node make_node(int value) {
+  node out = {value};
+  return out;
+}
+
+int main() {
+  Promise<node> p = make_node(44);
+  node out = p.wait();
+  return out.value;
+}

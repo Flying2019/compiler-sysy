@@ -1,0 +1,11 @@
+async int keep_live() {
+  int live = 21;
+  int dead = 7;
+  await sleep(2);
+  return live * 2;
+}
+
+int main() {
+  Promise<int> p = keep_live();
+  return p.wait();
+}

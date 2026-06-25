@@ -1,0 +1,12 @@
+node {
+  int value;
+  node* next;
+};
+
+int main() {
+  node* head = new node;
+  head->value = 11;
+  head->next = new node;
+  head->next->value = 31;
+  return head->value + head->next->value;
+}

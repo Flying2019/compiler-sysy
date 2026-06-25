@@ -1,0 +1,12 @@
+async int delayed(int value, int ticks) {
+  await sleep(ticks);
+  return value;
+}
+
+int main() {
+  Promise<int> slow = delayed(10, 6);
+  Promise<int> fast = delayed(20, 2);
+  int a = fast.wait();
+  int b = slow.wait();
+  return a + b;
+}

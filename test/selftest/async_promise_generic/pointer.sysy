@@ -1,0 +1,10 @@
+async int* id_ptr(int* p) {
+  return p;
+}
+
+int main() {
+  int value = 43;
+  Promise<int*> p = id_ptr(&value);
+  int* out = p.wait();
+  return *out;
+}

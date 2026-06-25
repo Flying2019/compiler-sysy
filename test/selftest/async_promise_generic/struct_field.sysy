@@ -1,0 +1,13 @@
+box {
+  Promise<int> p;
+};
+
+async int answer() {
+  return 45;
+}
+
+int main() {
+  box b;
+  b.p = answer();
+  return b.p.wait();
+}

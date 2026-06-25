@@ -1,0 +1,14 @@
+int sum_row(int a[][3], int row) {
+  int j = 0;
+  int total = 0;
+  while (j < 3) {
+    total = total + a[row][j];
+    j = j + 1;
+  }
+  return total;
+}
+
+int main() {
+  int a[2][3] = {{1, 2, 3}, {4, 5, 6}};
+  return sum_row(a, 1);
+}
