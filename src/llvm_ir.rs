@@ -110,9 +110,8 @@ pub fn try_compile_to_llvm_with_target(
     ast: &CompUnit,
     target_triple: &str,
 ) -> Result<String, String> {
-    let ast = normalize_async_awaits(ast);
     ast.validate_semantics()?;
-    catch_lowering_errors(|| emit_llvm_unchecked(&ast, target_triple))
+    catch_lowering_errors(|| emit_llvm_unchecked(ast, target_triple))
 }
 
 fn catch_lowering_errors<F>(f: F) -> Result<String, String>
@@ -133,224 +132,6 @@ where
         };
         format!("LLVM lowering failed: {}", message)
     })
-}
-
-fn normalize_async_awaits(ast: &CompUnit) -> CompUnit {
-    let mut used_names = HashSet::new();
-    collect_names_comp_unit(ast, &mut used_names);
-    let mut lifter = AwaitLifter {
-        next_id: 0,
-        used_names,
-    };
-    CompUnit {
-        global_defs: ast
-            .global_defs
-            .iter()
-            .map(|global| match global {
-                GlobalDef::FuncDef(func) if func.is_async => {
-                    let mut func = func.clone();
-                    func.block = lifter.lift_stmts(&func.block);
-                    GlobalDef::FuncDef(func)
-                }
-                other => other.clone(),
-            })
-            .collect(),
-    }
-}
-
-struct AwaitLifter {
-    next_id: usize,
-    used_names: HashSet<String>,
-}
-
-impl AwaitLifter {
-    fn lift_stmts(&mut self, stmts: &[Stmt]) -> Vec<Stmt> {
-        let mut out = Vec::new();
-        for stmt in stmts {
-            out.extend(self.lift_stmt(stmt));
-        }
-        out
-    }
-
-    fn lift_stmt(&mut self, stmt: &Stmt) -> Vec<Stmt> {
-        let mut prelude = Vec::new();
-        let stmt = match stmt {
-            Stmt::Block(stmts) => Stmt::Block(self.lift_stmts(stmts)),
-            Stmt::Assign(lhs, rhs)
-                if matches!(lhs, Exp::Ident(_)) && matches!(rhs, Exp::Await(_)) =>
-            {
-                Stmt::Assign(lhs.clone(), self.lift_top_level_await(rhs, &mut prelude))
-            }
-            Stmt::Assign(lhs, rhs) => {
-                let rhs = self.lift_exp(rhs, &mut prelude);
-                Stmt::Assign(lhs.clone(), rhs)
-            }
-            Stmt::Decl(ty, decls) => {
-                let mut out = Vec::new();
-                for decl in decls {
-                    let mut decl_prelude = Vec::new();
-                    let init = decl.init.as_ref().map(|init| match init {
-                        InitVal::Exp(exp) if matches!(exp, Exp::Await(_)) => {
-                            InitVal::Exp(self.lift_top_level_await(exp, &mut decl_prelude))
-                        }
-                        _ => self.lift_init(init, &mut decl_prelude),
-                    });
-                    out.extend(decl_prelude);
-                    out.push(Stmt::Decl(
-                        ty.clone(),
-                        vec![SingleDecl {
-                            var: decl.var.clone(),
-                            init,
-                        }],
-                    ));
-                }
-                return out;
-            }
-            Stmt::Exp(exp) if matches!(exp, Exp::Await(_)) => {
-                Stmt::Exp(self.lift_top_level_await(exp, &mut prelude))
-            }
-            Stmt::Exp(exp) => Stmt::Exp(self.lift_exp(exp, &mut prelude)),
-            Stmt::Return(Some(exp)) if matches!(exp, Exp::Await(_)) => {
-                Stmt::Return(Some(self.lift_top_level_await(exp, &mut prelude)))
-            }
-            Stmt::Return(Some(exp)) => Stmt::Return(Some(self.lift_exp(exp, &mut prelude))),
-            Stmt::PromiseWait(exp) => Stmt::PromiseWait(self.lift_exp(exp, &mut prelude)),
-            Stmt::If(cond, then_stmt) => {
-                let cond = self.lift_exp(cond, &mut prelude);
-                Stmt::If(cond, Box::new(self.lift_stmt_as_block(then_stmt)))
-            }
-            Stmt::IfElse(cond, then_stmt, else_stmt) => {
-                let cond = self.lift_exp(cond, &mut prelude);
-                Stmt::IfElse(
-                    cond,
-                    Box::new(self.lift_stmt_as_block(then_stmt)),
-                    Box::new(self.lift_stmt_as_block(else_stmt)),
-                )
-            }
-            Stmt::While(cond, body) => {
-                // Await in a loop condition cannot be hoisted without changing loop semantics.
-                Stmt::While(cond.clone(), Box::new(self.lift_stmt_as_block(body)))
-            }
-            Stmt::Continue | Stmt::Break | Stmt::Return(None) | Stmt::Empty => stmt.clone(),
-        };
-        prelude.push(stmt);
-        prelude
-    }
-
-    fn lift_stmt_as_block(&mut self, stmt: &Stmt) -> Stmt {
-        match stmt {
-            Stmt::Block(stmts) => Stmt::Block(self.lift_stmts(stmts)),
-            other => {
-                let stmts = self.lift_stmt(other);
-                if stmts.len() == 1 {
-                    stmts.into_iter().next().unwrap()
-                } else {
-                    Stmt::Block(stmts)
-                }
-            }
-        }
-    }
-
-    fn lift_top_level_await(&mut self, exp: &Exp, prelude: &mut Vec<Stmt>) -> Exp {
-        match exp {
-            Exp::Await(inner) => Exp::Await(Box::new(self.lift_exp(inner, prelude))),
-            _ => self.lift_exp(exp, prelude),
-        }
-    }
-
-    fn lift_init(&mut self, init: &InitVal, prelude: &mut Vec<Stmt>) -> InitVal {
-        match init {
-            InitVal::Exp(exp) => InitVal::Exp(self.lift_exp(exp, prelude)),
-            InitVal::Arr(items) => InitVal::Arr(
-                items
-                    .iter()
-                    .map(|item| self.lift_init(item, prelude))
-                    .collect(),
-            ),
-        }
-    }
-
-    fn lift_exp(&mut self, exp: &Exp, prelude: &mut Vec<Stmt>) -> Exp {
-        match exp {
-            Exp::Await(inner) => {
-                let inner = self.lift_exp(inner, prelude);
-                let temp = self.next_temp();
-                prelude.push(Stmt::Decl(
-                    Type::BType(BType::I32),
-                    vec![SingleDecl {
-                        var: VarDecl::Ident(temp.clone()),
-                        init: Some(InitVal::Exp(Exp::Await(Box::new(inner)))),
-                    }],
-                ));
-                Exp::Ident(temp)
-            }
-            Exp::UnaryExp(op, inner) => {
-                Exp::UnaryExp(op.clone(), Box::new(self.lift_exp(inner, prelude)))
-            }
-            Exp::BinaryExp(op @ (BinaryOp::And | BinaryOp::Or), lhs, rhs) => {
-                Exp::BinaryExp(op.clone(), lhs.clone(), rhs.clone())
-            }
-            Exp::BinaryExp(op, lhs, rhs) => Exp::BinaryExp(
-                op.clone(),
-                Box::new(self.lift_exp(lhs, prelude)),
-                Box::new(self.lift_exp(rhs, prelude)),
-            ),
-            Exp::Sleep(inner) => Exp::Sleep(Box::new(self.lift_exp(inner, prelude))),
-            Exp::PromiseWait(inner) => Exp::PromiseWait(Box::new(self.lift_exp(inner, prelude))),
-            Exp::FuncCall(name, args) => Exp::FuncCall(
-                name.clone(),
-                args.iter().map(|arg| self.lift_exp(arg, prelude)).collect(),
-            ),
-            Exp::ArrGet(base, index) => Exp::ArrGet(
-                Box::new(self.lift_exp(base, prelude)),
-                Box::new(self.lift_exp(index, prelude)),
-            ),
-            Exp::Field(base, field) => {
-                Exp::Field(Box::new(self.lift_exp(base, prelude)), field.clone())
-            }
-            Exp::PtrField(base, field) => {
-                Exp::PtrField(Box::new(self.lift_exp(base, prelude)), field.clone())
-            }
-            Exp::Number(_) | Exp::New(_) | Exp::Ident(_) => exp.clone(),
-        }
-    }
-
-    fn next_temp(&mut self) -> String {
-        loop {
-            let name = format!("sysy_await_tmp_{}", self.next_id);
-            self.next_id += 1;
-            if self.used_names.insert(name.clone()) {
-                return name;
-            }
-        }
-    }
-}
-
-fn collect_names_comp_unit(ast: &CompUnit, names: &mut HashSet<String>) {
-    for global in &ast.global_defs {
-        match global {
-            GlobalDef::FuncDef(func) => {
-                names.insert(func.ident.clone());
-                for param in &func.func_params {
-                    names.insert(param.name.clone());
-                }
-                collect_names_stmts(&func.block, names);
-            }
-            GlobalDef::GlobalDecl(_, decls) => {
-                for decl in decls {
-                    names.insert(var_decl_name(&decl.var));
-                }
-            }
-            GlobalDef::StructDef(def) => {
-                names.insert(def.name.clone());
-                for field in &def.fields {
-                    for decl in &field.decls {
-                        names.insert(var_decl_name(&decl.var));
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn collect_names_stmts(stmts: &[Stmt], names: &mut HashSet<String>) {
@@ -847,7 +628,7 @@ fn async_frame_layout(
     params: &[(String, LlvmType)],
     stmts: &[Stmt],
     frame_locals: &HashSet<String>,
-    extra_i32_fields: &HashSet<String>,
+    extra_fields: &HashMap<String, LlvmType>,
     await_count: usize,
 ) -> AsyncFrameLayout {
     let mut fields = HashMap::new();
@@ -886,7 +667,7 @@ fn async_frame_layout(
         &mut offset,
         &mut max_align,
     );
-    for name in extra_i32_fields {
+    for (name, ty) in extra_fields {
         add_frame_field(
             &mut fields,
             &mut ordered_fields,
@@ -895,7 +676,7 @@ fn async_frame_layout(
             &module.layouts,
             frame_type,
             name.clone(),
-            LlvmType::I32,
+            ty.clone(),
         );
     }
     for idx in 0..await_count {
@@ -1061,6 +842,150 @@ fn collect_await_points(
         .collect()
 }
 
+fn collect_function_type_env(module: &ModuleCtx, func: &FuncDef) -> HashMap<String, LlvmType> {
+    let mut env = HashMap::new();
+    for param in &func.func_params {
+        env.insert(
+            param.name.clone(),
+            LlvmType::from_btype(&param_resolved_btype(param, module)),
+        );
+    }
+    collect_decl_type_env(module, &func.block, &mut env);
+    env
+}
+
+fn collect_decl_type_env(module: &ModuleCtx, stmts: &[Stmt], env: &mut HashMap<String, LlvmType>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Block(stmts) => collect_decl_type_env(module, stmts, env),
+            Stmt::Decl(ty, decls) => {
+                for decl in decls {
+                    env.insert(var_decl_name(&decl.var), decl_type(ty, &decl.var, module));
+                }
+            }
+            Stmt::If(_, then_stmt) => {
+                collect_decl_type_env(module, std::slice::from_ref(then_stmt), env)
+            }
+            Stmt::IfElse(_, then_stmt, else_stmt) => {
+                collect_decl_type_env(module, std::slice::from_ref(then_stmt), env);
+                collect_decl_type_env(module, std::slice::from_ref(else_stmt), env);
+            }
+            Stmt::While(_, body) => collect_decl_type_env(module, std::slice::from_ref(body), env),
+            Stmt::Assign(_, _)
+            | Stmt::Exp(_)
+            | Stmt::PromiseWait(_)
+            | Stmt::Continue
+            | Stmt::Break
+            | Stmt::Return(_)
+            | Stmt::Empty => {}
+        }
+    }
+}
+
+fn infer_await_result_type(
+    module: &ModuleCtx,
+    env: &HashMap<String, LlvmType>,
+    cfg: &AsyncCfgFunction,
+    state: i32,
+) -> Option<LlvmType> {
+    let await_term = cfg
+        .await_points()
+        .into_iter()
+        .find(|await_term| await_term.state == state)?;
+    match infer_exp_type(module, env, &await_term.child)? {
+        LlvmType::Promise(inner) => Some(*inner),
+        other => Some(other.promise_value()),
+    }
+}
+
+fn infer_exp_type(
+    module: &ModuleCtx,
+    env: &HashMap<String, LlvmType>,
+    exp: &Exp,
+) -> Option<LlvmType> {
+    match exp {
+        Exp::Number(_) => Some(LlvmType::I32),
+        Exp::Ident(name) => env
+            .get(name)
+            .cloned()
+            .or_else(|| module.globals.get(name).cloned())
+            .or_else(|| module.constants.get(name).map(|_| LlvmType::I32)),
+        Exp::UnaryExp(UnaryOp::Addr, inner) => {
+            infer_lvalue_type(module, env, inner).map(|ty| LlvmType::Ptr(Box::new(ty)))
+        }
+        Exp::UnaryExp(UnaryOp::Deref, inner) => match infer_exp_type(module, env, inner)? {
+            LlvmType::Ptr(inner) => Some(*inner),
+            _ => None,
+        },
+        Exp::UnaryExp(_, _) | Exp::BinaryExp(_, _, _) => Some(LlvmType::I32),
+        Exp::New(ty) => Some(LlvmType::Ptr(Box::new(LlvmType::from_btype(ty)))),
+        Exp::Await(inner) | Exp::PromiseWait(inner) => {
+            Some(infer_exp_type(module, env, inner)?.promise_value())
+        }
+        Exp::Sleep(_) => Some(LlvmType::Promise(Box::new(LlvmType::Void))),
+        Exp::FuncCall(name, _) => {
+            let sig = module.funcs.get(name)?;
+            if sig.is_async {
+                Some(LlvmType::Promise(Box::new(sig.ret.clone())))
+            } else {
+                Some(sig.ret.clone())
+            }
+        }
+        Exp::ArrGet(_, _) | Exp::Field(_, _) | Exp::PtrField(_, _) => {
+            infer_lvalue_type(module, env, exp)
+        }
+    }
+}
+
+fn infer_lvalue_type(
+    module: &ModuleCtx,
+    env: &HashMap<String, LlvmType>,
+    exp: &Exp,
+) -> Option<LlvmType> {
+    match exp {
+        Exp::Ident(name) => env
+            .get(name)
+            .cloned()
+            .or_else(|| module.globals.get(name).cloned()),
+        Exp::UnaryExp(UnaryOp::Deref, inner) => match infer_exp_type(module, env, inner)? {
+            LlvmType::Ptr(inner) => Some(*inner),
+            _ => None,
+        },
+        Exp::ArrGet(base, _) => match infer_exp_type(module, env, base)? {
+            LlvmType::Array(_, inner) => Some(*inner),
+            LlvmType::Ptr(inner) => match *inner {
+                LlvmType::Array(_, element) => Some(*element),
+                other => Some(other),
+            },
+            _ => None,
+        },
+        Exp::Field(base, field_name) => {
+            let base_ty = infer_exp_type(module, env, base)?;
+            let struct_name = match base_ty {
+                LlvmType::Struct(name) => name,
+                LlvmType::Ptr(inner) => match *inner {
+                    LlvmType::Struct(name) => name,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            Some(module.field(&struct_name, field_name).ty.clone())
+        }
+        Exp::PtrField(base, field_name) => {
+            let base_ty = infer_exp_type(module, env, base)?;
+            let struct_name = match base_ty {
+                LlvmType::Ptr(inner) => match *inner {
+                    LlvmType::Struct(name) => name,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            Some(module.field(&struct_name, field_name).ty.clone())
+        }
+        _ => None,
+    }
+}
+
 fn async_field_ptr(ctx: &mut FunctionCtx<'_>, frame: &str, field: &FrameField) -> String {
     let ptr = ctx.tmp();
     ctx.emit(format!(
@@ -1107,12 +1032,23 @@ fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
         .collect::<HashSet<_>>();
     let start_name = format!("__sysy_async_start_{}", safe_name);
     let awaits = collect_await_points(module, &safe_name, &cfg);
-    let mut extra_i32_fields = HashSet::new();
+    let mut extra_fields = HashMap::new();
+    for temp in &cfg.i32_temps {
+        extra_fields.insert(temp.clone(), LlvmType::I32);
+    }
+    let mut type_env = collect_function_type_env(module, func);
     for await_info in &awaits {
         if let Some(target) = &await_info.result_target {
             if target != "__return" {
                 if target.starts_with("__sysy_cfg_await_tmp_") {
-                    extra_i32_fields.insert(target.clone());
+                    if let Some(await_ty) =
+                        infer_await_result_type(module, &type_env, &cfg, await_info.state)
+                    {
+                        type_env.insert(target.clone(), await_ty.clone());
+                        extra_fields.insert(target.clone(), await_ty);
+                    } else {
+                        extra_fields.insert(target.clone(), LlvmType::I32);
+                    }
                 } else {
                     frame_locals.insert(target.clone());
                 }
@@ -1128,7 +1064,7 @@ fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> String {
         &params,
         &func.block,
         &frame_locals,
-        &extra_i32_fields,
+        &extra_fields,
         awaits.len(),
     );
     let fields = &frame_layout.fields;

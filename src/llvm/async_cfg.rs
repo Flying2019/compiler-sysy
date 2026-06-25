@@ -7,6 +7,7 @@ use std::collections::HashSet;
 pub(crate) struct AsyncCfgFunction {
     pub(crate) entry: usize,
     pub(crate) blocks: Vec<AsyncBlock>,
+    pub(crate) i32_temps: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,13 +162,18 @@ pub(crate) fn build_top_level_async_cfg(func: &FuncDef) -> AsyncCfgFunction {
         terminator: AsyncTerminator::Return(None),
     });
 
-    AsyncCfgFunction { entry: 0, blocks }
+    AsyncCfgFunction {
+        entry: 0,
+        blocks,
+        i32_temps: Vec::new(),
+    }
 }
 
 struct CfgBuilder {
     blocks: Vec<AsyncBlock>,
     state: i32,
     temp_id: usize,
+    i32_temps: Vec<String>,
     loop_stack: Vec<LoopTargets>,
 }
 
@@ -183,6 +189,7 @@ impl CfgBuilder {
             blocks: Vec::new(),
             state: 1,
             temp_id: 0,
+            i32_temps: Vec::new(),
             loop_stack: Vec::new(),
         }
     }
@@ -194,6 +201,7 @@ impl CfgBuilder {
         AsyncCfgFunction {
             entry,
             blocks: self.blocks,
+            i32_temps: self.i32_temps,
         }
     }
 
@@ -393,6 +401,9 @@ impl CfgBuilder {
             Exp::UnaryExp(op, inner) => {
                 Exp::UnaryExp(op.clone(), Box::new(self.lower_exp(current, inner)))
             }
+            Exp::BinaryExp(op @ (BinaryOp::And | BinaryOp::Or), lhs, rhs) => {
+                self.lower_short_circuit_value(current, op, lhs, rhs)
+            }
             Exp::BinaryExp(op, lhs, rhs) => Exp::BinaryExp(
                 op.clone(),
                 Box::new(self.lower_exp(current, lhs)),
@@ -424,6 +435,44 @@ impl CfgBuilder {
         let name = format!("__sysy_cfg_await_tmp_{}", self.temp_id);
         self.temp_id += 1;
         name
+    }
+
+    fn next_i32_temp(&mut self, prefix: &str) -> String {
+        let name = format!("{}_{}", prefix, self.temp_id);
+        self.temp_id += 1;
+        self.i32_temps.push(name.clone());
+        name
+    }
+
+    fn lower_short_circuit_value(
+        &mut self,
+        current: &mut usize,
+        op: &BinaryOp,
+        lhs: &Exp,
+        rhs: &Exp,
+    ) -> Exp {
+        let result = self.next_i32_temp("__sysy_cfg_bool_tmp");
+        let true_block = self.new_block();
+        let false_block = self.new_block();
+        let end_block = self.new_block();
+        let cond = Exp::BinaryExp(op.clone(), Box::new(lhs.clone()), Box::new(rhs.clone()));
+        let cond_end = self.lower_cond(*current, &cond, true_block, false_block);
+        self.terminate_if_open(cond_end, AsyncTerminator::Jump(end_block));
+
+        self.push_op(
+            true_block,
+            AsyncOp::Assign(Exp::Ident(result.clone()), Exp::Number(1)),
+        );
+        self.terminate_if_open(true_block, AsyncTerminator::Jump(end_block));
+
+        self.push_op(
+            false_block,
+            AsyncOp::Assign(Exp::Ident(result.clone()), Exp::Number(0)),
+        );
+        self.terminate_if_open(false_block, AsyncTerminator::Jump(end_block));
+
+        *current = end_block;
+        Exp::Ident(result)
     }
 
     fn suspend_for_await(

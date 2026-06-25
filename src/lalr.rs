@@ -478,10 +478,6 @@ impl Stmt {
             }
             Stmt::Assign(lhs, rhs) => {
                 reject_unsupported_await_position(lhs, "assignment target")?;
-                reject_unsupported_await_nested(rhs, "assignment value")?;
-                if matches!(rhs, Exp::Await(_)) && !matches!(lhs, Exp::Ident(_)) {
-                    return Err("await assignment target must be a simple identifier".to_string());
-                }
                 let lhs_kind = lhs.validate_async_syntax(ctx)?;
                 let rhs_kind = rhs.validate_async_syntax(ctx)?;
                 match (lhs_kind, rhs_kind) {
@@ -510,7 +506,6 @@ impl Stmt {
                         _ => None,
                     };
                     if let Some(init) = &decl.init {
-                        reject_unsupported_await_nested_in_init(init, "declaration initializer")?;
                         let init_kind = init.validate_async_syntax(ctx)?;
                         match (&declared_promise, init_kind) {
                             (Some(expected), AsyncExprKind::Promise(actual)) => {
@@ -541,7 +536,6 @@ impl Stmt {
                 Ok(())
             }
             Stmt::Exp(exp) => {
-                reject_unsupported_await_nested(exp, "expression statement")?;
                 let kind = exp.validate_async_syntax(ctx)?;
                 if kind.is_promise() {
                     return Err(
@@ -551,7 +545,6 @@ impl Stmt {
                 Ok(())
             }
             Stmt::Return(Some(exp)) => {
-                reject_unsupported_await_nested(exp, "return expression")?;
                 exp.validate_async_syntax(ctx)?;
                 Ok(())
             }
@@ -1222,36 +1215,9 @@ fn builtin_function_sigs() -> HashMap<String, FunctionSig> {
     funcs
 }
 
-fn reject_unsupported_await_nested_in_init(init: &InitVal, context: &str) -> Result<(), String> {
-    match init {
-        InitVal::Exp(exp) => reject_unsupported_await_nested(exp, context),
-        InitVal::Arr(items) => {
-            for item in items {
-                if init_contains_await(item) {
-                    return Err(format!(
-                        "await inside {} is not supported by callback-hole lowering yet",
-                        context
-                    ));
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-fn reject_unsupported_await_nested(exp: &Exp, context: &str) -> Result<(), String> {
-    match exp {
-        Exp::Await(_) => Ok(()),
-        _ => reject_unsupported_await_position(exp, context),
-    }
-}
-
 fn reject_unsupported_await_position(exp: &Exp, context: &str) -> Result<(), String> {
     if exp_contains_await(exp) {
-        Err(format!(
-            "await inside {} is not supported by callback-hole lowering yet",
-            context
-        ))
+        Err(format!("await inside {} is not supported", context))
     } else {
         Ok(())
     }
