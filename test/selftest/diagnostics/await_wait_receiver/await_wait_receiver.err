@@ -1,0 +1,1 @@
+await_wait_receiver.sysy:12:3: await inside Promise.wait receiver is not supported

@@ -1,0 +1,18 @@
+async int id(int x) {
+  return x;
+}
+
+async int use_shadow(Promise<int> p) {
+  int value = await p;
+  {
+    Promise<int> p = id(value + 1);
+    value = await p;
+  }
+  return value;
+}
+
+int main() {
+  Promise<int> p = id(41);
+  Promise<int> out = use_shadow(p);
+  return out.wait();
+}

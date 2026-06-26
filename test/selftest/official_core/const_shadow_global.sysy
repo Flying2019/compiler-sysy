@@ -1,0 +1,13 @@
+const int N = 4;
+int a[N] = {1, 2, 3, 4};
+
+int add_local(int n) {
+  int a = 10;
+  return a + n;
+}
+
+int main() {
+  const int N = 2;
+  int b[N] = {5, 6};
+  return add_local(b[0] + b[1]) + a[3];
+}

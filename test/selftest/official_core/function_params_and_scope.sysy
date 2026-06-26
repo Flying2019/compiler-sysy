@@ -1,0 +1,13 @@
+int mix(int a, int b, int c) {
+  int b_local = b + 1;
+  {
+    int a = c + b_local;
+    return a + b;
+  }
+}
+
+int main() {
+  int a = 5;
+  int b = 7;
+  return mix(a + 1, b - 2, a * 2) + 21;
+}

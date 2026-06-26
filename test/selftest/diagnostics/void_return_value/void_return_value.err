@@ -1,1 +1,1 @@
-Void function cannot return a value
+void_return_value.sysy:2:3: Void function cannot return a value

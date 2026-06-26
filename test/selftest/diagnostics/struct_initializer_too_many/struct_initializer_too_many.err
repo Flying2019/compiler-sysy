@@ -1,1 +1,1 @@
-Too many initializer values for item
+struct_initializer_too_many.sysy:6:12: Too many initializer values for item

@@ -1,1 +1,1 @@
-Array length must be a constant expression
+nonconst_array_len.sysy:3:7: Array length must be a constant expression

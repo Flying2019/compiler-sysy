@@ -1,1 +1,1 @@
-Promise.wait() expects a Promise value
+wait_non_promise.sysy:3:3: Promise.wait() expects a Promise value

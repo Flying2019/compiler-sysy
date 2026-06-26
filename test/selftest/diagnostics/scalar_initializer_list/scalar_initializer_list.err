@@ -1,1 +1,1 @@
-Initializer list cannot initialize int
+scalar_initializer_list.sysy:2:11: Initializer list cannot initialize int

@@ -1,1 +1,1 @@
-Function returning int may fall through without return
+int_return_fallthrough.sysy:1:1: Function returning int may fall through without return

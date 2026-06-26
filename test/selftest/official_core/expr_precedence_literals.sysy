@@ -1,0 +1,6 @@
+int main() {
+  int a = 0x10;
+  int b = 010;
+  int c = 3;
+  return a + b * 2 + (c + 5) / 2 + 7 % 4 * 2 - !0 + (0 - (0 - 1));
+}

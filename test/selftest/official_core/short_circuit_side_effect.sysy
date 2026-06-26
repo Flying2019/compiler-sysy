@@ -1,0 +1,23 @@
+int x;
+
+int inc() {
+  x = x + 1;
+  return 1;
+}
+
+int main() {
+  x = 0;
+  if (0 && inc()) {
+    x = 100;
+  }
+  if (1 || inc()) {
+    x = x + 10;
+  }
+  if (1 && inc()) {
+    x = x + 20;
+  }
+  if (0 || inc()) {
+    x = x + 30;
+  }
+  return x;
+}

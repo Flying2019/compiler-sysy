@@ -1,1 +1,1 @@
-Too many initializer values for int[2]
+nested_array_initializer_too_many.sysy:2:18: Too many initializer values for int[2]

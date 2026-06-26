@@ -1,1 +1,1 @@
-Too many initializer values for int[2]
+array_initializer_too_many.sysy:2:14: Too many initializer values for int[2]

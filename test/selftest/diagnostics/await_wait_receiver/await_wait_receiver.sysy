@@ -1,0 +1,14 @@
+async int idx() {
+  return 0;
+}
+
+async int value() {
+  return 42;
+}
+
+async int main() {
+  Promise<int> ps[1];
+  ps[0] = value();
+  ps[await idx()].wait();
+  return 0;
+}

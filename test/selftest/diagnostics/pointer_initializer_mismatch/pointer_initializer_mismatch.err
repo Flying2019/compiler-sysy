@@ -1,1 +1,1 @@
-Initializer type mismatch: expected int, got int*
+pointer_initializer_mismatch.sysy:3:11: Initializer type mismatch: expected int, got int*

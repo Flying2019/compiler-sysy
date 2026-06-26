@@ -1,1 +1,1 @@
-Array length must be non-negative
+negative_array_len.sysy:2:7: Array length must be non-negative

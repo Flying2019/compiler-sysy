@@ -1,1 +1,1 @@
-break/continue used outside a loop
+break_outside_loop.sysy:2:3: break/continue used outside a loop

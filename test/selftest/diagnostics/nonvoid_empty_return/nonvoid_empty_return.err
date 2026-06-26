@@ -1,1 +1,1 @@
-Function returning int cannot use empty return
+nonvoid_empty_return.sysy:2:3: Function returning int cannot use empty return

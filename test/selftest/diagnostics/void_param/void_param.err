@@ -1,1 +1,1 @@
-Function parameter cannot have type void
+void_param.sysy:1:1: Function parameter cannot have type void

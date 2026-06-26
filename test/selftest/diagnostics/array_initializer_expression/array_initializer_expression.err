@@ -1,1 +1,1 @@
-Array initializer must use an initializer list
+array_initializer_expression.sysy:3:14: Array initializer must use an initializer list

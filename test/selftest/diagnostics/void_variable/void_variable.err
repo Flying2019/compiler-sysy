@@ -1,1 +1,1 @@
-Local variable cannot have type void
+void_variable.sysy:2:8: Local variable cannot have type void

@@ -1,0 +1,18 @@
+slot {
+  Promise<int> values[2];
+};
+
+box {
+  slot inner;
+};
+
+async int id(int x) {
+  return x;
+}
+
+int main() {
+  box item;
+  item.inner.values[0] = id(19);
+  item.inner.values[1] = id(23);
+  return item.inner.values[0].wait() + item.inner.values[1].wait();
+}

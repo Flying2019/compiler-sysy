@@ -1,0 +1,19 @@
+big {
+  int a;
+  int b;
+  int c;
+  int d;
+  int e;
+  int f;
+};
+
+async big make_big(int base) {
+  big out = {base, base + 1, base + 2, base + 3, base + 4, base + 5};
+  return out;
+}
+
+int main() {
+  Promise<big> p = make_big(4);
+  big out = p.wait();
+  return out.a + out.b + out.c + out.d + out.e + out.f;
+}

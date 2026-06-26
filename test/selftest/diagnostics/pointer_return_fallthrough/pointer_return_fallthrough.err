@@ -1,1 +1,1 @@
-Function returning int* may fall through without return
+pointer_return_fallthrough.sysy:1:1: Function returning int* may fall through without return

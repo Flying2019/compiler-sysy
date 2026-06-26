@@ -1,1 +1,1 @@
-Promise expression must be awaited, stored, or registered
+promise_dropped.sysy:6:3: Promise expression must be awaited, stored, or registered

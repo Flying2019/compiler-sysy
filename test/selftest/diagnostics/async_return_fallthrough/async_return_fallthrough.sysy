@@ -1,0 +1,8 @@
+async int missing_return(int x) {
+  await sleep(x);
+}
+
+int main() {
+  Promise<int> p = missing_return(1);
+  return p.wait();
+}

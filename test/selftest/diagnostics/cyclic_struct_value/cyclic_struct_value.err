@@ -1,1 +1,1 @@
-Cyclic struct definition detected
+cyclic_struct_value.sysy:6:15: Cyclic struct definition detected through field right.value: left -> right -> left

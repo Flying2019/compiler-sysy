@@ -1,1 +1,1 @@
-Return type mismatch: expected int, got int*
+return_pointer_as_int.sysy:3:3: Return type mismatch: expected int, got int*

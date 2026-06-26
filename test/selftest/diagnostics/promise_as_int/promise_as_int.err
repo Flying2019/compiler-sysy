@@ -1,1 +1,1 @@
-Promise value cannot initialize non-Promise variable x without await
+promise_as_int.sysy:6:11: Promise value cannot be used in initializer without await
