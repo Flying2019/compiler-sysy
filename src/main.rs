@@ -1,10 +1,10 @@
 use clap::{Parser, ValueEnum};
-use compile_sysy::lalr::CompUnit;
-use compile_sysy::lexer::{LexError, Lexer, Tok};
-use compile_sysy::llvm_ir::{
-    compile_llvm_to_riscv_asm, try_compile_to_llvm, try_compile_to_llvm_with_target,
-    DEFAULT_RISCV_TARGET,
+use compile_sysy::compile::{
+    compile_llvm_to_riscv_asm, dump_async_cfgs, try_compile_to_llvm,
+    try_compile_to_llvm_with_target, DEFAULT_RISCV_TARGET,
 };
+use compile_sysy::lalr::{CompUnit, Diagnostic};
+use compile_sysy::lexer::{LexError, Lexer, Tok};
 use lalrpop_util::lalrpop_mod;
 use lalrpop_util::ParseError;
 use std::env;
@@ -31,6 +31,9 @@ struct Args {
 
     #[arg(long, default_value = DEFAULT_RISCV_TARGET)]
     target: String,
+
+    #[arg(long)]
+    dump_cfg: Option<PathBuf>,
 }
 
 lalrpop_mod!(sysy);
@@ -70,9 +73,10 @@ fn main() -> Result<()> {
             let llvm_ir = try_compile_to_llvm_with_target(&ast, &target).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format_source_error(&args.input, &input, 0, err),
+                    format_diagnostic(&args.input, &input, err),
                 )
             })?;
+            write_cfg_dump(&args, &input, &ast)?;
             std::fs::write(args.output, llvm_ir)?;
         }
         Mode::Riscv => {
@@ -81,11 +85,25 @@ fn main() -> Result<()> {
             let llvm_ir = try_compile_to_llvm(&ast).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format_source_error(&args.input, &input, 0, err),
+                    format_diagnostic(&args.input, &input, err),
                 )
             })?;
+            write_cfg_dump(&args, &input, &ast)?;
             compile_llvm_to_riscv_asm(&llvm_ir, &args.output)?;
         }
+    }
+    Ok(())
+}
+
+fn write_cfg_dump(args: &Args, input: &str, ast: &CompUnit) -> Result<()> {
+    if let Some(path) = &args.dump_cfg {
+        let dump = dump_async_cfgs(ast).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format_diagnostic(&args.input, input, err),
+            )
+        })?;
+        std::fs::write(path, dump)?;
     }
     Ok(())
 }
@@ -130,7 +148,10 @@ fn describe_parse_error(err: ParseError<usize, Tok, LexError>) -> (usize, String
         ParseError::ExtraToken { token } => {
             (token.0, format!("parse error: extra token {:?}", token.1))
         }
-        ParseError::User { error } => (0, format!("parse error: lexer error: {error:?}")),
+        ParseError::User { error } => (
+            error.location(),
+            format!("parse error: lexer error: {}", error.message()),
+        ),
     }
 }
 
@@ -145,6 +166,11 @@ fn format_expected_tokens(expected: &[String]) -> String {
 fn format_source_error(path: &Path, input: &str, byte_offset: usize, reason: String) -> String {
     let (line, column) = line_column(input, byte_offset);
     format!("{}:{}:{}: {}", path.display(), line, column, reason)
+}
+
+fn format_diagnostic(path: &Path, input: &str, diagnostic: Diagnostic) -> String {
+    let byte_offset = diagnostic.span.map(|span| span.start).unwrap_or(0);
+    format_source_error(path, input, byte_offset, diagnostic.message)
 }
 
 fn line_column(input: &str, byte_offset: usize) -> (usize, usize) {

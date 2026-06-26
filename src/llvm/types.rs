@@ -1,3 +1,4 @@
+use super::names::sanitize_ident;
 use crate::lalr::BType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,16 +43,4 @@ impl LlvmType {
     pub(crate) fn is_void(&self) -> bool {
         matches!(self, Self::Void)
     }
-}
-
-fn sanitize_ident(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }

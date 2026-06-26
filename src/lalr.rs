@@ -1,4 +1,67 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub span: Option<Span>,
+    pub message: String,
+}
+
+impl Diagnostic {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            span: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn at(span: Span, message: impl Into<String>) -> Self {
+        Self {
+            span: Some(span),
+            message: message.into(),
+        }
+    }
+
+    pub fn with_fallback_span(mut self, span: Span) -> Self {
+        if self.span.is_none() {
+            self.span = Some(span);
+        }
+        self
+    }
+}
+
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+impl std::error::Error for Diagnostic {}
+
+impl From<String> for Diagnostic {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for Diagnostic {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+fn diagnostic_at(span: Option<Span>, message: impl Into<String>) -> Diagnostic {
+    match span {
+        Some(span) => Diagnostic::at(span, message),
+        None => Diagnostic::new(message),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CompUnit {
@@ -34,12 +97,22 @@ struct FunctionSig {
 #[derive(Debug, Clone)]
 struct StructSig {
     fields: HashMap<String, BType>,
+    field_order: Vec<StructFieldSig>,
+}
+
+#[derive(Debug, Clone)]
+struct StructFieldSig {
+    name: String,
+    ty: BType,
+    span: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
 struct SemanticProgram {
     funcs: HashMap<String, FunctionSig>,
     structs: HashMap<String, StructSig>,
+    globals: HashMap<String, BType>,
+    constants: HashMap<String, i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,18 +124,21 @@ pub enum GlobalDef {
 
 #[derive(Debug, Clone)]
 pub struct StructDef {
+    pub span: Option<Span>,
     pub name: String,
     pub fields: Vec<StructField>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StructField {
+    pub span: Option<Span>,
     pub ty: Type,
     pub decls: Vec<SingleDecl>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FuncDef {
+    pub span: Option<Span>,
     pub is_async: bool,
     pub func_type: Type,
     pub ident: String,
@@ -79,6 +155,7 @@ pub struct FuncParam {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
+    Spanned(Box<Stmt>, Span),
     Block(Vec<Stmt>),
     Assign(Exp, Exp),
     Decl(Type, Vec<SingleDecl>),
@@ -93,6 +170,10 @@ pub enum Stmt {
     Empty,
 }
 
+pub fn spanned_stmt(stmt: Stmt, start: usize, end: usize) -> Stmt {
+    Stmt::Spanned(Box::new(stmt), Span { start, end })
+}
+
 #[derive(Debug, Clone)]
 pub enum VarDecl {
     Ident(String),
@@ -101,14 +182,20 @@ pub enum VarDecl {
 
 #[derive(Debug, Clone)]
 pub struct SingleDecl {
+    pub span: Option<Span>,
     pub var: VarDecl,
     pub init: Option<InitVal>,
 }
 
 #[derive(Debug, Clone)]
 pub enum InitVal {
+    Spanned(Box<InitVal>, Span),
     Exp(Exp),
     Arr(Vec<InitVal>),
+}
+
+pub fn spanned_init(init: InitVal, start: usize, end: usize) -> InitVal {
+    InitVal::Spanned(Box::new(init), Span { start, end })
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +233,7 @@ where
     F: Fn(&str) -> Option<i32>,
 {
     match exp {
+        Exp::Spanned(exp, _) => eval_const_exp_with(exp, lookup),
         Exp::Number(num) => Some(*num),
         Exp::UnaryExp(op, inner) => {
             let value = eval_const_exp_with(inner, lookup)?;
@@ -159,7 +247,7 @@ where
                         0
                     }
                 }
-                UnaryOp::Addr | UnaryOp::Deref => unreachable!(),
+                UnaryOp::Addr | UnaryOp::Deref => return None,
             })
         }
         Exp::BinaryExp(op, lhs, rhs) => {
@@ -169,8 +257,18 @@ where
                 BinaryOp::Add => lhs + rhs,
                 BinaryOp::Sub => lhs - rhs,
                 BinaryOp::Mul => lhs * rhs,
-                BinaryOp::Div => lhs / rhs,
-                BinaryOp::Mod => lhs % rhs,
+                BinaryOp::Div => {
+                    if rhs == 0 {
+                        return None;
+                    }
+                    lhs / rhs
+                }
+                BinaryOp::Mod => {
+                    if rhs == 0 {
+                        return None;
+                    }
+                    lhs % rhs
+                }
                 BinaryOp::Lt => (lhs < rhs) as i32,
                 BinaryOp::Gt => (lhs > rhs) as i32,
                 BinaryOp::Le => (lhs <= rhs) as i32,
@@ -193,21 +291,21 @@ where
     }
 }
 
-pub fn eval_param_dim<F>(exp: &Exp, lookup: &F) -> usize
+pub fn eval_param_dim<F>(exp: &Exp, lookup: &F) -> Result<usize, String>
 where
     F: Fn(&str) -> Option<i32>,
 {
     let value = eval_const_exp_with(exp, lookup)
-        .expect("Array parameter dimensions must be constant expressions");
-    assert!(
-        value >= 0,
-        "Array parameter dimensions must be non-negative"
-    );
-    value as usize
+        .ok_or_else(|| "Array parameter dimensions must be constant expressions".to_string())?;
+    if value < 0 {
+        return Err("Array parameter dimensions must be non-negative".to_string());
+    }
+    Ok(value as usize)
 }
 
 #[derive(Debug, Clone)]
 pub enum Exp {
+    Spanned(Box<Exp>, Span),
     Number(i32),
     UnaryExp(UnaryOp, Box<Exp>),
     BinaryExp(BinaryOp, Box<Exp>, Box<Exp>),
@@ -222,6 +320,10 @@ pub enum Exp {
     Ident(String),
 }
 
+pub fn spanned_exp(exp: Exp, start: usize, end: usize) -> Exp {
+    Exp::Spanned(Box::new(exp), Span { start, end })
+}
+
 impl CompUnit {
     pub fn contains_async_syntax(&self) -> bool {
         self.global_defs
@@ -229,21 +331,12 @@ impl CompUnit {
             .any(GlobalDef::contains_async_syntax)
     }
 
-    pub fn validate_async_syntax(&self) -> Result<(), String> {
-        let funcs = self.async_function_sigs()?;
-        let program = self.semantic_program()?;
-        for glob_def in &self.global_defs {
-            glob_def.validate_async_syntax(&funcs, &program)?;
-        }
-        Ok(())
+    pub fn validate_async_syntax(&self) -> Result<(), Diagnostic> {
+        self.validate_semantics()
     }
 
-    pub fn validate_semantics(&self) -> Result<(), String> {
+    pub fn validate_semantics(&self) -> Result<(), Diagnostic> {
         let program = self.semantic_program()?;
-        let funcs = self.async_function_sigs()?;
-        for glob_def in &self.global_defs {
-            glob_def.validate_async_syntax(&funcs, &program)?;
-        }
         for glob_def in &self.global_defs {
             glob_def.validate_semantics(&program)?;
         }
@@ -262,43 +355,105 @@ impl CompUnit {
         AsyncProgramAnalysis { functions }
     }
 
-    fn async_function_sigs(&self) -> Result<HashMap<String, AsyncFunctionSig>, String> {
-        let mut funcs = HashMap::new();
+    fn semantic_program(&self) -> Result<SemanticProgram, Diagnostic> {
+        let mut funcs = builtin_function_sigs();
+        let mut structs = HashMap::new();
+        let mut globals = HashMap::new();
+        let constants = collect_global_constants(&self.global_defs);
+        let mut struct_names = HashSet::new();
         for glob_def in &self.global_defs {
-            if let GlobalDef::FuncDef(func) = glob_def {
-                if funcs
-                    .insert(
-                        func.ident.clone(),
-                        AsyncFunctionSig {
-                            is_async: func.is_async,
-                            ret: type_base_btype(&func.func_type).clone(),
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(format!("Duplicate function definition: {}", func.ident));
+            if let GlobalDef::StructDef(def) = glob_def {
+                if !struct_names.insert(def.name.clone()) {
+                    return Err(diagnostic_at(
+                        def.span,
+                        format!("Duplicate struct definition: {}", def.name),
+                    ));
                 }
             }
         }
-        Ok(funcs)
-    }
-
-    fn semantic_program(&self) -> Result<SemanticProgram, String> {
-        let mut funcs = builtin_function_sigs();
-        let mut structs = HashMap::new();
         for glob_def in &self.global_defs {
             if let GlobalDef::StructDef(def) = glob_def {
                 let mut fields = HashMap::new();
+                let mut field_order = Vec::new();
                 for field in &def.fields {
                     for decl in &field.decls {
-                        fields.insert(var_decl_name(&decl.var), decl_btype(&field.ty, &decl.var));
+                        let span = decl.span.or(field.span);
+                        let field_ty = decl_btype(&field.ty, &decl.var, &constants)
+                            .map_err(|err| diagnostic_at(span, err))?;
+                        validate_object_type(&field_ty, &struct_names, "Struct field")
+                            .map_err(|err| diagnostic_at(span, err))?;
+                        let field_name = var_decl_name(&decl.var);
+                        if fields
+                            .insert(field_name.clone(), field_ty.clone())
+                            .is_some()
+                        {
+                            return Err(diagnostic_at(
+                                span,
+                                format!("Duplicate field {} in struct {}", field_name, def.name),
+                            ));
+                        }
+                        field_order.push(StructFieldSig {
+                            name: field_name,
+                            ty: field_ty,
+                            span,
+                        });
                     }
                 }
-                structs.insert(def.name.clone(), StructSig { fields });
+                structs.insert(
+                    def.name.clone(),
+                    StructSig {
+                        fields,
+                        field_order,
+                    },
+                );
+            }
+        }
+        for glob_def in &self.global_defs {
+            if let GlobalDef::GlobalDecl(ty, decls) = glob_def {
+                for decl in decls {
+                    let name = var_decl_name(&decl.var);
+                    let decl_ty = decl_btype(ty, &decl.var, &constants)
+                        .map_err(|err| diagnostic_at(decl.span, err))?;
+                    validate_object_type(&decl_ty, &struct_names, "Global variable")
+                        .map_err(|err| diagnostic_at(decl.span, err))?;
+                    if funcs.contains_key(&name) || globals.insert(name.clone(), decl_ty).is_some()
+                    {
+                        return Err(diagnostic_at(
+                            decl.span,
+                            format!("Duplicate global definition: {}", name),
+                        ));
+                    }
+                }
             }
         }
         for glob_def in &self.global_defs {
             if let GlobalDef::FuncDef(func) = glob_def {
+                validate_return_type(type_base_btype(&func.func_type), &struct_names)
+                    .map_err(|err| diagnostic_at(func.span, err))?;
+                let mut params = Vec::new();
+                let mut param_names = HashSet::new();
+                for param in &func.func_params {
+                    if !param_names.insert(param.name.clone()) {
+                        return Err(diagnostic_at(
+                            func.span,
+                            format!(
+                                "Duplicate parameter {} in function {}",
+                                param.name, func.ident
+                            ),
+                        ));
+                    }
+                    let param_ty = func_param_semantic_btype(param, &constants)
+                        .map_err(|err| diagnostic_at(func.span, err))?;
+                    validate_object_type(&param_ty, &struct_names, "Function parameter")
+                        .map_err(|err| diagnostic_at(func.span, err))?;
+                    params.push(param_ty);
+                }
+                if globals.contains_key(&func.ident) {
+                    return Err(diagnostic_at(
+                        func.span,
+                        format!("Duplicate global definition: {}", func.ident),
+                    ));
+                }
                 if funcs
                     .insert(
                         func.ident.clone(),
@@ -306,20 +461,25 @@ impl CompUnit {
                             is_async: func.is_async,
                             ret: type_base_btype(&func.func_type).clone(),
                             param_count: func.func_params.len(),
-                            params: func
-                                .func_params
-                                .iter()
-                                .map(func_param_semantic_btype)
-                                .collect(),
+                            params,
                         },
                     )
                     .is_some()
                 {
-                    return Err(format!("Duplicate function definition: {}", func.ident));
+                    return Err(diagnostic_at(
+                        func.span,
+                        format!("Duplicate function definition: {}", func.ident),
+                    ));
                 }
             }
         }
-        Ok(SemanticProgram { funcs, structs })
+        validate_struct_value_cycles(&structs)?;
+        Ok(SemanticProgram {
+            funcs,
+            structs,
+            globals,
+            constants,
+        })
     }
 }
 
@@ -342,34 +502,15 @@ impl GlobalDef {
         }
     }
 
-    fn validate_async_syntax(
-        &self,
-        funcs: &HashMap<String, AsyncFunctionSig>,
-        program: &SemanticProgram,
-    ) -> Result<(), String> {
-        match self {
-            GlobalDef::FuncDef(func) => func.validate_async_syntax(funcs, program),
-            GlobalDef::GlobalDecl(_, decls) => {
-                let mut ctx = AsyncValidationContext::new(funcs, program, false);
-                for decl in decls {
-                    if let Some(init) = &decl.init {
-                        init.validate_async_syntax(&mut ctx)?;
-                    }
-                }
-                Ok(())
-            }
-            GlobalDef::StructDef(_) => Ok(()),
-        }
-    }
-
-    fn validate_semantics(&self, program: &SemanticProgram) -> Result<(), String> {
+    fn validate_semantics(&self, program: &SemanticProgram) -> Result<(), Diagnostic> {
         match self {
             GlobalDef::FuncDef(func) => func.validate_semantics(program),
-            GlobalDef::GlobalDecl(_, decls) => {
+            GlobalDef::GlobalDecl(ty, decls) => {
                 let mut ctx = SemanticCtx::new(program, false, &BType::Void);
                 for decl in decls {
+                    let decl_ty = decl_btype(ty, &decl.var, &program.constants)?;
                     if let Some(init) = &decl.init {
-                        init.validate_semantics(&mut ctx, 0)?;
+                        validate_initializer(&mut ctx, init, &decl_ty, 0)?;
                     }
                 }
                 Ok(())
@@ -390,23 +531,6 @@ impl FuncDef {
             || self.block.iter().any(Stmt::contains_async_syntax)
     }
 
-    fn validate_async_syntax(
-        &self,
-        funcs: &HashMap<String, AsyncFunctionSig>,
-        program: &SemanticProgram,
-    ) -> Result<(), String> {
-        let mut ctx = AsyncValidationContext::new(funcs, program, self.is_async);
-        ctx.push_scope();
-        for param in &self.func_params {
-            ctx.define_var(param.name.clone(), func_param_semantic_btype(param));
-        }
-        for stmt in &self.block {
-            stmt.validate_async_syntax(&mut ctx)?;
-        }
-        ctx.finish_function()?;
-        Ok(())
-    }
-
     pub fn analyze_async(&self) -> AsyncFunctionAnalysis {
         let mut analyzer = AsyncFunctionAnalyzer::new();
         analyzer.visit_stmts(&self.block, false);
@@ -422,15 +546,29 @@ impl FuncDef {
         }
     }
 
-    fn validate_semantics(&self, program: &SemanticProgram) -> Result<(), String> {
+    fn validate_semantics(&self, program: &SemanticProgram) -> Result<(), Diagnostic> {
         let ret_ty = type_base_btype(&self.func_type);
         let mut ctx = SemanticCtx::new(program, self.is_async, ret_ty);
         ctx.push_scope();
         for param in &self.func_params {
-            ctx.define_var(param.name.clone(), func_param_semantic_btype(param));
+            let param_ty = func_param_semantic_btype(param, &program.constants)
+                .map_err(|err| diagnostic_at(self.span, err))?;
+            ctx.define_var(param.name.clone(), param_ty)
+                .map_err(|err| diagnostic_at(self.span, err))?;
         }
         for stmt in &self.block {
             stmt.validate_semantics(&mut ctx, 0)?;
+        }
+        ctx.finish_function()?;
+        if requires_guaranteed_return(ret_ty) && !block_guarantees_return(&self.block) {
+            let message = format!(
+                "Function returning {} may fall through without return",
+                btype_name(ret_ty)
+            );
+            return Err(self
+                .span
+                .map(|span| Diagnostic::at(span, message.clone()))
+                .unwrap_or_else(|| Diagnostic::new(message)));
         }
         ctx.pop_scope();
         Ok(())
@@ -440,6 +578,7 @@ impl FuncDef {
 impl Stmt {
     fn contains_async_syntax(&self) -> bool {
         match self {
+            Stmt::Spanned(stmt, _) => stmt.contains_async_syntax(),
             Stmt::Block(stmts) => stmts.iter().any(Stmt::contains_async_syntax),
             Stmt::Assign(lhs, rhs) => lhs.contains_async_syntax() || rhs.contains_async_syntax(),
             Stmt::Decl(ty, decls) => {
@@ -466,126 +605,15 @@ impl Stmt {
         }
     }
 
-    fn validate_async_syntax(&self, ctx: &mut AsyncValidationContext<'_>) -> Result<(), String> {
-        match self {
-            Stmt::Block(stmts) => {
-                ctx.push_scope();
-                for stmt in stmts {
-                    stmt.validate_async_syntax(ctx)?;
-                }
-                ctx.pop_scope();
-                Ok(())
-            }
-            Stmt::Assign(lhs, rhs) => {
-                reject_unsupported_await_position(lhs, "assignment target")?;
-                let lhs_kind = lhs.validate_async_syntax(ctx)?;
-                let rhs_kind = rhs.validate_async_syntax(ctx)?;
-                match (lhs_kind, rhs_kind) {
-                    (AsyncExprKind::Promise(expected), AsyncExprKind::Promise(actual)) => {
-                        if !btype_same(&expected, &actual) {
-                            return Err(format!(
-                                "Promise assignment type mismatch: expected {}, got {}",
-                                btype_name(&expected),
-                                btype_name(&actual)
-                            ));
-                        }
-                    }
-                    (AsyncExprKind::Plain(_), AsyncExprKind::Promise(_)) => {
-                        return Err("Promise value cannot be assigned without await".to_string());
-                    }
-                    _ => {}
-                }
-                Ok(())
-            }
-            Stmt::Decl(ty, decls) => {
-                for decl in decls {
-                    let var_name = var_decl_name(&decl.var);
-                    let decl_ty = decl_btype(ty, &decl.var);
-                    let declared_promise = match &decl_ty {
-                        BType::Promise(inner) => Some((**inner).clone()),
-                        _ => None,
-                    };
-                    if let Some(init) = &decl.init {
-                        let init_kind = init.validate_async_syntax(ctx)?;
-                        match (&declared_promise, init_kind) {
-                            (Some(expected), AsyncExprKind::Promise(actual)) => {
-                                if !btype_same(expected, &actual) {
-                                    return Err(format!(
-                                        "Promise initializer type mismatch for {}",
-                                        var_name
-                                    ));
-                                }
-                            }
-                            (Some(_), AsyncExprKind::Plain(_)) => {
-                                return Err(format!(
-                                    "Promise variable {} must be initialized with a Promise value",
-                                    var_name
-                                ));
-                            }
-                            (None, AsyncExprKind::Promise(_)) => {
-                                return Err(format!(
-                                    "Promise value cannot initialize non-Promise variable {} without await",
-                                    var_name
-                                ));
-                            }
-                            (None, AsyncExprKind::Plain(_)) => {}
-                        }
-                    }
-                    ctx.define_var(var_name, decl_ty);
-                }
-                Ok(())
-            }
-            Stmt::Exp(exp) => {
-                let kind = exp.validate_async_syntax(ctx)?;
-                if kind.is_promise() {
-                    return Err(
-                        "Promise expression must be awaited, stored, or registered".to_string()
-                    );
-                }
-                Ok(())
-            }
-            Stmt::Return(Some(exp)) => {
-                exp.validate_async_syntax(ctx)?;
-                Ok(())
-            }
-            Stmt::PromiseWait(exp) => {
-                reject_unsupported_await_position(exp, "Promise.wait receiver")?;
-                let kind = exp.validate_async_syntax(ctx)?;
-                if !kind.is_promise() {
-                    return Err("Promise.wait() expects a Promise value".to_string());
-                }
-                ctx.wait_promise_exp(exp);
-                Ok(())
-            }
-            Stmt::If(cond, then_stmt) => {
-                if cond.validate_async_syntax(ctx)?.is_promise() {
-                    return Err("Promise value cannot be used as an if condition".to_string());
-                }
-                then_stmt.validate_async_syntax(ctx)
-            }
-            Stmt::IfElse(cond, then_stmt, else_stmt) => {
-                if cond.validate_async_syntax(ctx)?.is_promise() {
-                    return Err("Promise value cannot be used as an if condition".to_string());
-                }
-                then_stmt.validate_async_syntax(ctx)?;
-                else_stmt.validate_async_syntax(ctx)
-            }
-            Stmt::While(cond, body) => {
-                if cond.validate_async_syntax(ctx)?.is_promise() {
-                    return Err("Promise value cannot be used as a while condition".to_string());
-                }
-                body.validate_async_syntax(ctx)
-            }
-            Stmt::Continue | Stmt::Break | Stmt::Return(None) | Stmt::Empty => Ok(()),
-        }
-    }
-
     fn validate_semantics(
         &self,
         ctx: &mut SemanticCtx<'_>,
         loop_depth: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
         match self {
+            Stmt::Spanned(stmt, span) => stmt
+                .validate_semantics(ctx, loop_depth)
+                .map_err(|err| err.with_fallback_span(*span)),
             Stmt::Block(stmts) => {
                 ctx.push_scope();
                 for stmt in stmts {
@@ -595,72 +623,119 @@ impl Stmt {
                 Ok(())
             }
             Stmt::Assign(lhs, rhs) => {
-                lhs.validate_semantics(ctx, loop_depth)?;
-                rhs.validate_semantics(ctx, loop_depth)?;
+                reject_unsupported_await_position(lhs, "assignment target")?;
+                let lhs_kind = lhs.validate_semantics(ctx, loop_depth)?;
+                let rhs_kind = rhs.validate_semantics(ctx, loop_depth)?;
+                validate_assignment_kind(&lhs_kind, &rhs_kind).map_err(Diagnostic::from)?;
+                if lhs_kind.is_promise() && rhs_kind.is_promise() {
+                    ctx.consume_promise_exp(rhs);
+                }
                 Ok(())
             }
             Stmt::Decl(ty, decls) => {
                 for decl in decls {
+                    let constants = ctx.visible_constants();
+                    let decl_ty = decl_btype(ty, &decl.var, &constants)
+                        .map_err(|err| diagnostic_at(decl.span, err))?;
+                    validate_object_type_in_program(&decl_ty, ctx.program, "Local variable")
+                        .map_err(|err| diagnostic_at(decl.span, err))?;
                     if let Some(init) = &decl.init {
-                        init.validate_semantics(ctx, loop_depth)?;
+                        validate_initializer(ctx, init, &decl_ty, loop_depth)?;
                     }
-                    ctx.define_var(var_decl_name(&decl.var), decl_btype(ty, &decl.var));
+                    ctx.define_const_from_decl(ty, decl);
+                    ctx.define_var(var_decl_name(&decl.var), decl_ty)
+                        .map_err(|err| diagnostic_at(decl.span, err))?;
                 }
                 Ok(())
             }
-            Stmt::Exp(exp) | Stmt::PromiseWait(exp) => {
-                exp.validate_semantics(ctx, loop_depth)?;
+            Stmt::Exp(exp) => {
+                let kind = exp.validate_semantics(ctx, loop_depth)?;
+                if kind.is_promise() {
+                    return Err(Diagnostic::new(
+                        "Promise expression must be awaited, stored, or registered",
+                    ));
+                }
+                Ok(())
+            }
+            Stmt::PromiseWait(exp) => {
+                reject_unsupported_await_position(exp, "Promise.wait receiver")?;
+                let kind = exp.validate_semantics(ctx, loop_depth)?;
+                if !kind.is_promise() {
+                    return Err(Diagnostic::new("Promise.wait() expects a Promise value"));
+                }
+                ctx.wait_promise_exp(exp);
                 Ok(())
             }
             Stmt::Return(Some(exp)) => {
                 let kind = exp.validate_semantics(ctx, loop_depth)?;
                 if let AsyncExprKind::Promise(actual) = kind {
+                    ctx.consume_promise_exp(exp);
+                    ensure_promise_result_supported(&actual)?;
                     if let BType::Promise(expected) = ctx.ret_ty {
                         if btype_same(expected, &actual) {
                             return Ok(());
                         }
-                        return Err(format!(
+                        return Err(Diagnostic::new(format!(
                             "Return type mismatch: expected Promise<{}>, got Promise<{}>",
                             btype_name(expected),
                             btype_name(&actual)
-                        ));
+                        )));
                     }
-                    return Err("Promise value cannot be returned without await".to_string());
+                    return Err(Diagnostic::new(
+                        "Promise value cannot be returned without await",
+                    ));
                 }
                 let actual_ty = kind.plain_ty().unwrap_or(&BType::Void);
+                if matches!(actual_ty, BType::Array(_, _)) {
+                    return Err(Diagnostic::new("Array value cannot be returned"));
+                }
                 if matches!(ctx.ret_ty, BType::Void) {
                     if !matches!(actual_ty, BType::Void) {
-                        return Err("Void function cannot return a value".to_string());
+                        return Err(Diagnostic::new("Void function cannot return a value"));
                     }
                 } else if !btype_same(ctx.ret_ty, actual_ty) {
-                    return Err(format!(
+                    return Err(Diagnostic::new(format!(
                         "Return type mismatch: expected {}, got {}",
                         btype_name(ctx.ret_ty),
                         btype_name(actual_ty)
-                    ));
+                    )));
                 }
                 Ok(())
             }
             Stmt::If(cond, then_stmt) => {
-                cond.validate_semantics(ctx, loop_depth)?;
+                if cond.validate_semantics(ctx, loop_depth)?.is_promise() {
+                    return Err(Diagnostic::new(
+                        "Promise value cannot be used as an if condition",
+                    ));
+                }
                 then_stmt.validate_semantics(ctx, loop_depth)
             }
             Stmt::IfElse(cond, then_stmt, else_stmt) => {
-                cond.validate_semantics(ctx, loop_depth)?;
+                if cond.validate_semantics(ctx, loop_depth)?.is_promise() {
+                    return Err(Diagnostic::new(
+                        "Promise value cannot be used as an if condition",
+                    ));
+                }
                 then_stmt.validate_semantics(ctx, loop_depth)?;
                 else_stmt.validate_semantics(ctx, loop_depth)
             }
             Stmt::While(cond, body) => {
-                cond.validate_semantics(ctx, loop_depth)?;
+                if cond.validate_semantics(ctx, loop_depth)?.is_promise() {
+                    return Err(Diagnostic::new(
+                        "Promise value cannot be used as a while condition",
+                    ));
+                }
                 body.validate_semantics(ctx, loop_depth + 1)
             }
             Stmt::Break | Stmt::Continue if loop_depth == 0 => {
-                Err("break/continue used outside a loop".to_string())
+                Err(Diagnostic::new("break/continue used outside a loop"))
             }
-            Stmt::Return(None) if !matches!(ctx.ret_ty, BType::Void) => Err(format!(
-                "Function returning {} cannot use empty return",
-                btype_name(ctx.ret_ty)
-            )),
+            Stmt::Return(None) if !matches!(ctx.ret_ty, BType::Void) => {
+                Err(Diagnostic::new(format!(
+                    "Function returning {} cannot use empty return",
+                    btype_name(ctx.ret_ty)
+                )))
+            }
             Stmt::Break | Stmt::Continue | Stmt::Return(None) | Stmt::Empty => Ok(()),
         }
     }
@@ -669,43 +744,9 @@ impl Stmt {
 impl InitVal {
     fn contains_async_syntax(&self) -> bool {
         match self {
+            InitVal::Spanned(init, _) => init.contains_async_syntax(),
             InitVal::Exp(exp) => exp.contains_async_syntax(),
             InitVal::Arr(items) => items.iter().any(InitVal::contains_async_syntax),
-        }
-    }
-
-    fn validate_async_syntax(
-        &self,
-        ctx: &mut AsyncValidationContext<'_>,
-    ) -> Result<AsyncExprKind, String> {
-        match self {
-            InitVal::Exp(exp) => exp.validate_async_syntax(ctx),
-            InitVal::Arr(items) => {
-                for item in items {
-                    if item.validate_async_syntax(ctx)?.is_promise() {
-                        return Err(
-                            "Promise value cannot be used inside array initializer".to_string()
-                        );
-                    }
-                }
-                Ok(AsyncExprKind::Plain(BType::I32))
-            }
-        }
-    }
-
-    fn validate_semantics(
-        &self,
-        ctx: &mut SemanticCtx<'_>,
-        loop_depth: usize,
-    ) -> Result<AsyncExprKind, String> {
-        match self {
-            InitVal::Exp(exp) => exp.validate_semantics(ctx, loop_depth),
-            InitVal::Arr(items) => {
-                for item in items {
-                    item.validate_semantics(ctx, loop_depth)?;
-                }
-                Ok(AsyncExprKind::Plain(BType::I32))
-            }
         }
     }
 }
@@ -713,6 +754,7 @@ impl InitVal {
 impl Exp {
     fn contains_async_syntax(&self) -> bool {
         match self {
+            Exp::Spanned(exp, _) => exp.contains_async_syntax(),
             Exp::Await(_) | Exp::Sleep(_) => true,
             Exp::UnaryExp(_, exp) => exp.contains_async_syntax(),
             Exp::BinaryExp(_, lhs, rhs) | Exp::ArrGet(lhs, rhs) => {
@@ -727,126 +769,27 @@ impl Exp {
         }
     }
 
-    fn validate_async_syntax(
-        &self,
-        ctx: &mut AsyncValidationContext<'_>,
-    ) -> Result<AsyncExprKind, String> {
-        match self {
-            Exp::Await(inner) => {
-                if !ctx.in_async_fn {
-                    return Err("await is only allowed inside async functions".to_string());
-                }
-                let kind = inner.validate_async_syntax(ctx)?;
-                let AsyncExprKind::Promise(inner_ty) = kind else {
-                    return Err("await expects a Promise value".to_string());
-                };
-                ctx.await_promise_exp(inner);
-                Ok(AsyncExprKind::Plain(inner_ty))
-            }
-            Exp::Sleep(duration) => {
-                if duration.validate_async_syntax(ctx)?.is_promise() {
-                    return Err("sleep duration cannot be a Promise value".to_string());
-                }
-                Ok(AsyncExprKind::Promise(BType::Void))
-            }
-            Exp::PromiseWait(promise) => {
-                reject_unsupported_await_position(promise, "Promise.wait receiver")?;
-                let kind = promise.validate_async_syntax(ctx)?;
-                match kind {
-                    AsyncExprKind::Promise(_inner) => {
-                        ctx.wait_promise_exp(promise);
-                        Ok(AsyncExprKind::Plain(_inner))
-                    }
-                    AsyncExprKind::Plain(_) => {
-                        Err("Promise.wait() expects a Promise value".to_string())
-                    }
-                }
-            }
-            Exp::UnaryExp(_, exp) => {
-                if exp.validate_async_syntax(ctx)?.is_promise() {
-                    return Err(
-                        "Promise value cannot be used in unary expression without await"
-                            .to_string(),
-                    );
-                }
-                Ok(AsyncExprKind::Plain(BType::I32))
-            }
-            Exp::BinaryExp(_, lhs, rhs) => {
-                if lhs.validate_async_syntax(ctx)?.is_promise()
-                    || rhs.validate_async_syntax(ctx)?.is_promise()
-                {
-                    return Err(
-                        "Promise value cannot be used in expression without await".to_string()
-                    );
-                }
-                Ok(AsyncExprKind::Plain(BType::I32))
-            }
-            Exp::ArrGet(lhs, rhs) => {
-                let lhs_kind = lhs.validate_async_syntax(ctx)?;
-                if lhs_kind.is_promise() {
-                    return Err("Promise value cannot be indexed without await".to_string());
-                }
-                if rhs.validate_async_syntax(ctx)?.is_promise() {
-                    return Err(
-                        "Promise value cannot be used as an array index without await".to_string(),
-                    );
-                }
-                array_element_type(lhs_kind.plain_ty())
-            }
-            Exp::FuncCall(_, args) => {
-                for arg in args {
-                    if arg.validate_async_syntax(ctx)?.is_promise() {
-                        return Err(
-                            "Promise value cannot be passed as a normal argument without await"
-                                .to_string(),
-                        );
-                    }
-                }
-                if let Exp::FuncCall(name, _) = self {
-                    if let Some(sig) = ctx.funcs.get(name) {
-                        if sig.is_async {
-                            return Ok(AsyncExprKind::Promise(sig.ret.clone()));
-                        }
-                        return Ok(kind_from_btype(sig.ret.clone()));
-                    }
-                }
-                Ok(AsyncExprKind::Plain(BType::I32))
-            }
-            Exp::Field(base, field) | Exp::PtrField(base, field) => {
-                let base_kind = base.validate_async_syntax(ctx)?;
-                if base_kind.is_promise() {
-                    return Err(
-                        "Promise value cannot be used for field access without await".to_string(),
-                    );
-                }
-                match self {
-                    Exp::Field(_, _) => field_access_type(ctx.program, base_kind.plain_ty(), field),
-                    Exp::PtrField(_, _) => {
-                        ptr_field_access_type(ctx.program, base_kind.plain_ty(), field)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            Exp::Ident(name) => Ok(kind_from_btype(ctx.lookup_var(name).unwrap_or(BType::I32))),
-            Exp::Number(_) => Ok(AsyncExprKind::Plain(BType::I32)),
-            Exp::New(ty) => Ok(AsyncExprKind::Plain(BType::Ptr(Box::new(ty.clone())))),
-        }
-    }
-
     fn validate_semantics(
         &self,
         ctx: &mut SemanticCtx<'_>,
         loop_depth: usize,
-    ) -> Result<AsyncExprKind, String> {
+    ) -> Result<AsyncExprKind, Diagnostic> {
         match self {
+            Exp::Spanned(exp, span) => exp
+                .validate_semantics(ctx, loop_depth)
+                .map_err(|err| err.with_fallback_span(*span)),
             Exp::Await(inner) => {
                 if !ctx.in_async_fn {
-                    return Err("await is only allowed inside async functions".to_string());
+                    return Err(Diagnostic::new(
+                        "await is only allowed inside async functions",
+                    ));
                 }
                 let kind = inner.validate_semantics(ctx, loop_depth)?;
                 let AsyncExprKind::Promise(inner_ty) = kind else {
-                    return Err("await expects a Promise value".to_string());
+                    return Err(Diagnostic::new("await expects a Promise value"));
                 };
+                ensure_promise_result_supported(&inner_ty)?;
+                ctx.await_promise_exp(inner);
                 Ok(AsyncExprKind::Plain(inner_ty))
             }
             Exp::FuncCall(name, args) => {
@@ -856,84 +799,168 @@ impl Exp {
                     .get(name)
                     .ok_or_else(|| format!("Unknown function {}", name))?;
                 if args.len() != sig.param_count {
-                    return Err(format!(
+                    return Err(Diagnostic::new(format!(
                         "Function {} expects {} argument(s), got {}",
                         name,
                         sig.param_count,
                         args.len()
-                    ));
+                    )));
                 }
                 for (idx, arg) in args.iter().enumerate() {
                     let kind = arg.validate_semantics(ctx, loop_depth)?;
-                    if let (Some(expected), Some(actual)) = (sig.params.get(idx), kind.plain_ty()) {
-                        if !call_arg_compatible(expected, actual) {
-                            return Err(format!(
-                                "Function {} argument {} type mismatch: expected {}, got {}",
-                                name,
-                                idx + 1,
-                                btype_name(expected),
-                                btype_name(actual)
-                            ));
-                        }
+                    let expected = sig.params.get(idx).ok_or_else(|| {
+                        format!(
+                            "Function {} expects {} argument(s), got {}",
+                            name,
+                            sig.param_count,
+                            args.len()
+                        )
+                    })?;
+                    validate_call_arg_kind(name, idx, expected, &kind)?;
+                    if matches!(expected, BType::Promise(_)) && kind.is_promise() {
+                        ctx.consume_promise_exp(arg);
                     }
                 }
                 if sig.is_async {
+                    ensure_promise_result_supported(&sig.ret)?;
                     Ok(AsyncExprKind::Promise(sig.ret.clone()))
                 } else {
                     Ok(kind_from_btype(sig.ret.clone()))
                 }
             }
             Exp::Sleep(duration) => {
-                duration.validate_semantics(ctx, loop_depth)?;
+                let duration_kind = duration.validate_semantics(ctx, loop_depth)?;
+                if duration_kind.is_promise() {
+                    return Err(Diagnostic::new("sleep duration cannot be a Promise value"));
+                }
+                let duration_ty = duration_kind.plain_ty().cloned().unwrap_or(BType::Void);
+                expect_i32(&duration_ty, "sleep duration")?;
                 Ok(AsyncExprKind::Promise(BType::Void))
             }
-            Exp::PromiseWait(inner)
-            | Exp::UnaryExp(_, inner)
-            | Exp::Field(inner, _)
-            | Exp::PtrField(inner, _) => {
+            Exp::PromiseWait(inner) | Exp::Field(inner, _) | Exp::PtrField(inner, _) => {
+                if matches!(self, Exp::PromiseWait(_)) {
+                    reject_unsupported_await_position(inner, "Promise.wait receiver")?;
+                }
                 let inner_kind = inner.validate_semantics(ctx, loop_depth)?;
                 match self {
                     Exp::Field(_, field) => {
-                        field_access_type(ctx.program, inner_kind.plain_ty(), field)
+                        if inner_kind.is_promise() {
+                            return Err(Diagnostic::new(
+                                "Promise value cannot be used for field access without await",
+                            ));
+                        }
+                        Ok(field_access_type(
+                            ctx.program,
+                            inner_kind.plain_ty(),
+                            field,
+                        )?)
                     }
                     Exp::PtrField(_, field) => {
-                        ptr_field_access_type(ctx.program, inner_kind.plain_ty(), field)
+                        if inner_kind.is_promise() {
+                            return Err(Diagnostic::new(
+                                "Promise value cannot be used for field access without await",
+                            ));
+                        }
+                        Ok(ptr_field_access_type(
+                            ctx.program,
+                            inner_kind.plain_ty(),
+                            field,
+                        )?)
                     }
-                    Exp::UnaryExp(UnaryOp::Addr, _) => Ok(AsyncExprKind::Plain(BType::Ptr(
-                        Box::new(inner_kind.plain_ty().cloned().unwrap_or(BType::I32)),
-                    ))),
-                    Exp::UnaryExp(UnaryOp::Deref, _) => match inner_kind.plain_ty() {
-                        Some(BType::Ptr(inner)) => Ok(AsyncExprKind::Plain((**inner).clone())),
-                        _ => Ok(AsyncExprKind::Plain(BType::I32)),
-                    },
                     Exp::PromiseWait(_) => match inner_kind {
-                        AsyncExprKind::Promise(inner) => Ok(AsyncExprKind::Plain(inner)),
+                        AsyncExprKind::Promise(inner_ty) => {
+                            ensure_promise_result_supported(&inner_ty)?;
+                            ctx.wait_promise_exp(inner);
+                            Ok(AsyncExprKind::Plain(inner_ty))
+                        }
                         AsyncExprKind::Plain(_) => {
-                            Err("Promise.wait() expects a Promise value".to_string())
+                            Err(Diagnostic::new("Promise.wait() expects a Promise value"))
                         }
                     },
-                    _ => Ok(AsyncExprKind::Plain(BType::I32)),
+                    _ => Err(Diagnostic::new(
+                        "internal semantic error: unexpected field or wait expression",
+                    )),
                 }
             }
-            Exp::BinaryExp(_, lhs, rhs) | Exp::ArrGet(lhs, rhs) => {
-                let lhs_kind = lhs.validate_semantics(ctx, loop_depth)?;
-                rhs.validate_semantics(ctx, loop_depth)?;
-                match self {
-                    Exp::ArrGet(_, _) => array_element_type(lhs_kind.plain_ty()),
-                    _ => Ok(AsyncExprKind::Plain(BType::I32)),
+            Exp::UnaryExp(op, inner) => {
+                let inner_kind = inner.validate_semantics(ctx, loop_depth)?;
+                if inner_kind.is_promise() {
+                    return Err(Diagnostic::new(
+                        "Promise value cannot be used in unary expression without await",
+                    ));
                 }
+                validate_unary_type(op, inner_kind.plain_ty())?;
+                match op {
+                    UnaryOp::Addr => {
+                        validate_address_operand(inner)?;
+                        Ok(AsyncExprKind::Plain(BType::Ptr(Box::new(
+                            inner_kind.plain_ty().cloned().unwrap_or(BType::I32),
+                        ))))
+                    }
+                    UnaryOp::Deref => match inner_kind.plain_ty() {
+                        Some(BType::Ptr(inner)) => Ok(AsyncExprKind::Plain((**inner).clone())),
+                        _ => Err(Diagnostic::new("Cannot dereference non-pointer value")),
+                    },
+                    UnaryOp::Pos | UnaryOp::Neg | UnaryOp::Not => {
+                        Ok(AsyncExprKind::Plain(BType::I32))
+                    }
+                }
+            }
+            Exp::BinaryExp(op, lhs, rhs) => {
+                let lhs_kind = lhs.validate_semantics(ctx, loop_depth)?;
+                let rhs_kind = rhs.validate_semantics(ctx, loop_depth)?;
+                if lhs_kind.is_promise() || rhs_kind.is_promise() {
+                    return Err(Diagnostic::new(
+                        "Promise value cannot be used in expression without await",
+                    ));
+                }
+                validate_binary_type(op, lhs_kind.plain_ty(), rhs_kind.plain_ty())?;
+                Ok(AsyncExprKind::Plain(BType::I32))
+            }
+            Exp::ArrGet(lhs, rhs) => {
+                let lhs_kind = lhs.validate_semantics(ctx, loop_depth)?;
+                if lhs_kind.is_promise() {
+                    return Err(Diagnostic::new(
+                        "Promise value cannot be indexed without await",
+                    ));
+                }
+                let rhs_kind = rhs.validate_semantics(ctx, loop_depth)?;
+                if rhs_kind.is_promise() {
+                    return Err(Diagnostic::new(
+                        "Promise value cannot be used as an array index without await",
+                    ));
+                }
+                let rhs_ty = rhs_kind.plain_ty().cloned().unwrap_or(BType::Void);
+                expect_i32(&rhs_ty, "array index")?;
+                Ok(array_element_type(lhs_kind.plain_ty())?)
             }
             Exp::Number(_) => Ok(AsyncExprKind::Plain(BType::I32)),
-            Exp::Ident(name) => Ok(kind_from_btype(ctx.lookup_var(name).unwrap_or(BType::I32))),
-            Exp::New(ty) => Ok(AsyncExprKind::Plain(BType::Ptr(Box::new(ty.clone())))),
+            Exp::Ident(name) => Ok(kind_from_btype(
+                ctx.lookup_var(name)
+                    .ok_or_else(|| format!("Unknown identifier {}", name))?,
+            )),
+            Exp::New(ty) => {
+                validate_new_type_in_program(ty, ctx.program)?;
+                Ok(AsyncExprKind::Plain(BType::Ptr(Box::new(ty.clone()))))
+            }
         }
     }
-}
 
-#[derive(Debug, Clone)]
-struct AsyncFunctionSig {
-    is_async: bool,
-    ret: BType,
+    fn is_lvalue_shape(&self) -> bool {
+        match self {
+            Exp::Spanned(exp, _) => exp.is_lvalue_shape(),
+            Exp::Ident(_) | Exp::ArrGet(_, _) | Exp::Field(_, _) | Exp::PtrField(_, _) => true,
+            Exp::UnaryExp(UnaryOp::Deref, _) => true,
+            Exp::Number(_)
+            | Exp::UnaryExp(_, _)
+            | Exp::BinaryExp(_, _, _)
+            | Exp::New(_)
+            | Exp::Await(_)
+            | Exp::Sleep(_)
+            | Exp::PromiseWait(_)
+            | Exp::FuncCall(_, _) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -955,20 +982,14 @@ impl AsyncExprKind {
     }
 }
 
-struct AsyncValidationContext<'a> {
-    funcs: &'a HashMap<String, AsyncFunctionSig>,
-    program: &'a SemanticProgram,
-    in_async_fn: bool,
-    scopes: Vec<HashMap<String, BType>>,
-    declared_promises: HashSet<String>,
-    consumed_promises: HashSet<String>,
-}
-
 struct SemanticCtx<'a> {
     program: &'a SemanticProgram,
     in_async_fn: bool,
     ret_ty: &'a BType,
     scopes: Vec<HashMap<String, BType>>,
+    const_scopes: Vec<HashMap<String, i32>>,
+    declared_promises: HashSet<String>,
+    consumed_promises: HashSet<String>,
 }
 
 impl<'a> SemanticCtx<'a> {
@@ -978,42 +999,7 @@ impl<'a> SemanticCtx<'a> {
             in_async_fn,
             ret_ty,
             scopes: Vec::new(),
-        }
-    }
-
-    fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
-    }
-
-    fn pop_scope(&mut self) {
-        self.scopes.pop();
-    }
-
-    fn define_var(&mut self, name: String, ty: BType) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name, ty);
-        }
-    }
-
-    fn lookup_var(&self, name: &str) -> Option<BType> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name).cloned())
-    }
-}
-
-impl<'a> AsyncValidationContext<'a> {
-    fn new(
-        funcs: &'a HashMap<String, AsyncFunctionSig>,
-        program: &'a SemanticProgram,
-        in_async_fn: bool,
-    ) -> Self {
-        Self {
-            funcs,
-            program,
-            in_async_fn,
-            scopes: Vec::new(),
+            const_scopes: Vec::new(),
             declared_promises: HashSet::new(),
             consumed_promises: HashSet::new(),
         }
@@ -1021,19 +1007,25 @@ impl<'a> AsyncValidationContext<'a> {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.const_scopes.push(HashMap::new());
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.const_scopes.pop();
     }
 
-    fn define_var(&mut self, name: String, ty: BType) {
+    fn define_var(&mut self, name: String, ty: BType) -> Result<(), String> {
         if let Some(scope) = self.scopes.last_mut() {
+            if scope.contains_key(&name) {
+                return Err(format!("Duplicate local definition: {}", name));
+            }
             scope.insert(name.clone(), ty.clone());
         }
         if let BType::Promise(_) = ty {
             self.declared_promises.insert(name);
         }
+        Ok(())
     }
 
     fn lookup_var(&self, name: &str) -> Option<BType> {
@@ -1041,16 +1033,47 @@ impl<'a> AsyncValidationContext<'a> {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).cloned())
+            .or_else(|| self.program.globals.get(name).cloned())
+    }
+
+    fn visible_constants(&self) -> HashMap<String, i32> {
+        let mut constants = self.program.constants.clone();
+        for scope in &self.const_scopes {
+            constants.extend(scope.iter().map(|(name, value)| (name.clone(), *value)));
+        }
+        constants
+    }
+
+    fn define_const_from_decl(&mut self, ty: &Type, decl: &SingleDecl) {
+        if !matches!(ty, Type::Const(BType::I32)) {
+            return;
+        }
+        let (VarDecl::Ident(name), Some(init)) = (&decl.var, &decl.init) else {
+            return;
+        };
+        let Some(exp) = init_exp(init) else {
+            return;
+        };
+        let constants = self.visible_constants();
+        if let Some(value) = eval_const_exp_with(exp, &|name| constants.get(name).copied()) {
+            if let Some(scope) = self.const_scopes.last_mut() {
+                scope.insert(name.clone(), value);
+            }
+        }
     }
 
     fn wait_promise_exp(&mut self, exp: &Exp) {
-        if let Exp::Ident(name) = exp {
+        if let Some(name) = exp_ident_name(exp) {
             self.consumed_promises.insert(name.clone());
         }
     }
 
     fn await_promise_exp(&mut self, exp: &Exp) {
-        if let Exp::Ident(name) = exp {
+        self.consume_promise_exp(exp);
+    }
+
+    fn consume_promise_exp(&mut self, exp: &Exp) {
+        if let Some(name) = exp_ident_name(exp) {
             self.consumed_promises.insert(name.clone());
         }
     }
@@ -1068,9 +1091,62 @@ impl<'a> AsyncValidationContext<'a> {
     }
 }
 
+fn exp_ident_name(exp: &Exp) -> Option<&String> {
+    match exp {
+        Exp::Spanned(exp, _) => exp_ident_name(exp),
+        Exp::Ident(name) => Some(name),
+        _ => None,
+    }
+}
+
 fn type_base_btype(ty: &Type) -> &BType {
     match ty {
         Type::BType(btype) | Type::Const(btype) => btype,
+    }
+}
+
+fn collect_global_constants(global_defs: &[GlobalDef]) -> HashMap<String, i32> {
+    let mut constants = HashMap::new();
+    let mut pending = Vec::new();
+    for glob_def in global_defs {
+        let GlobalDef::GlobalDecl(ty, decls) = glob_def else {
+            continue;
+        };
+        if !matches!(ty, Type::Const(BType::I32)) {
+            continue;
+        }
+        for decl in decls {
+            let (VarDecl::Ident(name), Some(init)) = (&decl.var, &decl.init) else {
+                continue;
+            };
+            let Some(exp) = init_exp(init) else {
+                continue;
+            };
+            pending.push((name.clone(), exp.clone()));
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (name, exp) in &pending {
+            if constants.contains_key(name) {
+                continue;
+            }
+            if let Some(value) = eval_const_exp_with(exp, &|name| constants.get(name).copied()) {
+                constants.insert(name.clone(), value);
+                changed = true;
+            }
+        }
+    }
+    constants
+}
+
+fn init_exp(init: &InitVal) -> Option<&Exp> {
+    match init {
+        InitVal::Spanned(init, _) => init_exp(init),
+        InitVal::Exp(exp) => Some(exp),
+        InitVal::Arr(_) => None,
     }
 }
 
@@ -1081,36 +1157,190 @@ fn var_decl_name(var: &VarDecl) -> String {
     }
 }
 
-fn decl_btype(ty: &Type, var: &VarDecl) -> BType {
+fn decl_btype(ty: &Type, var: &VarDecl, constants: &HashMap<String, i32>) -> Result<BType, String> {
     let mut base = type_base_btype(ty).clone();
     let mut dims = Vec::new();
-    collect_decl_dims(var, &mut dims);
+    collect_decl_dims(var, constants, &mut dims)?;
     for dim in dims.into_iter().rev() {
         base = BType::Array(dim, Box::new(base));
     }
-    base
+    Ok(base)
 }
 
-fn collect_decl_dims(var: &VarDecl, dims: &mut Vec<usize>) {
+fn collect_decl_dims(
+    var: &VarDecl,
+    constants: &HashMap<String, i32>,
+    dims: &mut Vec<usize>,
+) -> Result<(), String> {
     match var {
-        VarDecl::Ident(_) => {}
+        VarDecl::Ident(_) => Ok(()),
         VarDecl::Array(inner, len) => {
-            collect_decl_dims(inner, dims);
-            let len = eval_const_exp_with(len, &|_| None).unwrap_or(0).max(0) as usize;
-            dims.push(len);
+            collect_decl_dims(inner, constants, dims)?;
+            let value = const_dim(len, constants, "Array length")?;
+            dims.push(value);
+            Ok(())
         }
     }
 }
 
-fn func_param_semantic_btype(param: &FuncParam) -> BType {
+fn func_param_semantic_btype(
+    param: &FuncParam,
+    constants: &HashMap<String, i32>,
+) -> Result<BType, String> {
     if let Some(dims) = &param.array_dims {
-        let dims = dims
-            .iter()
-            .map(|dim| eval_const_exp_with(dim, &|_| None).unwrap_or(0).max(0) as usize)
-            .collect::<Vec<_>>();
-        func_param_btype(param.btype.clone(), dims)
+        let mut resolved = Vec::new();
+        for dim in dims {
+            resolved.push(const_dim(dim, constants, "Array parameter dimension")?);
+        }
+        Ok(func_param_btype(param.btype.clone(), resolved))
     } else {
-        param.btype.clone()
+        Ok(param.btype.clone())
+    }
+}
+
+fn validate_return_type(ty: &BType, structs: &HashSet<String>) -> Result<(), String> {
+    validate_type_refs(ty, structs)?;
+    Ok(())
+}
+
+fn validate_object_type(
+    ty: &BType,
+    structs: &HashSet<String>,
+    context: &str,
+) -> Result<(), String> {
+    validate_type_refs(ty, structs)?;
+    if type_has_void_object(ty) {
+        Err(format!("{} cannot have type {}", context, btype_name(ty)))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_object_type_in_program(
+    ty: &BType,
+    program: &SemanticProgram,
+    context: &str,
+) -> Result<(), String> {
+    let structs = program.structs.keys().cloned().collect::<HashSet<_>>();
+    validate_object_type(ty, &structs, context)
+}
+
+fn validate_new_type_in_program(ty: &BType, program: &SemanticProgram) -> Result<(), String> {
+    let structs = program.structs.keys().cloned().collect::<HashSet<_>>();
+    validate_type_refs(ty, &structs)?;
+    if matches!(ty, BType::Void) {
+        Err("new cannot allocate void".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_type_refs(ty: &BType, structs: &HashSet<String>) -> Result<(), String> {
+    match ty {
+        BType::Struct(name) if !structs.contains(name) => {
+            Err(format!("Unknown struct type {}", name))
+        }
+        BType::Promise(inner) | BType::Ptr(inner) | BType::Array(_, inner) => {
+            validate_type_refs(inner, structs)
+        }
+        BType::I32 | BType::Void | BType::Struct(_) => Ok(()),
+    }
+}
+
+fn type_has_void_object(ty: &BType) -> bool {
+    match ty {
+        BType::Void => true,
+        BType::Array(_, inner) => type_has_void_object(inner),
+        BType::I32 | BType::Struct(_) | BType::Promise(_) | BType::Ptr(_) => false,
+    }
+}
+
+fn validate_struct_value_cycles(structs: &HashMap<String, StructSig>) -> Result<(), Diagnostic> {
+    let mut visiting = HashMap::new();
+    let mut visited = HashSet::new();
+    let mut names = structs.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        let mut path = Vec::new();
+        visit_struct_value_graph(&name, structs, &mut visiting, &mut visited, &mut path)?;
+    }
+    Ok(())
+}
+
+fn visit_struct_value_graph(
+    name: &str,
+    structs: &HashMap<String, StructSig>,
+    visiting: &mut HashMap<String, usize>,
+    visited: &mut HashSet<String>,
+    path: &mut Vec<String>,
+) -> Result<(), Diagnostic> {
+    if visited.contains(name) {
+        return Ok(());
+    }
+    visiting.insert(name.to_string(), path.len());
+    path.push(name.to_string());
+    let Some(sig) = structs.get(name) else {
+        path.pop();
+        visiting.remove(name);
+        return Ok(());
+    };
+    for field in &sig.field_order {
+        for dep in struct_value_dependencies(&field.ty) {
+            if let Some(start) = visiting.get(&dep).copied() {
+                let mut cycle = path[start..].to_vec();
+                cycle.push(dep.clone());
+                return Err(diagnostic_at(
+                    field.span,
+                    format!(
+                        "Cyclic struct definition detected through field {}.{}: {}",
+                        name,
+                        field.name,
+                        cycle.join(" -> ")
+                    ),
+                ));
+            }
+            visit_struct_value_graph(&dep, structs, visiting, visited, path)?;
+        }
+    }
+    path.pop();
+    visiting.remove(name);
+    visited.insert(name.to_string());
+    Ok(())
+}
+
+fn struct_value_dependencies(ty: &BType) -> Vec<String> {
+    match ty {
+        BType::Struct(name) => vec![name.clone()],
+        BType::Array(_, inner) => struct_value_dependencies(inner),
+        BType::I32 | BType::Void | BType::Promise(_) | BType::Ptr(_) => Vec::new(),
+    }
+}
+
+fn requires_guaranteed_return(ty: &BType) -> bool {
+    !matches!(ty, BType::Void)
+}
+
+fn block_guarantees_return(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_guarantees_return)
+}
+
+fn stmt_guarantees_return(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Spanned(stmt, _) => stmt_guarantees_return(stmt),
+        Stmt::Return(_) => true,
+        Stmt::Block(stmts) => block_guarantees_return(stmts),
+        Stmt::IfElse(_, then_stmt, else_stmt) => {
+            stmt_guarantees_return(then_stmt) && stmt_guarantees_return(else_stmt)
+        }
+        Stmt::Assign(_, _)
+        | Stmt::Decl(_, _)
+        | Stmt::Exp(_)
+        | Stmt::If(_, _)
+        | Stmt::While(_, _)
+        | Stmt::PromiseWait(_)
+        | Stmt::Continue
+        | Stmt::Break
+        | Stmt::Empty => false,
     }
 }
 
@@ -1119,12 +1349,142 @@ fn call_arg_compatible(expected: &BType, actual: &BType) -> bool {
         || matches!((expected, actual), (BType::Ptr(inner), BType::Array(_, actual_inner)) if btype_same(inner, actual_inner))
 }
 
+fn validate_call_arg_kind(
+    func_name: &str,
+    idx: usize,
+    expected: &BType,
+    actual: &AsyncExprKind,
+) -> Result<(), String> {
+    match (expected, actual) {
+        (BType::Promise(expected), AsyncExprKind::Promise(actual)) => {
+            ensure_promise_result_supported(expected)?;
+            ensure_promise_result_supported(actual)?;
+            if btype_same(expected, actual) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Function {} argument {} type mismatch: expected Promise<{}>, got Promise<{}>",
+                    func_name,
+                    idx + 1,
+                    btype_name(expected),
+                    btype_name(actual)
+                ))
+            }
+        }
+        (BType::Promise(expected), AsyncExprKind::Plain(actual)) => Err(format!(
+            "Function {} argument {} type mismatch: expected Promise<{}>, got {}",
+            func_name,
+            idx + 1,
+            btype_name(expected),
+            btype_name(actual)
+        )),
+        (_, AsyncExprKind::Promise(_)) => {
+            Err("Promise value cannot be passed as a normal argument without await".to_string())
+        }
+        (_, AsyncExprKind::Plain(actual)) => {
+            if call_arg_compatible(expected, actual) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Function {} argument {} type mismatch: expected {}, got {}",
+                    func_name,
+                    idx + 1,
+                    btype_name(expected),
+                    btype_name(actual)
+                ))
+            }
+        }
+    }
+}
+
+fn assignment_compatible(expected: &BType, actual: &BType) -> bool {
+    btype_same(expected, actual)
+}
+
+fn validate_assignment_kind(
+    expected_kind: &AsyncExprKind,
+    actual_kind: &AsyncExprKind,
+) -> Result<(), String> {
+    match (expected_kind, actual_kind) {
+        (AsyncExprKind::Promise(expected), AsyncExprKind::Promise(actual)) => {
+            if btype_same(expected, actual) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Promise assignment type mismatch: expected {}, got {}",
+                    btype_name(expected),
+                    btype_name(actual)
+                ))
+            }
+        }
+        (AsyncExprKind::Plain(_), AsyncExprKind::Promise(_)) => {
+            Err("Promise value cannot be assigned without await".to_string())
+        }
+        (AsyncExprKind::Promise(_), AsyncExprKind::Plain(_)) => {
+            Err("Promise variable must be assigned a Promise value".to_string())
+        }
+        (AsyncExprKind::Plain(expected), AsyncExprKind::Plain(actual)) => {
+            if matches!(expected, BType::Array(_, _)) || matches!(actual, BType::Array(_, _)) {
+                return Err("Array values cannot be assigned".to_string());
+            }
+            if assignment_compatible(expected, actual) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Assignment type mismatch: expected {}, got {}",
+                    btype_name(expected),
+                    btype_name(actual)
+                ))
+            }
+        }
+    }
+}
+
+fn validate_initializer_kind(expected: &BType, actual: &AsyncExprKind) -> Result<(), String> {
+    match (expected, actual) {
+        (BType::Promise(expected), AsyncExprKind::Promise(actual)) => {
+            ensure_promise_result_supported(expected)?;
+            ensure_promise_result_supported(actual)?;
+            if btype_same(expected, actual) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Promise initializer type mismatch: expected Promise<{}>, got Promise<{}>",
+                    btype_name(expected),
+                    btype_name(actual)
+                ))
+            }
+        }
+        (BType::Promise(_), AsyncExprKind::Plain(_)) => {
+            Err("Promise variable must be initialized with a Promise value".to_string())
+        }
+        (_, AsyncExprKind::Promise(_)) => {
+            Err("Promise value cannot be used in initializer without await".to_string())
+        }
+        (_, AsyncExprKind::Plain(actual)) => {
+            if matches!(actual, BType::Array(_, _)) {
+                return Err("Array value cannot be used as an initializer expression".to_string());
+            }
+            if assignment_compatible(expected, actual) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Initializer type mismatch: expected {}, got {}",
+                    btype_name(expected),
+                    btype_name(actual)
+                ))
+            }
+        }
+    }
+}
+
 fn array_element_type(ty: Option<&BType>) -> Result<AsyncExprKind, String> {
     match ty {
         Some(BType::Array(_, inner)) | Some(BType::Ptr(inner)) => {
             Ok(kind_from_btype((**inner).clone()))
         }
-        _ => Ok(AsyncExprKind::Plain(BType::I32)),
+        Some(other) => Err(format!("Cannot index into {}", btype_name(other))),
+        None => Err("Cannot index into non-value expression".to_string()),
     }
 }
 
@@ -1135,15 +1495,19 @@ fn field_access_type(
 ) -> Result<AsyncExprKind, String> {
     match base {
         Some(BType::Struct(name)) => {
-            let ty = program
+            let sig = program
                 .structs
                 .get(name)
-                .and_then(|sig| sig.fields.get(field))
+                .ok_or_else(|| format!("Unknown struct type {}", name))?;
+            let ty = sig
+                .fields
+                .get(field)
                 .cloned()
-                .unwrap_or(BType::I32);
+                .ok_or_else(|| format!("Struct {} has no field {}", name, field))?;
             Ok(kind_from_btype(ty))
         }
-        _ => Ok(AsyncExprKind::Plain(BType::I32)),
+        Some(other) => Err(format!("Cannot access field on {}", btype_name(other))),
+        None => Err("Cannot access field on non-value expression".to_string()),
     }
 }
 
@@ -1154,8 +1518,183 @@ fn ptr_field_access_type(
 ) -> Result<AsyncExprKind, String> {
     match base {
         Some(BType::Ptr(inner)) => field_access_type(program, Some(inner), field),
-        _ => Ok(AsyncExprKind::Plain(BType::I32)),
+        Some(other) => Err(format!(
+            "Cannot access pointer field through {}",
+            btype_name(other)
+        )),
+        None => Err("Cannot access pointer field through non-value expression".to_string()),
     }
+}
+
+fn validate_unary_type(op: &UnaryOp, ty: Option<&BType>) -> Result<(), String> {
+    match op {
+        UnaryOp::Pos | UnaryOp::Neg | UnaryOp::Not => expect_i32_option(ty, "unary expression"),
+        UnaryOp::Addr => {
+            if ty.is_some() {
+                Ok(())
+            } else {
+                Err("Cannot take address of non-value expression".to_string())
+            }
+        }
+        UnaryOp::Deref => match ty {
+            Some(BType::Ptr(_)) => Ok(()),
+            Some(other) => Err(format!("Cannot dereference {}", btype_name(other))),
+            None => Err("Cannot dereference non-value expression".to_string()),
+        },
+    }
+}
+
+fn validate_address_operand(exp: &Exp) -> Result<(), String> {
+    if exp.is_lvalue_shape() {
+        Ok(())
+    } else {
+        Err("Cannot take address of non-lvalue expression".to_string())
+    }
+}
+
+fn ensure_promise_result_supported(ty: &BType) -> Result<(), String> {
+    if type_contains_array(ty) {
+        Err(format!(
+            "Promise result type {} is not supported because arrays are not first-class values",
+            btype_name(ty)
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn type_contains_array(ty: &BType) -> bool {
+    match ty {
+        BType::Array(_, _) => true,
+        BType::Promise(inner) => type_contains_array(inner),
+        BType::I32 | BType::Void | BType::Struct(_) | BType::Ptr(_) => false,
+    }
+}
+
+fn validate_binary_type(
+    _op: &BinaryOp,
+    lhs: Option<&BType>,
+    rhs: Option<&BType>,
+) -> Result<(), String> {
+    expect_i32_option(lhs, "left operand")?;
+    expect_i32_option(rhs, "right operand")
+}
+
+fn expect_i32(ty: &BType, context: &str) -> Result<(), String> {
+    if matches!(ty, BType::I32) {
+        Ok(())
+    } else {
+        Err(format!("{} expects int, got {}", context, btype_name(ty)))
+    }
+}
+
+fn expect_i32_option(ty: Option<&BType>, context: &str) -> Result<(), String> {
+    match ty {
+        Some(ty) => expect_i32(ty, context),
+        None => Err(format!("{} expects int", context)),
+    }
+}
+
+fn validate_initializer(
+    ctx: &mut SemanticCtx<'_>,
+    init: &InitVal,
+    expected: &BType,
+    loop_depth: usize,
+) -> Result<(), Diagnostic> {
+    match init {
+        InitVal::Spanned(init, span) => validate_initializer(ctx, init, expected, loop_depth)
+            .map_err(|err| err.with_fallback_span(*span)),
+        InitVal::Exp(exp) => {
+            if matches!(expected, BType::Array(_, _)) {
+                return Err(Diagnostic::new(
+                    "Array initializer must use an initializer list",
+                ));
+            }
+            let kind = exp.validate_semantics(ctx, loop_depth)?;
+            validate_initializer_kind(expected, &kind).map_err(Diagnostic::from)
+        }
+        InitVal::Arr(items) => match expected {
+            BType::Array(_, inner) => {
+                let capacity = array_scalar_capacity(expected);
+                let used = initializer_scalar_count(init);
+                if used > capacity {
+                    return Err(Diagnostic::new(format!(
+                        "Too many initializer values for {}",
+                        btype_name(expected)
+                    )));
+                }
+                for item in items {
+                    if matches!(unspan_init(item), InitVal::Arr(_)) {
+                        validate_initializer(ctx, item, inner, loop_depth)?;
+                    } else {
+                        validate_initializer(ctx, item, inner_scalar_btype(expected), loop_depth)?;
+                    }
+                }
+                Ok(())
+            }
+            BType::Struct(name) => {
+                let fields = ctx
+                    .program
+                    .structs
+                    .get(name)
+                    .ok_or_else(|| Diagnostic::new(format!("Unknown struct type {}", name)))?
+                    .field_order
+                    .clone();
+                for (idx, item) in items.iter().enumerate() {
+                    let Some(field_ty) = fields.get(idx) else {
+                        return Err(Diagnostic::new(format!(
+                            "Too many initializer values for {}",
+                            name
+                        )));
+                    };
+                    validate_initializer(ctx, item, &field_ty.ty, loop_depth)?;
+                }
+                Ok(())
+            }
+            other => Err(Diagnostic::new(format!(
+                "Initializer list cannot initialize {}",
+                btype_name(other)
+            ))),
+        },
+    }
+}
+
+fn initializer_scalar_count(init: &InitVal) -> usize {
+    match init {
+        InitVal::Spanned(init, _) => initializer_scalar_count(init),
+        InitVal::Exp(_) => 1,
+        InitVal::Arr(items) => items.iter().map(initializer_scalar_count).sum(),
+    }
+}
+
+fn unspan_init(init: &InitVal) -> &InitVal {
+    match init {
+        InitVal::Spanned(init, _) => unspan_init(init),
+        other => other,
+    }
+}
+
+fn array_scalar_capacity(ty: &BType) -> usize {
+    match ty {
+        BType::Array(len, inner) => len * array_scalar_capacity(inner),
+        _ => 1,
+    }
+}
+
+fn inner_scalar_btype(ty: &BType) -> &BType {
+    match ty {
+        BType::Array(_, inner) => inner_scalar_btype(inner),
+        other => other,
+    }
+}
+
+fn const_dim(exp: &Exp, constants: &HashMap<String, i32>, context: &str) -> Result<usize, String> {
+    let value = eval_const_exp_with(exp, &|name| constants.get(name).copied())
+        .ok_or_else(|| format!("{} must be a constant expression", context))?;
+    if value < 0 {
+        return Err(format!("{} must be non-negative", context));
+    }
+    Ok(value as usize)
 }
 
 fn kind_from_btype(ty: BType) -> AsyncExprKind {
@@ -1192,23 +1731,24 @@ fn btype_name(ty: &BType) -> String {
 
 fn builtin_function_sigs() -> HashMap<String, FunctionSig> {
     let mut funcs = HashMap::new();
-    for (name, ret, param_count) in [
-        ("getint", BType::I32, 0),
-        ("getch", BType::I32, 0),
-        ("getarray", BType::I32, 1),
-        ("putint", BType::Void, 1),
-        ("putch", BType::I32, 1),
-        ("putarray", BType::Void, 2),
-        ("starttime", BType::Void, 0),
-        ("stoptime", BType::Void, 0),
+    let ptr_i32 = BType::Ptr(Box::new(BType::I32));
+    for (name, ret, params) in [
+        ("getint", BType::I32, vec![]),
+        ("getch", BType::I32, vec![]),
+        ("getarray", BType::I32, vec![ptr_i32.clone()]),
+        ("putint", BType::Void, vec![BType::I32]),
+        ("putch", BType::I32, vec![BType::I32]),
+        ("putarray", BType::Void, vec![BType::I32, ptr_i32]),
+        ("starttime", BType::Void, vec![]),
+        ("stoptime", BType::Void, vec![]),
     ] {
         funcs.insert(
             name.to_string(),
             FunctionSig {
                 is_async: false,
                 ret,
-                param_count,
-                params: vec![BType::I32; param_count],
+                param_count: params.len(),
+                params,
             },
         );
     }
@@ -1225,6 +1765,7 @@ fn reject_unsupported_await_position(exp: &Exp, context: &str) -> Result<(), Str
 
 fn init_contains_await(init: &InitVal) -> bool {
     match init {
+        InitVal::Spanned(init, _) => init_contains_await(init),
         InitVal::Exp(exp) => exp_contains_await(exp),
         InitVal::Arr(items) => items.iter().any(init_contains_await),
     }
@@ -1232,6 +1773,7 @@ fn init_contains_await(init: &InitVal) -> bool {
 
 fn exp_contains_await(exp: &Exp) -> bool {
     match exp {
+        Exp::Spanned(exp, _) => exp_contains_await(exp),
         Exp::Await(_) => true,
         Exp::UnaryExp(_, exp)
         | Exp::Field(exp, _)
@@ -1271,6 +1813,7 @@ impl AsyncFunctionAnalyzer {
 
     fn visit_stmt(&mut self, stmt: &Stmt, in_loop: bool, following: &[Stmt]) {
         match stmt {
+            Stmt::Spanned(stmt, _) => self.visit_stmt(stmt, in_loop, following),
             Stmt::Block(stmts) => {
                 self.visit_stmts(stmts, in_loop);
             }
@@ -1312,6 +1855,7 @@ impl AsyncFunctionAnalyzer {
 
     fn visit_init(&mut self, init: &InitVal, in_loop: bool, following: &[Stmt]) {
         match init {
+            InitVal::Spanned(init, _) => self.visit_init(init, in_loop, following),
             InitVal::Exp(exp) => self.visit_exp(exp, in_loop, following),
             InitVal::Arr(items) => {
                 for item in items {
@@ -1323,6 +1867,7 @@ impl AsyncFunctionAnalyzer {
 
     fn visit_exp(&mut self, exp: &Exp, in_loop: bool, following: &[Stmt]) {
         match exp {
+            Exp::Spanned(exp, _) => self.visit_exp(exp, in_loop, following),
             Exp::Await(inner) => {
                 let continuation_id = self.next_continuation_id;
                 self.next_continuation_id += 1;
@@ -1367,6 +1912,7 @@ fn collect_used_vars_in_stmts(stmts: &[Stmt]) -> HashSet<String> {
 
 fn collect_used_vars_in_stmt(stmt: &Stmt, vars: &mut HashSet<String>) {
     match stmt {
+        Stmt::Spanned(stmt, _) => collect_used_vars_in_stmt(stmt, vars),
         Stmt::Block(stmts) => {
             for stmt in stmts {
                 collect_used_vars_in_stmt(stmt, vars);
@@ -1405,6 +1951,7 @@ fn collect_used_vars_in_stmt(stmt: &Stmt, vars: &mut HashSet<String>) {
 
 fn collect_used_vars_in_init(init: &InitVal, vars: &mut HashSet<String>) {
     match init {
+        InitVal::Spanned(init, _) => collect_used_vars_in_init(init, vars),
         InitVal::Exp(exp) => collect_used_vars_in_exp(exp, vars),
         InitVal::Arr(items) => {
             for item in items {
@@ -1416,6 +1963,7 @@ fn collect_used_vars_in_init(init: &InitVal, vars: &mut HashSet<String>) {
 
 fn collect_used_vars_in_exp(exp: &Exp, vars: &mut HashSet<String>) {
     match exp {
+        Exp::Spanned(exp, _) => collect_used_vars_in_exp(exp, vars),
         Exp::Ident(name) => {
             vars.insert(name.clone());
         }

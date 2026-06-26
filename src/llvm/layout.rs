@@ -35,33 +35,35 @@ pub(crate) struct StructLayout {
 }
 
 impl LlvmType {
-    pub(crate) fn size(&self, structs: &HashMap<String, StructLayout>) -> usize {
+    pub(crate) fn try_size(
+        &self,
+        structs: &HashMap<String, StructLayout>,
+    ) -> Result<usize, String> {
         match self {
-            Self::I32 => TARGET_LAYOUT.int_size,
-            Self::Ptr(_) | Self::Promise(_) => TARGET_LAYOUT.pointer_size,
-            Self::Void => 0,
-            Self::Array(len, inner) => len * inner.size(structs),
-            Self::Struct(name) => {
-                structs
-                    .get(name)
-                    .unwrap_or_else(|| panic!("Unknown struct type {}", name))
-                    .size
-            }
+            Self::I32 => Ok(TARGET_LAYOUT.int_size),
+            Self::Ptr(_) | Self::Promise(_) => Ok(TARGET_LAYOUT.pointer_size),
+            Self::Void => Ok(0),
+            Self::Array(len, inner) => Ok(len * inner.try_size(structs)?),
+            Self::Struct(name) => structs
+                .get(name)
+                .map(|layout| layout.size)
+                .ok_or_else(|| format!("Unknown struct type {}", name)),
         }
     }
 
-    pub(crate) fn align(&self, structs: &HashMap<String, StructLayout>) -> usize {
+    pub(crate) fn try_align(
+        &self,
+        structs: &HashMap<String, StructLayout>,
+    ) -> Result<usize, String> {
         match self {
-            Self::I32 => TARGET_LAYOUT.int_align,
-            Self::Ptr(_) | Self::Promise(_) => TARGET_LAYOUT.pointer_align,
-            Self::Void => 1,
-            Self::Array(_, inner) => inner.align(structs),
-            Self::Struct(name) => {
-                structs
-                    .get(name)
-                    .unwrap_or_else(|| panic!("Unknown struct type {}", name))
-                    .align
-            }
+            Self::I32 => Ok(TARGET_LAYOUT.int_align),
+            Self::Ptr(_) | Self::Promise(_) => Ok(TARGET_LAYOUT.pointer_align),
+            Self::Void => Ok(1),
+            Self::Array(_, inner) => inner.try_align(structs),
+            Self::Struct(name) => structs
+                .get(name)
+                .map(|layout| layout.align)
+                .ok_or_else(|| format!("Unknown struct type {}", name)),
         }
     }
 }

@@ -4,8 +4,29 @@ pub type Spanned<Tok, Loc, Error> = Result<(Loc, Tok, Loc), Error>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LexError {
-    InvalidChar(char),
-    UnterminatedBlockComment,
+    InvalidChar { ch: char, location: usize },
+    InvalidIntLiteral { text: String, location: usize },
+    UnterminatedBlockComment { location: usize },
+}
+
+impl LexError {
+    pub fn location(&self) -> usize {
+        match self {
+            Self::InvalidChar { location, .. }
+            | Self::InvalidIntLiteral { location, .. }
+            | Self::UnterminatedBlockComment { location } => *location,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidChar { ch, .. } => format!("invalid character {:?}", ch),
+            Self::InvalidIntLiteral { text, .. } => {
+                format!("invalid integer literal {}", text)
+            }
+            Self::UnterminatedBlockComment { .. } => "unterminated block comment".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +135,7 @@ impl<'input> Lexer<'input> {
                 continue;
             }
             if self.peek() == Some('/') && self.peek_next() == Some('*') {
+                let comment_start = self.byte_pos();
                 self.bump();
                 self.bump();
                 loop {
@@ -126,7 +148,11 @@ impl<'input> Lexer<'input> {
                         (Some(_), _) => {
                             self.bump();
                         }
-                        (None, _) => return Err(LexError::UnterminatedBlockComment),
+                        (None, _) => {
+                            return Err(LexError::UnterminatedBlockComment {
+                                location: comment_start,
+                            });
+                        }
                     }
                 }
                 continue;
@@ -170,14 +196,19 @@ impl<'input> Lexer<'input> {
             .collect()
     }
 
-    fn parse_int(text: &str) -> i32 {
-        if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-            i32::from_str_radix(hex, 16).unwrap()
+    fn parse_int(text: &str, location: usize) -> Result<i32, LexError> {
+        let parsed = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))
+        {
+            i32::from_str_radix(hex, 16)
         } else if text.len() > 1 && text.starts_with('0') {
-            i32::from_str_radix(text, 8).unwrap()
+            i32::from_str_radix(text, 8)
         } else {
-            text.parse().unwrap()
-        }
+            text.parse()
+        };
+        parsed.map_err(|_| LexError::InvalidIntLiteral {
+            text: text.to_string(),
+            location,
+        })
     }
 
     fn token(&mut self, tok: Tok) -> Tok {
@@ -251,7 +282,11 @@ impl Iterator for Lexer<'_> {
             }
         } else if ch.is_ascii_digit() {
             let number = self.take_number();
-            self.token(Tok::IntConst(Self::parse_int(&number)))
+            let value = match Self::parse_int(&number, start) {
+                Ok(value) => value,
+                Err(err) => return Some(Err(err)),
+            };
+            self.token(Tok::IntConst(value))
         } else {
             self.bump();
             let tok = match ch {
@@ -302,7 +337,12 @@ impl Iterator for Lexer<'_> {
                 ',' => Tok::Comma,
                 ';' => Tok::Semicolon,
                 '.' => Tok::Dot,
-                other => return Some(Err(LexError::InvalidChar(other))),
+                other => {
+                    return Some(Err(LexError::InvalidChar {
+                        ch: other,
+                        location: start,
+                    }));
+                }
             };
             self.token(tok)
         };

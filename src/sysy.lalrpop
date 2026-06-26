@@ -80,8 +80,8 @@ GlobalDef: GlobalDef = {
 }
 
 StructDef: StructDef = {
-  "struct" <name: StructName> "{" <fields: StructFields> "}" ";" => StructDef { name, fields },
-  <name: Ident> "{" <fields: StructFields> "}" ";" => StructDef { name, fields },
+  <l:@L> "struct" <name: StructName> "{" <fields: StructFields> "}" ";" <r:@R> => StructDef { span: Some(Span { start: l, end: r }), name, fields },
+  <l:@L> <name: Ident> "{" <fields: StructFields> "}" ";" <r:@R> => StructDef { span: Some(Span { start: l, end: r }), name, fields },
 }
 
 StructFields: Vec<StructField> = {
@@ -94,12 +94,12 @@ StructFields: Vec<StructField> = {
 }
 
 StructField: StructField = {
-  <ty: Type> <decls: MultipleDecl> ";" => StructField { ty, decls },
+  <l:@L> <ty: Type> <decls: MultipleDecl> ";" <r:@R> => StructField { span: Some(Span { start: l, end: r }), ty, decls },
 }
 
 FuncDef: FuncDef = {
-  <func_type: Type> <ident: Ident> "(" <func_params: FuncParams> ")" <block: Block> => FuncDef { is_async: false, func_type, ident, func_params, block },
-  "async" <func_type: Type> <ident: Ident> "(" <func_params: FuncParams> ")" <block: Block> => FuncDef { is_async: true, func_type, ident, func_params, block },
+  <l:@L> <func_type: Type> <ident: Ident> "(" <func_params: FuncParams> ")" <block: Block> <r:@R> => FuncDef { span: Some(Span { start: l, end: r }), is_async: false, func_type, ident, func_params, block },
+  <l:@L> "async" <func_type: Type> <ident: Ident> "(" <func_params: FuncParams> ")" <block: Block> <r:@R> => FuncDef { span: Some(Span { start: l, end: r }), is_async: true, func_type, ident, func_params, block },
 }
 
 FuncParams: Vec<FuncParam> = {
@@ -151,26 +151,26 @@ Stmt: Stmt = {
 }
 
 OpenStmt: Stmt = {
-  "if" "(" <exp: Exp> ")" <stmt: Stmt> => Stmt::If(exp, Box::new(stmt)),
-  "if" "(" <exp: Exp> ")" <then_stmt: ClosedStmt> "else" <else_stmt: OpenStmt> => Stmt::IfElse(exp, Box::new(then_stmt), Box::new(else_stmt)),
+  <l:@L> "if" "(" <exp: Exp> ")" <stmt: Stmt> <r:@R> => spanned_stmt(Stmt::If(exp, Box::new(stmt)), l, r),
+  <l:@L> "if" "(" <exp: Exp> ")" <then_stmt: ClosedStmt> "else" <else_stmt: OpenStmt> <r:@R> => spanned_stmt(Stmt::IfElse(exp, Box::new(then_stmt), Box::new(else_stmt)), l, r),
 }
 
 ClosedStmt: Stmt = {
   NonIfStmt => <>,
-  "if" "(" <exp: Exp> ")" <then_stmt: ClosedStmt> "else" <else_stmt: ClosedStmt> => Stmt::IfElse(exp, Box::new(then_stmt), Box::new(else_stmt)),
+  <l:@L> "if" "(" <exp: Exp> ")" <then_stmt: ClosedStmt> "else" <else_stmt: ClosedStmt> <r:@R> => spanned_stmt(Stmt::IfElse(exp, Box::new(then_stmt), Box::new(else_stmt)), l, r),
 }
 
 NonIfStmt: Stmt = {
-  <Type> <MultipleDecl> ";" => Stmt::Decl(<>),
-  "while" "(" <exp: Exp> ")" <stmt: NonIfStmt> => Stmt::While(exp, Box::new(stmt)),
-  "continue" ";" => Stmt::Continue,
-  "break" ";" => Stmt::Break,
-  <Block> => Stmt::Block(<>),
-  <ArrayExp> "=" <Exp> ";" => Stmt::Assign(<>),
-  "return" <Exp> ";" => Stmt::Return(Some(<>)),
-  "return" ";" => Stmt::Return(None),
-  <Exp> ";" => Stmt::Exp(<>),
-  ";" => Stmt::Empty,
+  <l:@L> <ty: Type> <decls: MultipleDecl> ";" <r:@R> => spanned_stmt(Stmt::Decl(ty, decls), l, r),
+  <l:@L> "while" "(" <exp: Exp> ")" <stmt: NonIfStmt> <r:@R> => spanned_stmt(Stmt::While(exp, Box::new(stmt)), l, r),
+  <l:@L> "continue" ";" <r:@R> => spanned_stmt(Stmt::Continue, l, r),
+  <l:@L> "break" ";" <r:@R> => spanned_stmt(Stmt::Break, l, r),
+  <l:@L> <block: Block> <r:@R> => spanned_stmt(Stmt::Block(block), l, r),
+  <l:@L> <lhs: ArrayExp> "=" <rhs: Exp> ";" <r:@R> => spanned_stmt(Stmt::Assign(lhs, rhs), l, r),
+  <l:@L> "return" <exp: Exp> ";" <r:@R> => spanned_stmt(Stmt::Return(Some(exp)), l, r),
+  <l:@L> "return" ";" <r:@R> => spanned_stmt(Stmt::Return(None), l, r),
+  <l:@L> <exp: Exp> ";" <r:@R> => spanned_stmt(Stmt::Exp(exp), l, r),
+  <l:@L> ";" <r:@R> => spanned_stmt(Stmt::Empty, l, r),
 }
 
 MultipleDecl: Vec<SingleDecl> = {
@@ -183,8 +183,8 @@ MultipleDecl: Vec<SingleDecl> = {
 }
 
 InitVal: InitVal = {
-  <exp: Exp> => InitVal::Exp(<>),
-  "{" <MultiInitVal> "}" => InitVal::Arr(<>)
+  <l:@L> <exp: Exp> <r:@R> => spanned_init(InitVal::Exp(exp), l, r),
+  <l:@L> "{" <items: MultiInitVal> "}" <r:@R> => spanned_init(InitVal::Arr(items), l, r)
 }
 
 MultiInitVal: Vec<InitVal> = {
@@ -203,8 +203,8 @@ VarDecl: VarDecl = {
 }
 
 SingleDecl: SingleDecl = {
-  <var: VarDecl> => SingleDecl { var: var, init: None },
-  <var: VarDecl> "=" <init_val: InitVal> => SingleDecl { var: var, init: Some(init_val) },
+  <l:@L> <var: VarDecl> <r:@R> => SingleDecl { span: Some(Span { start: l, end: r }), var: var, init: None },
+  <l:@L> <var: VarDecl> "=" <init_val: InitVal> <r:@R> => SingleDecl { span: Some(Span { start: l, end: r }), var: var, init: Some(init_val) },
 }
 
 FuncArgs: Vec<Exp> = {
@@ -239,37 +239,37 @@ Exp: Exp = {
 }
 
 ArrayExp: Exp = {
-  <Ident> => Exp::Ident(<>),
-  <arr: ArrayExp> "[" <pos: Exp> "]" => Exp::ArrGet(Box::new(arr), Box::new(pos)),
-  <arr: ArrayExp> "." <field: Ident> => Exp::Field(Box::new(arr), field),
-  <promise: ArrayExp> "." "wait" "(" ")" => Exp::PromiseWait(Box::new(promise)),
-  <arr: ArrayExp> "->" <field: Ident> => Exp::PtrField(Box::new(arr), field),
+  <l:@L> <ident: Ident> <r:@R> => spanned_exp(Exp::Ident(ident), l, r),
+  <l:@L> <arr: ArrayExp> "[" <pos: Exp> "]" <r:@R> => spanned_exp(Exp::ArrGet(Box::new(arr), Box::new(pos)), l, r),
+  <l:@L> <arr: ArrayExp> "." <field: Ident> <r:@R> => spanned_exp(Exp::Field(Box::new(arr), field), l, r),
+  <l:@L> <promise: ArrayExp> "." "wait" "(" ")" <r:@R> => spanned_exp(Exp::PromiseWait(Box::new(promise)), l, r),
+  <l:@L> <arr: ArrayExp> "->" <field: Ident> <r:@R> => spanned_exp(Exp::PtrField(Box::new(arr), field), l, r),
 }
 
 PrimaryExp: Exp = {
-  "new" <ty: BTypeBase> => Exp::New(ty),
-  "await" <exp: UnaryExp> => Exp::Await(Box::new(exp)),
-  "sleep" "(" <duration: Exp> ")" => Exp::Sleep(Box::new(duration)),
+  <l:@L> "new" <ty: BTypeBase> <r:@R> => spanned_exp(Exp::New(ty), l, r),
+  <l:@L> "await" <exp: UnaryExp> <r:@R> => spanned_exp(Exp::Await(Box::new(exp)), l, r),
+  <l:@L> "sleep" "(" <duration: Exp> ")" <r:@R> => spanned_exp(Exp::Sleep(Box::new(duration)), l, r),
   <ArrayExp> => <>,
-  <ident: Ident> "(" ")" => Exp::FuncCall(ident, Vec::new()),
-  <Ident> "(" <FuncArgs> ")" => Exp::FuncCall(<>),
+  <l:@L> <ident: Ident> "(" ")" <r:@R> => spanned_exp(Exp::FuncCall(ident, Vec::new()), l, r),
+  <l:@L> <ident: Ident> "(" <args: FuncArgs> ")" <r:@R> => spanned_exp(Exp::FuncCall(ident, args), l, r),
   "(" <Exp> ")" => <>,
-  <IntConst> => Exp::Number(<>),
+  <l:@L> <value: IntConst> <r:@R> => spanned_exp(Exp::Number(value), l, r),
 }
 
 UnaryExp: Exp = {
   <PrimaryExp> => <>,
-  <op: UnaryOp> <exp: UnaryExp> => Exp::UnaryExp(op, Box::new(exp)),
+  <l:@L> <op: UnaryOp> <exp: UnaryExp> <r:@R> => spanned_exp(Exp::UnaryExp(op, Box::new(exp)), l, r),
 }
 
 MulExp: Exp = {
   <UnaryExp> => <>,
-  <mul_exp: MulExp> <op: MulOp> <unary_exp: UnaryExp> => Exp::BinaryExp(op, Box::new(mul_exp), Box::new(unary_exp)),
+  <l:@L> <mul_exp: MulExp> <op: MulOp> <unary_exp: UnaryExp> <r:@R> => spanned_exp(Exp::BinaryExp(op, Box::new(mul_exp), Box::new(unary_exp)), l, r),
 }
 
 AddExp: Exp = {
   <MulExp> => <>,
-  <add_exp: AddExp> <op: AddOp> <mul_exp: MulExp> => Exp::BinaryExp(op, Box::new(add_exp), Box::new(mul_exp)),
+  <l:@L> <add_exp: AddExp> <op: AddOp> <mul_exp: MulExp> <r:@R> => spanned_exp(Exp::BinaryExp(op, Box::new(add_exp), Box::new(mul_exp)), l, r),
 }
 
 UnaryOp: UnaryOp = {
@@ -293,7 +293,7 @@ AddOp: BinaryOp = {
 
 RelExp: Exp = {
   AddExp => <>,
-  <rel_exp: RelExp> <op: RelOp> <add_exp: AddExp> => Exp::BinaryExp(op, Box::new(rel_exp), Box::new(add_exp)),
+  <l:@L> <rel_exp: RelExp> <op: RelOp> <add_exp: AddExp> <r:@R> => spanned_exp(Exp::BinaryExp(op, Box::new(rel_exp), Box::new(add_exp)), l, r),
 }
 
 RelOp: BinaryOp = {
@@ -305,7 +305,7 @@ RelOp: BinaryOp = {
 
 EqExp: Exp = {
   RelExp => <>,
-  <eq_exp: EqExp> <op: EqOp> <rel_exp: RelExp> => Exp::BinaryExp(op, Box::new(eq_exp), Box::new(rel_exp)),
+  <l:@L> <eq_exp: EqExp> <op: EqOp> <rel_exp: RelExp> <r:@R> => spanned_exp(Exp::BinaryExp(op, Box::new(eq_exp), Box::new(rel_exp)), l, r),
 }
 
 EqOp: BinaryOp = {
@@ -315,10 +315,10 @@ EqOp: BinaryOp = {
 
 LAndExp: Exp = {
   EqExp => <>,
-  <land_exp: LAndExp> "&&" <eq_exp: EqExp> => Exp::BinaryExp(BinaryOp::And, Box::new(land_exp), Box::new(eq_exp)),
+  <l:@L> <land_exp: LAndExp> "&&" <eq_exp: EqExp> <r:@R> => spanned_exp(Exp::BinaryExp(BinaryOp::And, Box::new(land_exp), Box::new(eq_exp)), l, r),
 }
 
 LOrExp: Exp = {
   LAndExp => <>,
-  <lor_exp: LOrExp> "||" <land_exp: LAndExp> => Exp::BinaryExp(BinaryOp::Or, Box::new(lor_exp), Box::new(land_exp)),
+  <l:@L> <lor_exp: LOrExp> "||" <land_exp: LAndExp> <r:@R> => spanned_exp(Exp::BinaryExp(BinaryOp::Or, Box::new(lor_exp), Box::new(land_exp)), l, r),
 }

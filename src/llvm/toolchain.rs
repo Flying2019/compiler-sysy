@@ -11,10 +11,9 @@ pub fn compile_llvm_to_riscv_asm(llvm_ir: &str, output: &Path) -> std::io::Resul
         std::env::var("SYSY_RISCV_TARGET").unwrap_or_else(|_| "riscv64-unknown-elf".to_string());
     let march = std::env::var("SYSY_RISCV_MARCH").unwrap_or_else(|_| "rv64im".to_string());
     let abi = std::env::var("SYSY_RISCV_ABI").unwrap_or_else(|_| "lp64".to_string());
-    compile_riscv_asm_with_clang(&clang, &target, &march, &abi, &input, output)?;
-
+    let result = compile_riscv_asm_with_clang(&clang, &target, &march, &abi, &input, output);
     let _ = std::fs::remove_file(&input);
-    Ok(())
+    result
 }
 
 fn compile_riscv_asm_with_clang(
@@ -25,7 +24,7 @@ fn compile_riscv_asm_with_clang(
     input: &Path,
     output: &Path,
 ) -> std::io::Result<()> {
-    let status = Command::new(clang)
+    let output_result = Command::new(clang)
         .arg("-target")
         .arg(target)
         .arg(format!("-march={}", march))
@@ -39,14 +38,17 @@ fn compile_riscv_asm_with_clang(
         .arg(input)
         .arg("-o")
         .arg(output)
-        .status()?;
-    if !status.success() {
+        .output()?;
+    if !output_result.status.success() {
+        let stderr = String::from_utf8_lossy(&output_result.stderr);
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!(
-                "{} failed to compile {} to RISC-V assembly",
+                "{} failed to compile {} to RISC-V assembly{}{}",
                 clang,
-                input.display()
+                input.display(),
+                if stderr.trim().is_empty() { "" } else { ":\n" },
+                stderr.trim()
             ),
         ));
     }

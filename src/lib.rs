@@ -1,4 +1,5 @@
+pub mod compile;
 pub mod lalr;
 pub mod lexer;
-pub mod llvm;
-pub mod llvm_ir;
+mod llvm;
+mod llvm_ir;

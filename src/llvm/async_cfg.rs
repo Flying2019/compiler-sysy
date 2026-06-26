@@ -1,7 +1,8 @@
-#![allow(dead_code)]
-
-use crate::lalr::{BinaryOp, Exp, FuncDef, InitVal, Stmt, Type, VarDecl};
+use crate::lalr::{
+    BinaryOp, CompUnit, Diagnostic, Exp, FuncDef, GlobalDef, InitVal, Stmt, Type, VarDecl,
+};
 use std::collections::HashSet;
+use std::fmt::Write;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AsyncCfgFunction {
@@ -44,7 +45,6 @@ pub(crate) struct AwaitTerminator {
     pub(crate) child: Exp,
     pub(crate) result_target: Option<String>,
     pub(crate) resume_block: usize,
-    pub(crate) resume_stmt_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +98,10 @@ impl AsyncCfgFunction {
             .iter()
             .filter_map(|block| match &block.terminator {
                 AsyncTerminator::Await(await_term) => {
-                    let mut vars = live_out[block.id].iter().cloned().collect::<Vec<_>>();
+                    let mut frame_vars = live_out[block.id].clone();
+                    collect_address_taken_exp(&await_term.child, &mut frame_vars);
+                    frame_vars.extend(self.assigned_vars_reachable(await_term.resume_block));
+                    let mut vars = frame_vars.into_iter().collect::<Vec<_>>();
                     vars.sort();
                     Some(LiveAcrossAwait {
                         state: await_term.state,
@@ -122,51 +125,55 @@ impl AsyncCfgFunction {
             AsyncTerminator::Return(_) | AsyncTerminator::Unreachable => Vec::new(),
         }
     }
+
+    fn assigned_vars_reachable(&self, start: usize) -> HashSet<String> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![start];
+        let mut assigned = HashSet::new();
+        while let Some(block_id) = stack.pop() {
+            if !seen.insert(block_id) {
+                continue;
+            }
+            let Some(block) = self.blocks.get(block_id) else {
+                continue;
+            };
+            for op in &block.ops {
+                if let AsyncOp::Assign(lhs, _) = op {
+                    collect_assigned_lvalue_roots(lhs, &mut assigned);
+                }
+            }
+            stack.extend(self.successors(block));
+        }
+        assigned
+    }
 }
 
 pub(crate) fn build_async_cfg(func: &FuncDef) -> AsyncCfgFunction {
     CfgBuilder::new().build(func)
 }
 
-pub(crate) fn build_top_level_async_cfg(func: &FuncDef) -> AsyncCfgFunction {
-    let mut blocks = Vec::new();
-    let mut current_ops = Vec::new();
-    let mut state = 1i32;
-
-    for (stmt_index, stmt) in func.block.iter().enumerate() {
-        if let Some((child, result_target)) = top_level_await(stmt) {
-            let block_id = blocks.len();
-            let resume_block = block_id + 1;
-            blocks.push(AsyncBlock {
-                id: block_id,
-                ops: current_ops,
-                terminator: AsyncTerminator::Await(AwaitTerminator {
-                    state,
-                    child,
-                    result_target,
-                    resume_block,
-                    resume_stmt_index: stmt_index + 1,
-                }),
-            });
-            state += 1;
-            current_ops = Vec::new();
-        } else {
-            current_ops.push(AsyncOp::Eval(Exp::Number(0)));
+pub fn dump_async_cfgs(ast: &CompUnit) -> Result<String, Diagnostic> {
+    ast.validate_semantics()?;
+    let mut out = String::new();
+    for glob_def in &ast.global_defs {
+        let GlobalDef::FuncDef(func) = glob_def else {
+            continue;
+        };
+        if !func.is_async {
+            continue;
         }
+        let cfg = build_async_cfg(func);
+        let _ = writeln!(out, "async {} entry={}", func.ident, cfg.entry);
+        for block in &cfg.blocks {
+            let _ = writeln!(out, "  block {}:", block.id);
+            for op in &block.ops {
+                let _ = writeln!(out, "    op {}", describe_op(op));
+            }
+            let _ = writeln!(out, "    term {}", describe_terminator(&block.terminator));
+        }
+        out.push('\n');
     }
-
-    let block_id = blocks.len();
-    blocks.push(AsyncBlock {
-        id: block_id,
-        ops: current_ops,
-        terminator: AsyncTerminator::Return(None),
-    });
-
-    AsyncCfgFunction {
-        entry: 0,
-        blocks,
-        i32_temps: Vec::new(),
-    }
+    Ok(out)
 }
 
 struct CfgBuilder {
@@ -243,6 +250,7 @@ impl CfgBuilder {
 
     fn lower_stmt(&mut self, current: usize, stmt: &Stmt) -> usize {
         match stmt {
+            Stmt::Spanned(stmt, _) => self.lower_stmt(current, stmt),
             Stmt::Block(stmts) => self.lower_stmts(current, stmts),
             Stmt::Decl(ty, decls) => {
                 let mut current = current;
@@ -253,6 +261,7 @@ impl CfgBuilder {
                         .as_ref()
                         .map(|init| self.lower_init(&mut current, init));
                     lowered.push(crate::lalr::SingleDecl {
+                        span: decl.span,
                         var: decl.var.clone(),
                         init,
                     });
@@ -269,8 +278,8 @@ impl CfgBuilder {
             }
             Stmt::Exp(exp) => {
                 let mut current = current;
-                if let Exp::Await(inner) = exp {
-                    current = self.suspend_for_await(current, *inner.clone(), None, 0);
+                if let Some(inner) = await_child(exp) {
+                    current = self.suspend_for_await(current, inner.clone(), None);
                 } else {
                     let exp = self.lower_exp(&mut current, exp);
                     self.push_op(current, AsyncOp::Eval(exp));
@@ -344,6 +353,9 @@ impl CfgBuilder {
 
     fn lower_init(&mut self, current: &mut usize, init: &InitVal) -> InitVal {
         match init {
+            InitVal::Spanned(init, span) => {
+                InitVal::Spanned(Box::new(self.lower_init(current, init)), *span)
+            }
             InitVal::Exp(exp) => InitVal::Exp(self.lower_exp(current, exp)),
             InitVal::Arr(items) => InitVal::Arr(
                 items
@@ -392,10 +404,11 @@ impl CfgBuilder {
 
     fn lower_exp(&mut self, current: &mut usize, exp: &Exp) -> Exp {
         match exp {
+            Exp::Spanned(exp, _) => self.lower_exp(current, exp),
             Exp::Await(inner) => {
                 let child = self.lower_exp(current, inner);
                 let temp = self.next_await_temp();
-                *current = self.suspend_for_await(*current, child, Some(temp.clone()), 0);
+                *current = self.suspend_for_await(*current, child, Some(temp.clone()));
                 Exp::Ident(temp)
             }
             Exp::UnaryExp(op, inner) => {
@@ -480,7 +493,6 @@ impl CfgBuilder {
         current: usize,
         child: Exp,
         result_target: Option<String>,
-        resume_stmt_index: usize,
     ) -> usize {
         let resume_block = self.new_block();
         let state = self.state;
@@ -492,30 +504,9 @@ impl CfgBuilder {
                 child,
                 result_target,
                 resume_block,
-                resume_stmt_index,
             }),
         );
         resume_block
-    }
-}
-
-fn top_level_await(stmt: &Stmt) -> Option<(Exp, Option<String>)> {
-    match stmt {
-        Stmt::Decl(_, decls) => decls.iter().find_map(|decl| {
-            if let Some(InitVal::Exp(Exp::Await(inner))) = &decl.init {
-                Some(((**inner).clone(), Some(var_decl_name(&decl.var))))
-            } else {
-                None
-            }
-        }),
-        Stmt::Assign(Exp::Ident(name), Exp::Await(inner)) => {
-            Some(((**inner).clone(), Some(name.clone())))
-        }
-        Stmt::Exp(Exp::Await(inner)) => Some(((**inner).clone(), None)),
-        Stmt::Return(Some(Exp::Await(inner))) => {
-            Some(((**inner).clone(), Some("__return".to_string())))
-        }
-        _ => None,
     }
 }
 
@@ -523,6 +514,123 @@ fn var_decl_name(var: &VarDecl) -> String {
     match var {
         VarDecl::Ident(name) => name.clone(),
         VarDecl::Array(inner, _) => var_decl_name(inner),
+    }
+}
+
+fn describe_op(op: &AsyncOp) -> String {
+    match op {
+        AsyncOp::Decl(_, decls) => {
+            let names = decls
+                .iter()
+                .map(|decl| var_decl_name(&decl.var))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("decl {}", names)
+        }
+        AsyncOp::Assign(lhs, rhs) => format!("assign {} = {}", format_exp(lhs), format_exp(rhs)),
+        AsyncOp::Eval(exp) => format!("eval {}", format_exp(exp)),
+        AsyncOp::PromiseWait(exp) => format!("wait {}", format_exp(exp)),
+    }
+}
+
+fn describe_terminator(term: &AsyncTerminator) -> String {
+    match term {
+        AsyncTerminator::Return(Some(exp)) => format!("return {}", format_exp(exp)),
+        AsyncTerminator::Return(None) => "return".to_string(),
+        AsyncTerminator::Jump(target) => format!("jump {}", target),
+        AsyncTerminator::Branch {
+            cond,
+            then_block,
+            else_block,
+        } => format!(
+            "branch {} ? {} : {}",
+            format_exp(cond),
+            then_block,
+            else_block
+        ),
+        AsyncTerminator::Await(await_term) => format!(
+            "await state={} child={} target={} resume={}",
+            await_term.state,
+            format_exp(&await_term.child),
+            await_term.result_target.as_deref().unwrap_or("-"),
+            await_term.resume_block
+        ),
+        AsyncTerminator::Unreachable => "unreachable".to_string(),
+    }
+}
+
+fn format_exp(exp: &Exp) -> String {
+    match exp {
+        Exp::Spanned(exp, _) => format_exp(exp),
+        Exp::Number(value) => value.to_string(),
+        Exp::Ident(name) => name.clone(),
+        Exp::UnaryExp(op, inner) => format!("({}{})", unary_symbol(op), format_exp(inner)),
+        Exp::BinaryExp(op, lhs, rhs) => {
+            format!(
+                "({} {} {})",
+                format_exp(lhs),
+                binary_symbol(op),
+                format_exp(rhs)
+            )
+        }
+        Exp::New(ty) => format!("new {}", format_btype(ty)),
+        Exp::Await(inner) => format!("await {}", format_exp(inner)),
+        Exp::Sleep(duration) => format!("sleep({})", format_exp(duration)),
+        Exp::PromiseWait(inner) => format!("{}.wait()", format_exp(inner)),
+        Exp::FuncCall(name, args) => {
+            let args = args.iter().map(format_exp).collect::<Vec<_>>().join(", ");
+            format!("{}({})", name, args)
+        }
+        Exp::ArrGet(base, index) => format!("{}[{}]", format_exp(base), format_exp(index)),
+        Exp::Field(base, field) => format!("{}.{}", format_exp(base), field),
+        Exp::PtrField(base, field) => format!("{}->{}", format_exp(base), field),
+    }
+}
+
+fn unary_symbol(op: &crate::lalr::UnaryOp) -> &'static str {
+    match op {
+        crate::lalr::UnaryOp::Pos => "+",
+        crate::lalr::UnaryOp::Neg => "-",
+        crate::lalr::UnaryOp::Not => "!",
+        crate::lalr::UnaryOp::Addr => "&",
+        crate::lalr::UnaryOp::Deref => "*",
+    }
+}
+
+fn binary_symbol(op: &BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
+        BinaryOp::Lt => "<",
+        BinaryOp::Gt => ">",
+        BinaryOp::Le => "<=",
+        BinaryOp::Ge => ">=",
+        BinaryOp::Eq => "==",
+        BinaryOp::Ne => "!=",
+        BinaryOp::And => "&&",
+        BinaryOp::Or => "||",
+    }
+}
+
+fn format_btype(ty: &crate::lalr::BType) -> String {
+    match ty {
+        crate::lalr::BType::I32 => "int".to_string(),
+        crate::lalr::BType::Void => "void".to_string(),
+        crate::lalr::BType::Struct(name) => name.clone(),
+        crate::lalr::BType::Promise(inner) => format!("Promise<{}>", format_btype(inner)),
+        crate::lalr::BType::Ptr(inner) => format!("{}*", format_btype(inner)),
+        crate::lalr::BType::Array(len, inner) => format!("{}[{}]", format_btype(inner), len),
+    }
+}
+
+fn await_child(exp: &Exp) -> Option<&Exp> {
+    match exp {
+        Exp::Spanned(exp, _) => await_child(exp),
+        Exp::Await(inner) => Some(inner),
+        _ => None,
     }
 }
 
@@ -569,6 +677,7 @@ fn block_use_def(block: &AsyncBlock) -> (HashSet<String>, HashSet<String>) {
 
 fn collect_uses_init(init: &InitVal, uses: &mut HashSet<String>, defs: &HashSet<String>) {
     match init {
+        InitVal::Spanned(init, _) => collect_uses_init(init, uses, defs),
         InitVal::Exp(exp) => collect_uses_exp(exp, uses, defs),
         InitVal::Arr(items) => {
             for item in items {
@@ -585,6 +694,26 @@ fn collect_lvalue_uses(exp: &Exp, uses: &mut HashSet<String>, defs: &HashSet<Str
     }
 }
 
+fn collect_assigned_lvalue_roots(exp: &Exp, out: &mut HashSet<String>) {
+    match exp {
+        Exp::Spanned(exp, _) => collect_assigned_lvalue_roots(exp, out),
+        Exp::Ident(name) => {
+            out.insert(name.clone());
+        }
+        Exp::ArrGet(base, _) | Exp::Field(base, _) | Exp::PtrField(base, _) => {
+            collect_assigned_lvalue_roots(base, out);
+        }
+        Exp::UnaryExp(_, _)
+        | Exp::Number(_)
+        | Exp::BinaryExp(_, _, _)
+        | Exp::New(_)
+        | Exp::Await(_)
+        | Exp::Sleep(_)
+        | Exp::PromiseWait(_)
+        | Exp::FuncCall(_, _) => {}
+    }
+}
+
 fn collect_uses_var_decl_dims(var: &VarDecl, uses: &mut HashSet<String>, defs: &HashSet<String>) {
     match var {
         VarDecl::Ident(_) => {}
@@ -597,6 +726,7 @@ fn collect_uses_var_decl_dims(var: &VarDecl, uses: &mut HashSet<String>, defs: &
 
 fn collect_uses_exp(exp: &Exp, uses: &mut HashSet<String>, defs: &HashSet<String>) {
     match exp {
+        Exp::Spanned(exp, _) => collect_uses_exp(exp, uses, defs),
         Exp::Ident(name) => {
             if !defs.contains(name) {
                 uses.insert(name.clone());
@@ -622,6 +752,30 @@ fn collect_uses_exp(exp: &Exp, uses: &mut HashSet<String>, defs: &HashSet<String
     }
 }
 
+fn collect_address_taken_exp(exp: &Exp, out: &mut HashSet<String>) {
+    match exp {
+        Exp::Spanned(exp, _) => collect_address_taken_exp(exp, out),
+        Exp::UnaryExp(crate::lalr::UnaryOp::Addr, inner) => {
+            collect_uses_exp(inner, out, &HashSet::new());
+        }
+        Exp::UnaryExp(_, inner)
+        | Exp::Await(inner)
+        | Exp::Sleep(inner)
+        | Exp::PromiseWait(inner) => collect_address_taken_exp(inner, out),
+        Exp::BinaryExp(_, lhs, rhs) | Exp::ArrGet(lhs, rhs) => {
+            collect_address_taken_exp(lhs, out);
+            collect_address_taken_exp(rhs, out);
+        }
+        Exp::FuncCall(_, args) => {
+            for arg in args {
+                collect_address_taken_exp(arg, out);
+            }
+        }
+        Exp::Field(base, _) | Exp::PtrField(base, _) => collect_address_taken_exp(base, out),
+        Exp::Ident(_) | Exp::Number(_) | Exp::New(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,6 +784,7 @@ mod tests {
     #[test]
     fn cfg_splits_loop_and_short_circuit_awaits() {
         let func = FuncDef {
+            span: None,
             is_async: true,
             func_type: Type::BType(BType::I32),
             ident: "f".to_string(),
@@ -675,6 +830,7 @@ mod tests {
     #[test]
     fn cfg_liveness_tracks_values_used_after_await() {
         let func = FuncDef {
+            span: None,
             is_async: true,
             func_type: Type::BType(BType::I32),
             ident: "f".to_string(),
@@ -683,6 +839,7 @@ mod tests {
                 Stmt::Decl(
                     Type::BType(BType::I32),
                     vec![crate::lalr::SingleDecl {
+                        span: None,
                         var: VarDecl::Ident("x".to_string()),
                         init: Some(InitVal::Exp(Exp::Number(7))),
                     }],
@@ -698,6 +855,140 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].state, 1);
         assert_eq!(live[0].vars, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn cfg_liveness_tracks_address_taken_await_child_values() {
+        let func = FuncDef {
+            span: None,
+            is_async: true,
+            func_type: Type::BType(BType::I32),
+            ident: "f".to_string(),
+            func_params: Vec::<FuncParam>::new(),
+            block: vec![
+                Stmt::Decl(
+                    Type::BType(BType::I32),
+                    vec![crate::lalr::SingleDecl {
+                        span: None,
+                        var: VarDecl::Ident("value".to_string()),
+                        init: Some(InitVal::Exp(Exp::Number(7))),
+                    }],
+                ),
+                Stmt::Exp(Exp::Await(Box::new(Exp::FuncCall(
+                    "id_ptr".to_string(),
+                    vec![Exp::UnaryExp(
+                        crate::lalr::UnaryOp::Addr,
+                        Box::new(Exp::Ident("value".to_string())),
+                    )],
+                )))),
+                Stmt::Return(Some(Exp::Number(0))),
+            ],
+        };
+
+        let cfg = build_async_cfg(&func);
+        let live = cfg.live_across_awaits();
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].vars, vec!["value".to_string()]);
+    }
+
+    #[test]
+    fn cfg_liveness_tracks_lvalues_assigned_after_await() {
+        let func = FuncDef {
+            span: None,
+            is_async: true,
+            func_type: Type::BType(BType::I32),
+            ident: "f".to_string(),
+            func_params: Vec::<FuncParam>::new(),
+            block: vec![
+                Stmt::Decl(
+                    Type::BType(BType::I32),
+                    vec![crate::lalr::SingleDecl {
+                        span: None,
+                        var: VarDecl::Ident("x".to_string()),
+                        init: Some(InitVal::Exp(Exp::Number(0))),
+                    }],
+                ),
+                Stmt::Exp(Exp::Await(Box::new(call("tick")))),
+                Stmt::Assign(Exp::Ident("x".to_string()), Exp::Number(7)),
+                Stmt::Return(Some(Exp::Ident("x".to_string()))),
+            ],
+        };
+
+        let cfg = build_async_cfg(&func);
+        let live = cfg.live_across_awaits();
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].vars, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn dump_rejects_semantically_invalid_ast() {
+        let ast = CompUnit {
+            global_defs: vec![GlobalDef::FuncDef(FuncDef {
+                span: None,
+                is_async: true,
+                func_type: Type::BType(BType::I32),
+                ident: "f".to_string(),
+                func_params: Vec::<FuncParam>::new(),
+                block: vec![Stmt::Return(Some(Exp::Ident("missing".to_string())))],
+            })],
+        };
+
+        let err = dump_async_cfgs(&ast).expect_err("invalid AST must not dump CFG");
+
+        assert!(err.to_string().contains("Unknown identifier missing"));
+    }
+
+    #[test]
+    fn dump_uses_stable_text_format() {
+        let ast = CompUnit {
+            global_defs: vec![
+                async_const_fn("one", 1),
+                GlobalDef::FuncDef(FuncDef {
+                    span: None,
+                    is_async: true,
+                    func_type: Type::BType(BType::I32),
+                    ident: "f".to_string(),
+                    func_params: Vec::<FuncParam>::new(),
+                    block: vec![
+                        Stmt::If(
+                            Exp::BinaryExp(
+                                BinaryOp::And,
+                                Box::new(Exp::Await(Box::new(call("one")))),
+                                Box::new(Exp::Await(Box::new(call("one")))),
+                            ),
+                            Box::new(Stmt::Return(Some(Exp::Number(1)))),
+                        ),
+                        Stmt::Return(Some(Exp::Number(0))),
+                    ],
+                }),
+            ],
+        };
+
+        let dump = dump_async_cfgs(&ast).expect("valid AST should dump CFG");
+
+        assert!(dump.contains("async f entry=0"));
+        assert!(
+            dump.contains("term await state=1 child=one() target=__sysy_cfg_await_tmp_0 resume=")
+        );
+        assert!(dump.contains("term branch __sysy_cfg_await_tmp_0 ?"));
+        assert!(
+            dump.contains("term await state=2 child=one() target=__sysy_cfg_await_tmp_1 resume=")
+        );
+        assert!(!dump.contains("BinaryExp"));
+        assert!(!dump.contains("FuncCall"));
+    }
+
+    fn async_const_fn(name: &str, value: i32) -> GlobalDef {
+        GlobalDef::FuncDef(FuncDef {
+            span: None,
+            is_async: true,
+            func_type: Type::BType(BType::I32),
+            ident: name.to_string(),
+            func_params: Vec::<FuncParam>::new(),
+            block: vec![Stmt::Return(Some(Exp::Number(value)))],
+        })
     }
 
     fn call(name: &str) -> Exp {
