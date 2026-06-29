@@ -2,7 +2,8 @@ use super::async_cfg::{
     build_async_cfg, AsyncCfgFunction, AsyncOp, AsyncTerminator, AwaitTerminator,
 };
 use super::builder::{FunctionCtx, Value, VarInfo};
-use super::layout::{align_up, StructLayout, TARGET_LAYOUT};
+use super::codegen::IrModule;
+use super::layout::{align_up, StructLayout};
 use super::module::{
     decl_type_with_constants, param_resolved_btype, type_to_llvm, var_decl_name, ModuleCtx,
 };
@@ -12,8 +13,8 @@ use super::types::LlvmType;
 use crate::lalr::{
     eval_const_exp_with, BType, Exp, FuncDef, InitVal, SingleDecl, Stmt, Type, UnaryOp, VarDecl,
 };
+use inkwell::values::PointerValue;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
 
 #[derive(Debug, Clone)]
 struct FrameField {
@@ -679,31 +680,46 @@ fn infer_lvalue_type(
     }
 }
 
-fn async_field_ptr(ctx: &mut FunctionCtx<'_>, frame: &str, field: &FrameField) -> String {
-    let ptr = ctx.tmp();
-    ctx.emit(format!(
-        "  {} = getelementptr inbounds {}, ptr {}, i32 0, i32 {}",
-        ptr, field.frame_type, frame, field.index
-    ));
-    ptr
+fn async_field_ptr<'ctx>(
+    ctx: &mut FunctionCtx<'_, 'ctx>,
+    frame: PointerValue<'ctx>,
+    field: &FrameField,
+) -> Result<PointerValue<'ctx>, String> {
+    let name = ctx.tmp();
+    ctx.builder
+        .build_struct_gep(
+            ctx.ir.struct_type(&field.frame_type)?,
+            frame,
+            field.index as u32,
+            &name,
+        )
+        .map_err(|err| err.to_string())
 }
 
-fn async_load_field(ctx: &mut FunctionCtx<'_>, frame: &str, field: &FrameField) -> Value {
-    let ptr = async_field_ptr(ctx, frame, field);
-    ctx.load(&ptr, &field.ty)
+fn async_load_field<'ctx>(
+    ctx: &mut FunctionCtx<'_, 'ctx>,
+    frame: PointerValue<'ctx>,
+    field: &FrameField,
+) -> Result<Value<'ctx>, String> {
+    let ptr = async_field_ptr(ctx, frame, field)?;
+    ctx.load(ptr, &field.ty)
 }
 
-fn async_store_field(ctx: &mut FunctionCtx<'_>, frame: &str, field: &FrameField, value: &Value) {
-    let ptr = async_field_ptr(ctx, frame, field);
-    ctx.emit(format!(
-        "  store {} {}, ptr {}",
-        value.ty.llvm(),
-        value.name,
-        ptr
-    ));
+fn async_store_field<'ctx>(
+    ctx: &mut FunctionCtx<'_, 'ctx>,
+    frame: PointerValue<'ctx>,
+    field: &FrameField,
+    value: &Value<'ctx>,
+) -> Result<(), String> {
+    let ptr = async_field_ptr(ctx, frame, field)?;
+    ctx.store(value, ptr)
 }
 
-pub(crate) fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> Result<String, String> {
+pub(crate) fn emit_async_function<'ctx>(
+    ir: &mut IrModule<'ctx>,
+    module: &ModuleCtx,
+    func: &FuncDef,
+) -> Result<(), String> {
     let ret_ty = type_to_llvm(&func.func_type);
     let lowered_func = rename_async_locals(func);
     let params = func
@@ -715,7 +731,7 @@ pub(crate) fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> Result<
         })
         .collect::<Result<Vec<_>, _>>()?;
     let safe_name = sanitize_ident(&func.ident);
-    let frame_type = format!("%async.frame.{}", safe_name);
+    let frame_type = format!("async.frame.{}", safe_name);
     let cfg = build_async_cfg(&lowered_func);
     let mut frame_locals = cfg
         .live_across_awaits()
@@ -757,58 +773,70 @@ pub(crate) fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> Result<
         awaits.len(),
     )?;
     let fields = &frame_layout.fields;
-
-    let mut out = String::new();
-    let frame_fields = frame_layout
+    let frame_field_tys = frame_layout
         .ordered_fields
         .iter()
-        .map(|(_, ty)| ty.llvm())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let _ = writeln!(
-        out,
-        "{} = type {{ {} }}\n",
-        frame_layout.type_name, frame_fields
+        .map(|(_, ty)| ty.clone())
+        .collect::<Vec<_>>();
+    ir.add_frame_struct(&frame_layout.type_name, &frame_field_tys)?;
+    let frame_ptr_ty = LlvmType::Ptr(Box::new(LlvmType::I32));
+    let start_fn = ir.declare_function(
+        &start_name,
+        &LlvmType::Void,
+        std::slice::from_ref(&frame_ptr_ty),
+    )?;
+    for await_info in &awaits {
+        ir.declare_function(
+            &await_info.callback_name,
+            &LlvmType::Void,
+            std::slice::from_ref(&frame_ptr_ty),
+        )?;
+    }
+
+    let public_fn = ir.function(&func.ident)?;
+    let mut entry = FunctionCtx::new(
+        ir,
+        module,
+        public_fn,
+        LlvmType::Promise(Box::new(ret_ty.clone())),
+        false,
     );
-    let param_sig = params
-        .iter()
-        .enumerate()
-        .map(|(idx, (_, ty))| format!("{} %arg{}", ty.llvm(), idx))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let _ = writeln!(out, "define ptr @{}({}) {{", safe_name, param_sig);
-    let mut entry = FunctionCtx::new(module, LlvmType::Promise(Box::new(ret_ty.clone())), false);
-    entry.emit_label("entry");
     let promise = entry.promise_new(&ret_ty)?;
-    let frame = entry.tmp();
-    entry.emit(format!(
-        "  {} = call ptr @malloc({} {})",
-        frame, TARGET_LAYOUT.malloc_size_type, frame_layout.size,
-    ));
+    let frame = entry
+        .call_named_typed(
+            "malloc",
+            &[entry.i64_const(frame_layout.size as u64)],
+            frame_ptr_ty.clone(),
+        )?
+        .ptr_value()?;
     async_store_field(
         &mut entry,
-        &frame,
+        frame,
         frame_field(fields, "__promise")?,
         &promise,
-    );
+    )?;
     for (idx, (name, ty)) in params.iter().enumerate() {
-        let value = Value {
-            name: format!("%arg{}", idx),
-            ty: ty.clone(),
-        };
-        async_store_field(&mut entry, &frame, frame_field(fields, name)?, &value);
+        let param = public_fn
+            .get_nth_param(idx as u32)
+            .ok_or_else(|| format!("Function {} is missing parameter {}", func.ident, idx))?;
+        let value = Value::from_basic(param, ty.clone());
+        async_store_field(&mut entry, frame, frame_field(fields, name)?, &value)?;
     }
-    entry.emit(format!(
-        "  call void @__sysy_pending_add(ptr {}, ptr @{}, ptr {})",
-        promise.name, start_name, frame
-    ));
-    entry.terminate(format!("  ret ptr {}", promise.name));
-    for line in entry.lines {
-        let _ = writeln!(out, "{}", line);
-    }
-    out.push_str("}\n\n");
+    entry.call_named_void(
+        "__sysy_pending_add",
+        &[
+            promise.clone(),
+            Value::from_basic(
+                start_fn.as_global_value().as_pointer_value().into(),
+                frame_ptr_ty.clone(),
+            ),
+            Value::from_basic(frame.into(), frame_ptr_ty.clone()),
+        ],
+    )?;
+    entry.terminate_return(Some(&promise))?;
 
-    out.push_str(&emit_async_cfg_function(
+    emit_async_cfg_function(
+        ir,
         module,
         &start_name,
         &ret_ty,
@@ -817,11 +845,12 @@ pub(crate) fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> Result<
         &awaits,
         cfg.entry,
         None,
-    )?);
+    )?;
 
     for await_info in &awaits {
         let resume_block = await_resume_block(&cfg, await_info.state)?;
-        out.push_str(&emit_async_cfg_function(
+        emit_async_cfg_function(
+            ir,
             module,
             &await_info.callback_name,
             &ret_ty,
@@ -830,13 +859,13 @@ pub(crate) fn emit_async_function(module: &ModuleCtx, func: &FuncDef) -> Result<
             &awaits,
             resume_block,
             Some(await_info),
-        )?);
+        )?;
     }
-
-    Ok(out)
+    Ok(())
 }
 
-fn emit_async_cfg_function(
+fn emit_async_cfg_function<'ctx>(
+    ir: &IrModule<'ctx>,
     module: &ModuleCtx,
     name: &str,
     ret_ty: &LlvmType,
@@ -845,52 +874,62 @@ fn emit_async_cfg_function(
     awaits: &[AwaitPointInfo],
     entry_block: usize,
     continuation: Option<&AwaitPointInfo>,
-) -> Result<String, String> {
-    let mut out = String::new();
-    let _ = writeln!(out, "define void @{}(ptr %frame) {{", name);
-    let mut ctx = FunctionCtx::new(module, LlvmType::Void, true);
-    ctx.emit_label("entry");
-    init_async_frame_vars(&mut ctx, fields)?;
+) -> Result<(), String> {
+    let function = ir.function(name)?;
+    let frame = function
+        .get_nth_param(0)
+        .ok_or_else(|| format!("Async function {} is missing frame parameter", name))?
+        .into_pointer_value();
+    let mut ctx = FunctionCtx::new(ir, module, function, LlvmType::Void, true);
+    init_async_frame_vars(&mut ctx, frame, fields)?;
 
     if let Some(await_info) = continuation {
-        emit_continuation_entry(&mut ctx, fields, await_info, cfg)?;
+        emit_continuation_entry(&mut ctx, frame, fields, await_info, cfg)?;
     } else {
         let promise = current_promise(&ctx)?;
-        ctx.emit(format!(
-            "  call void @__sysy_promise_clear_driver(ptr {})",
-            promise
-        ));
-        ctx.terminate(format!("  br label %{}", cfg_block_label(entry_block)));
+        ctx.call_named_void(
+            "__sysy_promise_clear_driver",
+            &[Value::from_basic(
+                promise.into(),
+                LlvmType::Ptr(Box::new(LlvmType::I32)),
+            )],
+        )?;
+        ctx.terminate_br(&cfg_block_label(entry_block))?;
     }
 
     for block in &cfg.blocks {
         ctx.emit_label(&cfg_block_label(block.id));
         for op in &block.ops {
-            emit_async_cfg_op(&mut ctx, fields, op)?;
+            emit_async_cfg_op(&mut ctx, frame, fields, op)?;
         }
-        emit_async_cfg_terminator(&mut ctx, fields, cfg, awaits, ret_ty, &block.terminator)?;
+        emit_async_cfg_terminator(
+            &mut ctx,
+            frame,
+            fields,
+            cfg,
+            awaits,
+            ret_ty,
+            &block.terminator,
+        )?;
     }
 
     ctx.emit_label("async.suspend");
-    ctx.terminate("  ret void".to_string());
-    for line in ctx.lines {
-        let _ = writeln!(out, "{}", line);
-    }
-    out.push_str("}\n\n");
-    Ok(out)
+    ctx.terminate_return(None)?;
+    Ok(())
 }
 
-fn init_async_frame_vars(
-    ctx: &mut FunctionCtx<'_>,
+fn init_async_frame_vars<'ctx>(
+    ctx: &mut FunctionCtx<'_, 'ctx>,
+    frame: PointerValue<'ctx>,
     fields: &HashMap<String, FrameField>,
 ) -> Result<(), String> {
-    let promise = async_load_field(ctx, "%frame", frame_field(fields, "__promise")?);
-    ctx.promise_ptr = Some(promise.name.clone());
+    let promise = async_load_field(ctx, frame, frame_field(fields, "__promise")?)?;
+    ctx.promise_ptr = Some(promise.ptr_value()?);
     for (name, field) in fields.iter() {
         if is_internal_async_frame_field(name) {
             continue;
         }
-        let ptr = async_field_ptr(ctx, "%frame", field);
+        let ptr = async_field_ptr(ctx, frame, field)?;
         ctx.insert_var(
             name.clone(),
             VarInfo {
@@ -906,39 +945,32 @@ fn is_internal_async_frame_field(name: &str) -> bool {
     name == "__promise" || name == "__return" || name.starts_with("__await")
 }
 
-fn emit_continuation_entry(
-    ctx: &mut FunctionCtx<'_>,
+fn emit_continuation_entry<'ctx>(
+    ctx: &mut FunctionCtx<'_, 'ctx>,
+    frame: PointerValue<'ctx>,
     fields: &HashMap<String, FrameField>,
     await_info: &AwaitPointInfo,
     cfg: &AsyncCfgFunction,
 ) -> Result<(), String> {
-    let child = async_load_field(ctx, "%frame", frame_field(fields, &await_info.child_field)?);
-    let ready = ctx.tmp();
-    ctx.emit(format!(
-        "  {} = call i32 @__sysy_promise_is_ready(ptr {})",
-        ready, child.name
-    ));
-    let ready_bool = ctx.tmp();
-    ctx.emit(format!("  {} = icmp ne i32 {}, 0", ready_bool, ready));
+    let child = async_load_field(ctx, frame, frame_field(fields, &await_info.child_field)?)?;
+    let ready = ctx.call_named_typed("__sysy_promise_is_ready", &[child.clone()], LlvmType::I32)?;
+    let ready_bool = ctx.i32_ne_zero(&ready)?;
     let resume_label = ctx.label("cont.resume");
     let exit_label = ctx.label("cont.exit");
-    ctx.terminate(format!(
-        "  br i1 {}, label %{}, label %{}",
-        ready_bool, resume_label, exit_label
-    ));
+    ctx.terminate_cond_br(ready_bool, &resume_label, &exit_label)?;
     ctx.emit_label(&resume_label);
     if let Some(target) = &await_info.result_target {
-        let value = ctx.promise_read(child);
+        let value = ctx.promise_read(child)?;
         if target != "__return" && !value.ty.is_void() {
             if let Some(target_field) = fields.get(target) {
-                async_store_field(ctx, "%frame", target_field, &value);
+                async_store_field(ctx, frame, target_field, &value)?;
             }
         }
     }
     let resume_block = await_resume_block(cfg, await_info.state)?;
-    ctx.terminate(format!("  br label %{}", cfg_block_label(resume_block)));
+    ctx.terminate_br(&cfg_block_label(resume_block))?;
     ctx.emit_label(&exit_label);
-    ctx.terminate("  ret void".to_string());
+    ctx.terminate_return(None)?;
     Ok(())
 }
 
@@ -951,14 +983,14 @@ fn frame_field<'a>(
         .ok_or_else(|| format!("Async frame is missing field {}", name))
 }
 
-fn current_promise(ctx: &FunctionCtx<'_>) -> Result<String, String> {
+fn current_promise<'ctx>(ctx: &FunctionCtx<'_, 'ctx>) -> Result<PointerValue<'ctx>, String> {
     ctx.promise_ptr
-        .clone()
         .ok_or_else(|| "Async lowering is missing current promise pointer".to_string())
 }
 
-fn emit_async_cfg_op(
-    ctx: &mut FunctionCtx<'_>,
+fn emit_async_cfg_op<'ctx>(
+    ctx: &mut FunctionCtx<'_, 'ctx>,
+    frame: PointerValue<'ctx>,
     fields: &HashMap<String, FrameField>,
     op: &AsyncOp,
 ) -> Result<(), String> {
@@ -977,13 +1009,13 @@ fn emit_async_cfg_op(
                     continue;
                 }
                 let ptr = if let Some(field) = fields.get(&name) {
-                    async_field_ptr(ctx, "%frame", field)
+                    async_field_ptr(ctx, frame, field)?
                 } else {
-                    let ptr = ctx.alloca(&value_ty);
+                    let ptr = ctx.alloca(&value_ty)?;
                     ctx.insert_var(
                         name.clone(),
                         VarInfo {
-                            ptr: ptr.clone(),
+                            ptr,
                             ty: value_ty.clone(),
                         },
                     )?;
@@ -992,9 +1024,9 @@ fn emit_async_cfg_op(
                 if let Some(init) = &decl.init {
                     if let InitVal::Exp(exp) = unspan_init(init) {
                         let value = emit_exp(ctx, exp)?;
-                        store_value_to_ptr(ctx, &value, &value_ty, &ptr);
+                        store_value_to_ptr(ctx, &value, &value_ty, ptr)?;
                     } else {
-                        init_store(ctx, init, &value_ty, &ptr)?;
+                        init_store(ctx, init, &value_ty, ptr)?;
                     }
                 }
             }
@@ -1003,8 +1035,7 @@ fn emit_async_cfg_op(
         AsyncOp::Assign(lhs, rhs) => {
             let value = emit_exp(ctx, rhs)?;
             let lvalue = emit_lvalue(ctx, lhs)?;
-            store_value_to_ptr(ctx, &value, &lvalue.ty, &lvalue.ptr);
-            Ok(())
+            store_value_to_ptr(ctx, &value, &lvalue.ty, lvalue.ptr)
         }
         AsyncOp::Eval(exp) => {
             let _ = emit_exp(ctx, exp)?;
@@ -1012,14 +1043,15 @@ fn emit_async_cfg_op(
         }
         AsyncOp::PromiseWait(exp) => {
             let promise = emit_exp(ctx, exp)?;
-            let _ = ctx.promise_wait(promise);
+            let _ = ctx.promise_wait(promise)?;
             Ok(())
         }
     }
 }
 
-fn emit_async_cfg_terminator(
-    ctx: &mut FunctionCtx<'_>,
+fn emit_async_cfg_terminator<'ctx>(
+    ctx: &mut FunctionCtx<'_, 'ctx>,
+    frame: PointerValue<'ctx>,
     fields: &HashMap<String, FrameField>,
     cfg: &AsyncCfgFunction,
     awaits: &[AwaitPointInfo],
@@ -1031,28 +1063,23 @@ fn emit_async_cfg_terminator(
             let value = emit_exp(ctx, exp)?;
             let promise = current_promise(ctx)?;
             if value.ty.is_void() {
-                ctx.promise_resolve(&promise, None);
+                ctx.promise_resolve(promise, None)?;
             } else {
-                ctx.promise_resolve_typed(&promise, Some(&value), ret_ty);
+                ctx.promise_resolve_typed(promise, Some(&value), ret_ty)?;
             }
-            ctx.terminate("  ret void".to_string());
-            Ok(())
+            ctx.terminate_return(None)
         }
         AsyncTerminator::Return(None) => {
             let promise = current_promise(ctx)?;
             if ret_ty.is_void() {
-                ctx.promise_resolve(&promise, None);
+                ctx.promise_resolve(promise, None)?;
             } else {
                 let value = ctx.default_value(ret_ty)?;
-                ctx.promise_resolve(&promise, Some(&value));
+                ctx.promise_resolve(promise, Some(&value))?;
             }
-            ctx.terminate("  ret void".to_string());
-            Ok(())
+            ctx.terminate_return(None)
         }
-        AsyncTerminator::Jump(target) => {
-            ctx.terminate(format!("  br label %{}", cfg_block_label(*target)));
-            Ok(())
-        }
+        AsyncTerminator::Jump(target) => ctx.terminate_br(&cfg_block_label(*target)),
         AsyncTerminator::Branch {
             cond,
             then_block,
@@ -1064,17 +1091,15 @@ fn emit_async_cfg_terminator(
             &cfg_block_label(*else_block),
         ),
         AsyncTerminator::Await(await_term) => {
-            emit_async_cfg_await(ctx, fields, cfg, awaits, await_term)
+            emit_async_cfg_await(ctx, frame, fields, cfg, awaits, await_term)
         }
-        AsyncTerminator::Unreachable => {
-            ctx.terminate("  unreachable".to_string());
-            Ok(())
-        }
+        AsyncTerminator::Unreachable => ctx.terminate_return(None),
     }
 }
 
-fn emit_async_cfg_await(
-    ctx: &mut FunctionCtx<'_>,
+fn emit_async_cfg_await<'ctx>(
+    ctx: &mut FunctionCtx<'_, 'ctx>,
+    frame: PointerValue<'ctx>,
     fields: &HashMap<String, FrameField>,
     _cfg: &AsyncCfgFunction,
     awaits: &[AwaitPointInfo],
@@ -1087,55 +1112,51 @@ fn emit_async_cfg_await(
     let child = emit_exp(ctx, &await_term.child)?;
     async_store_field(
         ctx,
-        "%frame",
+        frame,
         frame_field(fields, &await_info.child_field)?,
         &child,
-    );
-    let ready = ctx.tmp();
-    ctx.emit(format!(
-        "  {} = call i32 @__sysy_promise_is_ready(ptr {})",
-        ready, child.name
-    ));
-    let ready_bool = ctx.tmp();
-    ctx.emit(format!("  {} = icmp ne i32 {}, 0", ready_bool, ready));
+    )?;
+    let ready = ctx.call_named_typed("__sysy_promise_is_ready", &[child.clone()], LlvmType::I32)?;
+    let ready_bool = ctx.i32_ne_zero(&ready)?;
     let ready_label = ctx.label("async.await.ready");
     let suspend_label = ctx.label("async.await.suspend");
-    ctx.terminate(format!(
-        "  br i1 {}, label %{}, label %{}",
-        ready_bool, ready_label, suspend_label
-    ));
+    ctx.terminate_cond_br(ready_bool, &ready_label, &suspend_label)?;
     ctx.emit_label(&suspend_label);
-    ctx.emit(format!(
-        "  call void @__sysy_promise_set_callback(ptr {}, ptr @{}, ptr %frame)",
-        child.name, await_info.callback_name
-    ));
-    ctx.terminate("  br label %async.suspend".to_string());
+    let callback = ctx.ir.function(&await_info.callback_name)?;
+    ctx.call_named_void(
+        "__sysy_promise_set_callback",
+        &[
+            child.clone(),
+            Value::from_basic(
+                callback.as_global_value().as_pointer_value().into(),
+                LlvmType::Ptr(Box::new(LlvmType::I32)),
+            ),
+            Value::from_basic(frame.into(), LlvmType::Ptr(Box::new(LlvmType::I32))),
+        ],
+    )?;
+    ctx.terminate_br("async.suspend")?;
     ctx.emit_label(&ready_label);
     if let Some(target) = &await_info.result_target {
         if target == "__return" {
-            let value = ctx.promise_read(child);
+            let value = ctx.promise_read(child.clone())?;
             let promise = current_promise(ctx)?;
             if value.ty.is_void() {
-                ctx.promise_resolve(&promise, None);
+                ctx.promise_resolve(promise, None)?;
             } else {
-                ctx.promise_resolve(&promise, Some(&value));
+                ctx.promise_resolve(promise, Some(&value))?;
             }
-            ctx.terminate("  ret void".to_string());
+            ctx.terminate_return(None)?;
             return Ok(());
         } else {
-            let value = ctx.promise_read(child);
+            let value = ctx.promise_read(child)?;
             if !value.ty.is_void() {
                 if let Some(field) = fields.get(target) {
-                    async_store_field(ctx, "%frame", field, &value);
+                    async_store_field(ctx, frame, field, &value)?;
                 }
             }
         }
     }
-    ctx.terminate(format!(
-        "  br label %{}",
-        cfg_block_label(await_term.resume_block)
-    ));
-    Ok(())
+    ctx.terminate_br(&cfg_block_label(await_term.resume_block))
 }
 
 fn await_resume_block(cfg: &AsyncCfgFunction, state: i32) -> Result<usize, String> {
@@ -1150,7 +1171,7 @@ fn cfg_block_label(block: usize) -> String {
     format!("cfg.block.{}", block)
 }
 
-fn init_const_with_ctx(init: &InitVal, ctx: &FunctionCtx<'_>) -> Option<i32> {
+fn init_const_with_ctx(init: &InitVal, ctx: &FunctionCtx<'_, '_>) -> Option<i32> {
     match init {
         InitVal::Spanned(init, _) => init_const_with_ctx(init, ctx),
         InitVal::Exp(exp) => eval_const_exp_with(exp, &|name| ctx.lookup_const(name)),
@@ -1165,28 +1186,26 @@ fn unspan_init(init: &InitVal) -> &InitVal {
     }
 }
 
-pub(crate) fn emit_async_main_driver(module: &ModuleCtx, _hidden: &FuncDef) -> String {
-    let mut ctx = FunctionCtx::new(module, LlvmType::I32, false);
-    let mut out = String::new();
-    out.push_str("define i32 @main() {\n");
-    ctx.emit_label("entry");
-    let promise = ctx.tmp();
-    ctx.emit(format!("  {} = call ptr @__sysy_async_main()", promise));
-    let call = Value {
-        name: promise,
-        ty: LlvmType::Promise(Box::new(type_to_llvm(&_hidden.func_type))),
-    };
-    let waited = ctx.promise_wait(call);
-    if matches!(waited.ty, LlvmType::Void) {
-        ctx.terminate("  ret i32 0".to_string());
+pub(crate) fn emit_async_main_driver<'ctx>(
+    ir: &IrModule<'ctx>,
+    module: &ModuleCtx,
+    hidden: &FuncDef,
+) -> Result<(), String> {
+    let function = ir.function("main")?;
+    let mut ctx = FunctionCtx::new(ir, module, function, LlvmType::I32, false);
+    let call = ctx.call_named_typed(
+        "__sysy_async_main",
+        &[],
+        LlvmType::Promise(Box::new(type_to_llvm(&hidden.func_type))),
+    )?;
+    let waited = ctx.promise_wait(call)?;
+    if waited.ty.is_void() {
+        let zero = ctx.int_const(0);
+        ctx.terminate_return(Some(&zero))?;
     } else {
-        ctx.terminate(format!("  ret i32 {}", waited.name));
+        ctx.terminate_return(Some(&waited))?;
     }
-    for line in ctx.lines {
-        let _ = writeln!(out, "{}", line);
-    }
-    out.push_str("}\n\n");
-    out
+    Ok(())
 }
 
 #[cfg(test)]

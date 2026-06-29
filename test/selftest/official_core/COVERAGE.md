@@ -32,4 +32,4 @@ uses only baseline SysY syntax.
 
 If a real official SysY suite is later vendored, keep this directory as a fast
 smoke subset and add the official suite under a separate directory so both can
-run through `toolchain/riscv64/run_selftests.sh`.
+run through `python3 toolchain/toolchain.py selftest`.

@@ -168,7 +168,11 @@ impl ModuleCtx {
                 Ok(())
             }
             LlvmType::Array(_, inner) => self.ensure_type_layouts(inner, visiting),
-            LlvmType::I32 | LlvmType::Void | LlvmType::Ptr(_) | LlvmType::Promise(_) => Ok(()),
+            LlvmType::I32
+            | LlvmType::I64
+            | LlvmType::Void
+            | LlvmType::Ptr(_)
+            | LlvmType::Promise(_) => Ok(()),
         }
     }
 

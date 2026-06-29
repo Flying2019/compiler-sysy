@@ -1,0 +1,2 @@
+[env]
+LLVM_SYS_180_PREFIX = { value = "/usr/lib/llvm-18", force = false }

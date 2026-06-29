@@ -1,9 +1,9 @@
-use super::names::sanitize_ident;
 use crate::lalr::BType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LlvmType {
     I32,
+    I64,
     Void,
     Ptr(Box<LlvmType>),
     Struct(String),
@@ -20,16 +20,6 @@ impl LlvmType {
             BType::Promise(inner) => Self::Promise(Box::new(Self::from_btype(inner))),
             BType::Ptr(inner) => Self::Ptr(Box::new(Self::from_btype(inner))),
             BType::Array(len, inner) => Self::Array(*len, Box::new(Self::from_btype(inner))),
-        }
-    }
-
-    pub(crate) fn llvm(&self) -> String {
-        match self {
-            Self::I32 => "i32".to_string(),
-            Self::Void => "void".to_string(),
-            Self::Ptr(_) | Self::Promise(_) => "ptr".to_string(),
-            Self::Struct(name) => format!("%struct.{}", sanitize_ident(name)),
-            Self::Array(len, inner) => format!("[{} x {}]", len, inner.llvm()),
         }
     }
 

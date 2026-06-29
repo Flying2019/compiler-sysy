@@ -41,6 +41,7 @@ impl LlvmType {
     ) -> Result<usize, String> {
         match self {
             Self::I32 => Ok(TARGET_LAYOUT.int_size),
+            Self::I64 => Ok(8),
             Self::Ptr(_) | Self::Promise(_) => Ok(TARGET_LAYOUT.pointer_size),
             Self::Void => Ok(0),
             Self::Array(len, inner) => Ok(len * inner.try_size(structs)?),
@@ -57,6 +58,7 @@ impl LlvmType {
     ) -> Result<usize, String> {
         match self {
             Self::I32 => Ok(TARGET_LAYOUT.int_align),
+            Self::I64 => Ok(8),
             Self::Ptr(_) | Self::Promise(_) => Ok(TARGET_LAYOUT.pointer_align),
             Self::Void => Ok(1),
             Self::Array(_, inner) => inner.try_align(structs),

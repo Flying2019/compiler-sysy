@@ -1,6 +1,7 @@
 pub mod async_cfg;
 pub mod async_lower;
 pub mod builder;
+pub mod codegen;
 pub mod layout;
 pub mod module;
 pub mod names;
